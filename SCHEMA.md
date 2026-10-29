@@ -1,6 +1,6 @@
 # Tactile data schema for LeRobot datasets — draft 0.2
 
-*Status: draft for feedback, November 2026. Nothing here is final. The goal is to converge with [LeRobot PR #4469](https://github.com/huggingface/lerobot/pull/4469), [TLabel](https://github.com/liesliy/tlabel) and [Multi-Frequency-LeRobot](https://github.com/RoboCoin-BAAI/Multi-Frequency-LeRobot), not to add a fourth incompatible layout. Open questions are listed at the end; those are the ones I'd most like answered.*
+*Status: draft for feedback, October 2026. Nothing here is final. The goal is to converge with [LeRobot PR #4469](https://github.com/huggingface/lerobot/pull/4469), [TLabel](https://github.com/liesliy/tlabel) and [Multi-Frequency-LeRobot](https://github.com/RoboCoin-BAAI/Multi-Frequency-LeRobot), not to add a fourth incompatible layout. Open questions are listed at the end; those are the ones I'd most like answered.*
 
 Everything below targets LeRobot 0.6.1 (dataset format v3.0) and was checked against it: an `(N, C)` float32 tactile feature with per-instance metadata in its `info` entry writes, reloads and resumes through the public `LeRobotDataset` API with no change to LeRobot core. [`examples/write_tactile_feature.py`](examples/write_tactile_feature.py) shows the round trip.
 
@@ -12,7 +12,7 @@ A tactile feature in a LeRobot dataset today is typically an unnamed array: 116 
 
 1. **Per instance, not per type.** A dataset with two fingertips has two features, not one feature with a stacked dimension. Instances have stable IDs across sessions. Five fingertips on one hub are five instances that share a `device`.
 2. **Static metadata in the feature, per-session facts beside it.** What is true of an instance in every session (family, geometry, channels, declared rate) lives in its feature entry's `info`. What can change between sessions (serial after a swap, calibration, baseline, gel or skin) lives in a per-instance sidecar. Per-frame data is only what changes per frame.
-3. **Native rate, own timestamps.** When a sensor's rate differs from the dataset fps, its native-rate stream with device and host timestamps is required. A copy at the dataset fps is allowed for training code, provided the metadata says how it was made. Native timestamps are never discarded at write time.
+3. **Native rate, own timestamps.** When a sensor's rate differs from the dataset fps, its native-rate stream with device and host timestamps is required (for visuotactile images, see the `reduction` note under Static metadata). A copy at the dataset fps is allowed for training code, provided the metadata says how it was made. Native timestamps are never discarded at write time.
 4. **Provenance keys always exist.** `calibration`, `baseline` and `adapter` are present in every session record even when a value is `null`, so their absence is a visible fact rather than a missing key.
 5. **Raw is always recoverable.** Any transformation applied at record time (baseline subtraction, rate reduction) is recorded with enough information to undo it or to know exactly what was lost.
 6. **Health is an annotation, not a filter.** Quality scores are written alongside the data, per episode, and never silently drop frames or episodes.
@@ -37,7 +37,7 @@ observation.tactile.<instance_id>.force
 
 ## Static metadata: the feature entry's `info`
 
-Each instance's static metadata goes in its feature entry in `meta/info.json`, under `info`, the slot LeRobot core already uses for its own per-feature metadata (video and depth parameters). LeRobot 0.6.1 keeps extra keys there through `finalize`, reload, `resume` and the edit tools, and uploads them unchanged with `push_to_hub`. It drops unknown top-level keys in `info.json`, so a top-level `tactile_sensors` block does not work.
+Each instance's static metadata goes in its feature entry in `meta/info.json`, under `info`, the slot LeRobot core already uses for its own per-feature metadata (video and depth parameters). LeRobot 0.6.1 keeps extra keys there through `finalize`, reload, `resume` and the edit tools, and uploads them unchanged with `push_to_hub` (checked on array features; video features untested, see question 6). It drops unknown top-level keys in `info.json`, so a top-level `tactile_sensors` block does not work.
 
 Only facts that hold for every session go here. `lerobot-edit-dataset merge` requires non-video feature entries to be identical, `info` included, so anything that varies between sessions in `info` would make two sessions impossible to merge.
 
@@ -74,6 +74,7 @@ Only facts that hold for every session go here. `lerobot-edit-dataset merge` req
     "vendor": "GelSight",
     "model": "DIGIT",
     "declared_rate_hz": 60,
+    "reduction": {"method": "nearest", "window_ms": 33.3},
     "markers": {"count": 63, "grid": [7, 9]},
     "derived": {"method": "marker-flow-depth", "version": "0.1.0"},
     "mount": {"body": "so101_follower", "link": "gripper_right_finger", "pose": null},
@@ -108,14 +109,15 @@ Only facts that hold for every session go here. `lerobot-edit-dataset merge` req
 Core keys (`dtype`, `shape`, `names`) follow LeRobot's rules; only `info` is added to. Field notes:
 
 - `family` is one of `taxel_array`, `visuotactile`, `magnetic`, `force_torque`. Adding a family is a schema change; adding a vendor is not.
-- `channels` is required for `taxel_array`, `magnetic` and `force_torque`, and fixes the last dimension: per-frame shape is `(n_elements, len(channels))`. Order is the declared order, so `["fx", "fy", "fz", "dx", "dy", "dz"]` is as valid as `["fx", "fy", "fz"]`.
+- `channels` is required for `taxel_array`, `magnetic` and `force_torque`, and fixes the last dimension: per-frame shape is `(n_elements, len(channels))`. A force-torque sensor is one element, `(1, 6)`, so every array family shares this shape and the key stays its own feature instead of folding into `observation.state` as a 1-D array would. Order is the declared order, so `["fx", "fy", "fz", "dx", "dy", "dz"]` is as valid as `["fx", "fy", "fz"]`.
 - `layout.positions_mm` is the physical position of each element in the sensor's own frame. For taxel arrays and magnetic sensors its length equals `n_elements`. For visuotactile sensors the image itself is the layout; `markers.grid` gives the marker arrangement.
-- `reduction` is present only when the main-table column is a copy at the dataset fps of a faster native stream. `method` is one of `nearest`, `mean`, `last`; `window_ms` is the span of native samples each dataset frame was reduced from.
+- `reduction` is present only when the main-table column is a copy at the dataset fps of a faster native stream, or, for a video feature, when the sensor runs faster than the dataset fps. `method` is one of `nearest`, `mean`, `last`; `window_ms` is the span of native samples each dataset frame was reduced from.
 - `derived` is required when `.displacement` or `.force` streams are present, and names the algorithm (`method`) and its `version`. Point count and order are defined by that method.
 - `mount` records where on the robot the sensor sits. `pose` is a 4×4 or (xyz, quat) in the link frame if known, else `null`. Moving a sensor to another link makes it a different instance.
 - `device` groups instances that share one physical connection, such as several fingertips on one serial hub. `id` is a slug unique in the dataset; `clock` names the timebase, and instances with the same `clock` have directly comparable `device_ts`. `device` is `null` for a sensor with its own connection. The grouping is structural, so it lives here: five keys with the same `device.id` are one hand. The hub's serial and firmware can change and live in the session record.
 - `session_meta` points to the instance's sidecar `meta.json`, relative to the dataset root.
 - On video features, the tactile keys sit beside core's own `video.*` keys and never use that prefix.
+- For visuotactile sensors the image stream is stored at the dataset fps. When the sensor runs faster, `info.reduction` records `{"method": "nearest", "window_ms": …}` and the native-rate requirement applies to the instance's array streams (`.markers`, `.displacement`, `.force`), when present, not to the image; storing raw frames outside the video encoder is out of scope for 0.2.
 
 ## Per-session metadata: `tactile/<instance_id>/meta.json`
 
@@ -170,9 +172,9 @@ Field notes:
 | `visuotactile` `.displacement` | float32 | `(N, 3)` | Optional; dx, dy, dz; requires `derived` |
 | `visuotactile` `.force` | float32 | `(N, 3)` | Optional; fx, fy, fz; requires `derived` |
 | `magnetic` | float32 | `(n_sensors, len(channels))` | Raw field. Baseline-subtracted view is computed at read time, not stored |
-| `force_torque` | float32 | `(6,)` | `channels` `["fx", "fy", "fz", "mx", "my", "mz"]` in the sensor frame |
+| `force_torque` | float32 | `(1, 6)` | `channels` `["fx", "fy", "fz", "mx", "my", "mz"]` in the sensor frame; one element, so the key stays standalone |
 
-Parquet stores these as Hugging Face `Array2D` columns, readable with plain pyarrow or pandas, without LeRobot.
+Parquet stores the array features as Hugging Face `Array2D` columns, readable with plain pyarrow or pandas, without LeRobot.
 
 **Normalization stats are per channel, not per element.** LeRobot computes `stats.json` over the last dimension, so a `(52, 3)` feature gets stats of shape `(3,)` and a policy normalizer scales every taxel by the same three numbers. Per-taxel baselines and drift are computed from the data by `tactile doctor`, never read from `stats.json`. For the same reason, main-table layouts that pad a fixed-size block of samples per row are avoided: NaN padding makes the stats NaN, and zero padding biases them.
 
@@ -180,16 +182,20 @@ Parquet stores these as Hugging Face `Array2D` columns, readable with plain pyar
 
 When a sensor's rate equals the dataset fps, its main-table column is the native stream and nothing else is needed.
 
-When the rates differ, the native-rate stream is required and lives beside the dataset, one file per instance per episode:
+When the rates differ, the native-rate stream is required (except the visuotactile image itself, see the `reduction` note under Static metadata) and lives beside the dataset, one file per instance per episode:
 
 ```
 <dataset root>/
 ├── meta/  data/  videos/          # LeRobot's own layout, unchanged
 └── tactile/
-    └── left_fingertip/
+    ├── left_fingertip/
+    │   ├── meta.json
+    │   ├── episode-000000.parquet
+    │   └── episode-000001.parquet
+    └── right_fingertip/
         ├── meta.json
-        ├── episode-000000.parquet
-        └── episode-000001.parquet
+        └── markers/               # a suffixed stream keeps its own files
+            └── episode-000000.parquet
 ```
 
 | Column | dtype | Meaning |
@@ -199,11 +205,13 @@ When the rates differ, the native-rate stream is required and lives beside the d
 | `host_ts` | float64 | Host receive time, seconds, monotonic clock |
 | `device_ts` | float64 or null | Timestamp from the sensor's own clock, seconds, if the device provides one |
 | `seq` | int64 or null | Device sequence number if provided; gaps mean dropped frames at the source |
-| `data` | float32 | One sample, same shape as the feature: `(n_elements, len(channels))` |
+| `data` | float32 | One sample, same shape as the feature's per-frame shape |
+
+A suffixed stream keeps its own files: `tactile/<instance_id>/<suffix>/episode-{index:06d}.parquet` (for example `tactile/right_fingertip/markers/`), with the same columns.
 
 A copy at the dataset fps in the main table is optional and recommended, since most training code reads one table. When present, the feature's `info.reduction` says how it was made. A reader that needs the timing aligns from the sidecar by nearest `host_ts` or by a window; the alignment policy lives in the loader, not the file.
 
-A dataset-rate copy cannot show dropped frames or clock skew. Those are only visible in the native stream, which is why it is never optional when the rates differ.
+A dataset-rate copy cannot show dropped frames or clock skew. Those are only visible in the native stream, which is why it is never optional when the rates differ. A visuotactile image at the dataset fps carries only what the video shows; its suffixed streams, when present, carry the native timing.
 
 What core does and doesn't do with sidecars in 0.6.1: a full load ignores them and works normally, and `push_to_hub` uploads them with the rest of the folder. `lerobot-edit-dataset` copies only `meta/`, `data/` and `videos/`, and a partial load (`episodes=[…]`) downloads only the listed files, so both leave the sidecar behind. Tools in this project carry it; core tools do not yet.
 
@@ -213,7 +221,7 @@ The public dataset API (`LeRobotDataset.create` → `add_frame` → `save_episod
 
 Stock `lerobot-record` does not. A robot that returns a `(52, 3)` array from `get_observation()` is rejected by `hw_to_dataset_features`, which treats any non-1-D shape as a camera and expects `(H, W, C)`, and `build_dataset_frame` passes through only 1-D float arrays and images. Folding the taxels into `observation.state` or declaring a `(52, 3, 1)` "depth camera" both load, and both lose what the data is. Plugin discovery offers no other route.
 
-This project therefore records through the public API with its own `tactile-record` command, built on `make_robot_from_config`, `build_dataset_frame` and `LeRobotDataset.add_frame`. A small upstream change to `lerobot/utils/feature_utils.py` (accept an N-D numeric spec in `hw_to_dataset_features`, pass N-D arrays through in `build_dataset_frame`) would let `lerobot-record` do the same.
+This project therefore records through the public API with its own `tactile-record` command, built on `make_robot_from_config`, `build_dataset_frame` and `LeRobotDataset.add_frame`. A small upstream change to `lerobot/utils/feature_utils.py` (accept an N-D numeric spec in `hw_to_dataset_features`, pass N-D arrays through in `build_dataset_frame`), open as [huggingface/lerobot#5149](https://github.com/huggingface/lerobot/pull/5149), would let `lerobot-record` do the same once merged.
 
 ## Health annotations
 
@@ -230,7 +238,7 @@ This project therefore records through the public API with its own `tactile-reco
     },
     "right_fingertip": {
       "gel": {"dead_pct": 0.062, "largest_cluster_px": 41, "flag": true},
-      "framerate": {"effective_hz": 29.1, "dropped_pct": 0.51, "max_gap_ms": 220.0, "flag": true},
+      "framerate": {"effective_hz": 29.1, "dropped_pct": 0.03, "max_gap_ms": 220.0, "flag": true},
       "skew": {"lag_ms": 35.0, "confidence": 0.67, "flag": false}
     },
     "doctor_version": "0.1.0",
@@ -239,7 +247,7 @@ This project therefore records through the public API with its own `tactile-reco
 }
 ```
 
-Thresholds are conservative defaults and are recorded with the result so a later run with different thresholds is distinguishable.
+Thresholds are conservative defaults and are recorded with the result so a later run with different thresholds is distinguishable. For a video feature with `reduction`, `framerate` is measured against the dataset fps; the native rate is checked from the suffixed streams when present.
 
 ## Interoperability
 
@@ -274,9 +282,9 @@ Thresholds are conservative defaults and are recorded with the result so a later
   - New principle 5, "raw is always recoverable".
   - Static metadata moved from a top-level `tactile_sensors` block, which LeRobot 0.6.1 drops, to each feature entry's `info`.
   - Static and per-session metadata split: serial, firmware, the hub's serial and firmware, `adapter`, `calibration`, `baseline`, `gel` and `skin` move to `tactile/<instance_id>/meta.json`, since `merge` requires identical feature entries.
-  - `channels` required for `taxel_array`, `magnetic` and `force_torque`; per-frame shape is `(n_elements, len(channels))`. Stats are per channel; per-taxel statistics are computed by `tactile doctor`.
+  - `channels` required for `taxel_array`, `magnetic` and `force_torque`; per-frame shape is `(n_elements, len(channels))`, with `force_torque` as `(1, 6)`. Stats are per channel; per-taxel statistics are computed by `tactile doctor`.
   - Native-rate sidecar layout defined: `tactile/<instance_id>/episode-{index:06d}.parquet` with `episode_index`, `sample_index`, `host_ts`, `device_ts`, `seq`, `data`. Health reports move to `tactile/health.json`.
-  - Record path: the public dataset API writes tactile features with no core change; stock `lerobot-record` does not, so recording goes through `tactile-record`, with an upstream change to `feature_utils.py` proposed.
+  - Record path: the public dataset API writes tactile features with no core change; stock `lerobot-record` does not, so recording goes through `tactile-record`, with the upstream change opened as [huggingface/lerobot#5149](https://github.com/huggingface/lerobot/pull/5149).
   - Sibling `.displacement` / `.force` keys checked against 0.6.1: they load, get stats and carry `info` exactly as a single key does, so they stay.
   - Interoperability rewritten against PR #4469's code and TLabel's spec. Open questions revised.
 - 0.1 (Oct 2026): first draft for feedback.
