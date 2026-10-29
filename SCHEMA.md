@@ -249,6 +249,8 @@ Thresholds are conservative defaults and are recorded with the result so a later
 
 ## Open questions (please answer any of these)
 
+0.1's questions on per-instance keys vs a ragged dimension, multi-rate storage, and TLabel field overlap are answered in 0.2; see Feature keys, Native-rate streams, and Interoperability.
+
 1. Per-instance keys: does any training code need a stacked per-hub view (five fingertips as one array), and if so, should the loader build it from the `device` grouping rather than storing it?
 2. Static vs per-session: which facts change between your recording sessions? A fact placed in `info` that varies makes `merge` fail; one placed in the sidecar that never varies costs nothing.
 3. Sidecars: core edit tools and partial loads leave `tactile/` behind. Would you accept that until core knows about it, or would you rather keep native-rate data in the main table despite the padding cost to stats?
@@ -277,4 +279,4 @@ Thresholds are conservative defaults and are recorded with the result so a later
   - Record path: the public dataset API writes tactile features with no core change; stock `lerobot-record` does not, so recording goes through `tactile-record`, with an upstream change to `feature_utils.py` proposed.
   - Sibling `.displacement` / `.force` keys checked against 0.6.1: they load, get stats and carry `info` exactly as a single key does, so they stay.
   - Interoperability rewritten against PR #4469's code and TLabel's spec. Open questions revised.
-- 0.1 (Nov 2026): first draft for feedback.
+- 0.1 (Oct 2026): first draft for feedback.
