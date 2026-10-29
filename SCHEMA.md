@@ -12,7 +12,7 @@ A tactile feature in a LeRobot dataset today is typically an unnamed array: 116 
 
 1. **Per instance, not per type.** A dataset with two fingertips has two features, not one feature with a stacked dimension. Instances have stable IDs across sessions. Five fingertips on one hub are five instances that share a `device`.
 2. **Static metadata in the feature, per-session facts beside it.** What is true of an instance in every session (family, geometry, channels, declared rate) lives in its feature entry's `info`. What can change between sessions (serial after a swap, calibration, baseline, gel or skin) lives in a per-instance sidecar. Per-frame data is only what changes per frame.
-3. **Native rate, own timestamps.** When a sensor's rate differs from the dataset fps, its native-rate stream with device and host timestamps is required (for visuotactile images, see the `reduction` note under Static metadata). A copy at the dataset fps is allowed for training code, provided the metadata says how it was made. Native timestamps are never discarded at write time.
+3. **Native rate, own timestamps.** When a sensor's rate differs from the dataset fps, its native-rate stream with device and host timestamps is required (for visuotactile images, see the `reduction` note under Static metadata). A copy at the dataset fps is allowed for training code, provided the metadata says how it was made. Native timestamps are never discarded at write time, except the frames a video encoder drops, which `reduction` accounts for.
 4. **Provenance keys always exist.** `calibration`, `baseline` and `adapter` are present in every session record even when a value is `null`, so their absence is a visible fact rather than a missing key.
 5. **Raw is always recoverable.** Any transformation applied at record time (baseline subtraction, rate reduction) is recorded with enough information to undo it or to know exactly what was lost.
 6. **Health is an annotation, not a filter.** Quality scores are written alongside the data, per episode, and never silently drop frames or episodes.
@@ -34,6 +34,8 @@ observation.tactile.<instance_id>.force
 ```
 
 `.displacement` and `.force` are allowed only when the instance's `info` carries a `derived` block naming the method that produced them. In 0.6.1 these sibling keys and a single `(N, 6)` key behave the same on every check (loading, stats, metadata, `delta_timestamps`, file size); siblings are used here because they keep the image as the instance's main stream.
+
+A suffixed key is its own feature entry. Its `info` carries only `reduction`, when its main-table column is a dataset-rate copy of a faster native stream, and `session_meta`, pointing at the instance's sidecar. Everything else (`family`, `derived`, `mount`, `device`) is read from the instance's entry.
 
 ## Static metadata: the feature entry's `info`
 
