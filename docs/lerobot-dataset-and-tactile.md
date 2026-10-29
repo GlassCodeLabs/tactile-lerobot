@@ -77,9 +77,9 @@ Worked example: row 500 of `data/` is `episode_index 3`, `frame_index 80`, `time
 ## Where tactile doesn't fit
 
 - **Native rate.** Every row of `data/` is one frame at the dataset's single fps, and `timestamp` is one instant per row. A 1 kHz taxel array alongside a 10–30 Hz camera has no home. Options: keep only the sample nearest each frame (loses data), store a `(samples_per_frame, n_taxels)` block per row (works but `timestamp` no longer describes the block), or a second table with its own fps and its own row ranges in the episodes table, which is what [Multi-Frequency-LeRobot](https://github.com/RoboCoin-BAAI/Multi-Frequency-LeRobot) does outside core.
-- **Static per-sensor metadata.** A feature entry in `info.json` has `dtype`, `shape`, `names`. There is no slot for taxel geometry, vendor/model/serial, gel ID or calibration version. Whether extra keys under a feature entry survive `LeRobotDataset.create()` and `push_to_hub()` is untested.
-- **Per-episode sensor state.** The episodes table already stores per-episode stats per feature, which is the natural place for a session baseline or a health score, but no key is defined for it.
-- **Device vs host time.** `timestamp` is derived from `frame_index`. A sensor's own device clock and the host receive time have no column, so clock skew between tactile and video cannot be measured after the fact from the dataset alone.
+- **Static per-sensor metadata.** A feature entry in `info.json` has `dtype`, `shape`, `names`. Core defines no slot for taxel geometry, vendor/model/serial, gel ID or calibration version. Extra keys under a feature entry's `info` do survive `create`, `finalize`, reload and `resume`; unknown top-level keys in `info.json` are dropped. [SCHEMA.md](../SCHEMA.md) (Static metadata) uses the `info` slot for this.
+- **Per-episode sensor state.** The episodes table already stores per-episode stats per feature, which looks like the natural place for a session baseline or a health score, but `merge` compares feature entries with `==`, so anything that varies between sessions cannot live in `info.json`. SCHEMA.md puts session facts in `tactile/<instance_id>/meta.json` and health reports in `tactile/health.json`.
+- **Device vs host time.** `timestamp` is derived from `frame_index`. A sensor's own device clock and the host receive time have no column, so clock skew between tactile and video cannot be measured after the fact from the main table alone. SCHEMA.md adds `host_ts` and `device_ts` columns in a per-instance native-rate sidecar for this.
 
 ## State of native tactile support: PR #4469
 
@@ -113,10 +113,12 @@ Source: [huggingface/lerobot#4469](https://github.com/huggingface/lerobot/pull/4
 
 No Hugging Face maintainer has commented on the PR.
 
-## Open questions
+## Questions this raised, and where they are answered
 
-1. Does LeRobot preserve unknown keys inside a feature's `info.json` entry, or strip them on write? Decides whether sensor metadata can ride in the feature entry or needs a top-level `tactile_sensors` block.
-2. Where should per-sensor metadata (taxel positions, serial, calibration version) and native-rate timestamps live: inside the feature entry, a top-level block, or a sidecar? PR #4469 defines neither; see the section above.
-3. Does [TLabel](https://github.com/liesliy/tlabel)'s 14-dimension schema map onto one-key-per-instance, or does it collapse instances into one feature?
-4. For a visuotactile sensor stored as a video key, where do gel ID and calibration version attach?
-5. What does `LeRobotDataset.create()` → `add_frame()` → `save_episode()` → `finalize()` require of a new feature?
+These were open when the page was first written. Each is now settled in [SCHEMA.md](../SCHEMA.md) or by [`examples/write_tactile_feature.py`](../examples/write_tactile_feature.py).
+
+1. *Does LeRobot preserve unknown keys inside a feature's `info.json` entry?* Yes, under the entry's `info`; unknown top-level keys are dropped. SCHEMA.md, Static metadata.
+2. *Where should per-sensor metadata and native-rate timestamps live?* Static facts in the feature entry's `info`; per-session facts and native-rate samples in `tactile/<instance_id>/` sidecars. SCHEMA.md, Per-session metadata and Native-rate streams.
+3. *Does TLabel's 14-dimension schema map onto one-key-per-instance?* TLabel is an annotation layer that sits above a raw format; its code handles one sensor per file. SCHEMA.md, Interoperability.
+4. *For a visuotactile sensor stored as a video key, where do gel ID and calibration version attach?* Gel and calibration are per-session and go in the instance's sidecar `meta.json`; static keys go in the video feature's `info`. Whether core's own video write keeps extra `info` keys is still open (SCHEMA.md, question 6).
+5. *What does `create()` → `add_frame()` → `save_episode()` → `finalize()` require of a new feature?* A `dtype`, `shape`, `names` entry; an N-D float32 feature round-trips with no core change. `examples/write_tactile_feature.py` shows it.
