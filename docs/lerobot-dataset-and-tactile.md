@@ -47,6 +47,8 @@ Episode boundaries are metadata, not file boundaries. The episodes table holds, 
 
 Worked example: row 500 of `data/` is `episode_index 3`, `frame_index 80`, `timestamp 8.0`. The episodes table gives episode 3 `dataset_from_index 420`, `length 141`, and a video span of 14.1 s; 420 + 80 = 500 and 141 / 10 fps = 14.1 s.
 
+`examples/inspect_dataset.py` reproduces the layout listing and this lookup for any dataset: `python examples/inspect_dataset.py lerobot/pusht --episode 3 --frame 80`.
+
 ### Feature keys
 
 | Key | dtype / shape | Meaning |
