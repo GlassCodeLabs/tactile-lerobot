@@ -46,13 +46,16 @@ __all__ = [
     "REDUCTION_METHODS",
     "Reduction",
     "STREAM_SUFFIXES",
+    "STREAM_WIDTHS",
     "SchemaError",
     "SessionMeta",
     "SessionRecord",
     "Skin",
+    "StreamInfo",
     "TactileFamily",
     "TactileInfo",
     "feature_key",
+    "read_info_lenient",
     "session_meta_path",
 ]
 
@@ -61,6 +64,9 @@ FEATURE_KEY_PREFIX = "observation.tactile."
 
 STREAM_SUFFIXES = ("markers", "displacement", "force")
 """Suffixes a visuotactile instance may declare beside its image key."""
+
+STREAM_WIDTHS = {"markers": 2, "displacement": 3, "force": 3}
+"""Last dimension of a suffixed stream's per-frame array: pixel coordinates, or dx dy dz / fx fy fz."""
 
 REDUCTION_METHODS = ("nearest", "mean", "last")
 """How a dataset-rate copy was reduced from a faster native stream."""
@@ -271,10 +277,7 @@ class TactileInfo(Block):
     def __post_init__(self) -> None:
         self.family = _enum(TactileFamily, self.family, "family")
         _require_positive(self.declared_rate_hz, "declared_rate_hz")
-        if not isinstance(self.session_meta, str) or not _SESSION_META.match(self.session_meta):
-            raise SchemaError(
-                f"session_meta must look like 'tactile/<instance_id>/meta.json', got {self.session_meta!r}"
-            )
+        _require_session_meta(self.session_meta)
         if self.family in ARRAY_FAMILIES:
             if not self.channels:
                 raise SchemaError(f"channels is required for family {self.family.value!r}")
@@ -316,6 +319,40 @@ class TactileInfo(Block):
         """Build from an ``info`` block. Core's own ``video.*`` keys are ignored."""
         own = {k: v for k, v in data.items() if not k.startswith("video.")}
         return super().from_dict(own)
+
+
+@dataclass
+class StreamInfo(Block):
+    """The ``info`` block of a suffixed stream key (``.markers``, ``.displacement``, ``.force``).
+
+    A suffixed stream carries only ``reduction``, when its main-table column is a
+    dataset-rate copy of a faster native stream, and ``session_meta``. Everything
+    else about the stream is read from the instance's own entry.
+    """
+
+    session_meta: str
+    reduction: Reduction | None = None
+
+    _label: ClassVar[str] = "info"
+    _omit_when_none: ClassVar[frozenset[str]] = frozenset({"reduction"})
+    _key_order: ClassVar[tuple[str, ...] | None] = ("reduction", "session_meta")
+
+    def __post_init__(self) -> None:
+        _require_session_meta(self.session_meta)
+
+
+def read_info_lenient(data: Mapping[str, Any]) -> tuple[TactileInfo, list[str]]:
+    """Decode an ``info`` block from a dataset this package did not write.
+
+    Unknown keys are returned as dotted paths (``info.serial``) instead of raising,
+    so a reader can report them. Wrong types and missing required keys still raise
+    :class:`SchemaError`. Core's own ``video.*`` keys are ignored, as in
+    :meth:`TactileInfo.from_dict`.
+    """
+    reader = _Reader(strict=False)
+    own = {k: v for k, v in data.items() if not k.startswith("video.")}
+    info = _from_dict(TactileInfo, own, reader, "info")
+    return info, reader.unknown
 
 
 # --- Per-session metadata: ``tactile/<instance_id>/meta.json`` ---------------------------------
@@ -604,6 +641,11 @@ def _require_nonempty_str(value: Any, path: str) -> None:
 def _require_slug(value: Any, path: str) -> None:
     if not isinstance(value, str) or not _SLUG.match(value):
         raise SchemaError(f"{path} must match [A-Za-z0-9_-]+, got {value!r}")
+
+
+def _require_session_meta(value: Any) -> None:
+    if not isinstance(value, str) or not _SESSION_META.match(value):
+        raise SchemaError(f"session_meta must look like 'tactile/<instance_id>/meta.json', got {value!r}")
 
 
 def _require_positive(value: Any, path: str) -> None:

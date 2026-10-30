@@ -12,9 +12,11 @@ from taxel.schema import (
     SchemaError,
     SessionMeta,
     SessionRecord,
+    StreamInfo,
     TactileFamily,
     TactileInfo,
     feature_key,
+    read_info_lenient,
     session_meta_path,
 )
 
@@ -203,6 +205,38 @@ class TestStreams:
     def test_unknown_suffix(self) -> None:
         with pytest.raises(SchemaError, match="unknown stream suffixes"):
             TactileInfo.from_dict(RIGHT_FINGERTIP).check_streams(["depth"])
+
+    def test_stream_info_round_trips_and_is_strict(self) -> None:
+        session_meta = RIGHT_FINGERTIP["session_meta"]
+        block = {"reduction": {"method": "nearest", "window_ms": 33.3}, "session_meta": session_meta}
+        assert StreamInfo.from_dict(block).to_dict() == block
+        assert StreamInfo.from_dict({"session_meta": "tactile/x/meta.json"}).to_dict() == {
+            "session_meta": "tactile/x/meta.json"
+        }
+        with pytest.raises(SchemaError, match="unknown keys \\['family'\\]"):
+            StreamInfo.from_dict({**block, "family": "visuotactile"})
+        with pytest.raises(SchemaError, match="session_meta"):
+            StreamInfo(session_meta="meta.json")
+
+
+class TestLenientReader:
+    def test_unknown_keys_are_reported_not_raised(self) -> None:
+        layout = {**LEFT_FINGERTIP["layout"], "units": "mm"}
+        data = {**LEFT_FINGERTIP, "serial": "PX3-00412", "layout": layout}
+        info, unknown = read_info_lenient(data)
+        assert info == TactileInfo.from_dict(LEFT_FINGERTIP)
+        assert unknown == ["info.serial", "info.layout.units"]
+
+    def test_video_keys_are_not_unknown(self) -> None:
+        info, unknown = read_info_lenient({**RIGHT_FINGERTIP, "video.fps": 30, "video.codec": "av1"})
+        assert info == TactileInfo.from_dict(RIGHT_FINGERTIP)
+        assert unknown == []
+
+    def test_wrong_types_still_raise(self) -> None:
+        with pytest.raises(SchemaError, match="declared_rate_hz: expected a number"):
+            read_info_lenient({**LEFT_FINGERTIP, "declared_rate_hz": "91"})
+        with pytest.raises(SchemaError, match="missing required key 'session_meta'"):
+            read_info_lenient({k: v for k, v in LEFT_FINGERTIP.items() if k != "session_meta"})
 
 
 class TestSessionRoundTrip:
