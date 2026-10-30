@@ -25,6 +25,8 @@ classifiers = [
 dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
+# Dataset writer and `taxel record`: everything under taxel/dataset/ and taxel/cli/.
+lerobot = ["lerobot[dataset]>=0.6.1,<0.7", "pyarrow>=21"]
 dev = ["pytest>=8", "ruff==0.17.3"]
 
 [project.urls]
