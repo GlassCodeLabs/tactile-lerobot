@@ -4,7 +4,6 @@ import shutil
 from pathlib import Path
 
 import numpy as np
-
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 ROOT = Path("outputs/tactile_feature_demo")
@@ -35,7 +34,9 @@ def main() -> None:
     shutil.rmtree(ROOT, ignore_errors=True)
     rng = np.random.default_rng(0)
 
-    dataset = LeRobotDataset.create("example/tactile_feature_demo", fps=30, features=features, root=ROOT, use_videos=False)
+    dataset = LeRobotDataset.create(
+        "example/tactile_feature_demo", fps=30, features=features, root=ROOT, use_videos=False
+    )
     for _ in range(3):
         for _ in range(50):
             dataset.add_frame(
@@ -54,7 +55,8 @@ def main() -> None:
     print(f"{reloaded.num_episodes} episodes, {reloaded.num_frames} frames")
     print(f"{TACTILE_KEY}: dtype={frame[TACTILE_KEY].dtype}, shape={tuple(frame[TACTILE_KEY].shape)}")
     print("sensor metadata:", reloaded.meta.features[TACTILE_KEY]["info"])
-    # Dataset stats for an N-D feature are reduced over every axis but the last, so this is per channel, not per taxel.
+    # Dataset stats for an N-D feature are reduced over every axis but the last,
+    # so this is per channel, not per taxel.
     print("stats mean shape:", np.asarray(reloaded.meta.stats[TACTILE_KEY]["mean"]).shape)
 
 

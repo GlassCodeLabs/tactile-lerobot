@@ -26,7 +26,7 @@ def main() -> None:
     for key, spec in ds.features.items():
         print(f"  {key:32s} dtype={spec['dtype']:8s} shape={spec['shape']}")
 
-    info = json.load(open(root / "meta" / "info.json"))
+    info = json.loads((root / "meta" / "info.json").read_text())
     print("\nmeta/info.json keys:", list(info.keys()))
     print("data_path: ", info["data_path"])
     print("video_path:", info.get("video_path"))
@@ -43,8 +43,10 @@ def main() -> None:
     ep = episodes.loc[args.episode]
     row = int(ep["dataset_from_index"]) + args.frame
 
-    print(f"\nepisode {args.episode}: rows {int(ep['dataset_from_index'])}–{int(ep['dataset_to_index'])}, "
-          f"length {int(ep['length'])}")
+    print(
+        f"\nepisode {args.episode}: rows {int(ep['dataset_from_index'])}–{int(ep['dataset_to_index'])}, "
+        f"length {int(ep['length'])}"
+    )
     for col in episodes.columns:
         if col.startswith("videos/") and col.endswith("timestamp"):
             print(f"  {col}: {ep[col]}")
