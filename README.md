@@ -1,6 +1,6 @@
 # tactile-lerobot
 
-*Working name. Will be renamed when the package is published.*
+The Python package is `taxel`; the repository name describes its role as the LeRobot tactile plugin.
 
 An open-source LeRobot plugin for tactile sensors, plus a health-check CLI for tactile recordings.
 
@@ -12,7 +12,7 @@ An open-source LeRobot plugin for tactile sensors, plus a health-check CLI for t
 - `tactile doctor`: scores every episode for baseline drift, dead pixels and gel condition, dropped frames, saturation and clock skew against the video stream, and writes a JSON report you can diff across sessions
 - MCAP export so Foxglove and Rerun open tactile data alongside video and joints
 
-**Status (October 2026):** schema drafting. See [SCHEMA.md](SCHEMA.md). First adapters planned: PaXini PX-6AX GEN3, AnySkin, DIGIT / GelSight Mini, plus a simulated backend for CI.
+**Status:** the `taxel` package contains the schema dataclasses ([SCHEMA.md](SCHEMA.md)), the `TactileSensor` base class and a simulated backend with injectable faults ([docs/sensors.md](docs/sensors.md)); the dataset writer is the next component.
 
 **Why**
 
