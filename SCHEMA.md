@@ -132,6 +132,12 @@ One file per instance, holding one record per recording session and the episodes
     {
       "session_id": "2026-11-21a",
       "episodes": [0, 41],
+      "clock": {
+        "wall_time": "2026-11-21T14:03:05.117Z",
+        "host_clock": 10234.117,
+        "episode_origins": [10240.004, 10301.772, "..."]
+      },
+      "frames": {"received": 30412, "dropped": 7, "overflowed": 0},
       "serial": "PX3-00412",
       "firmware": null,
       "device": {"serial": "PXH-0193", "firmware": "1.4.2"},
@@ -158,6 +164,8 @@ One file per instance, holding one record per recording session and the episodes
 Field notes:
 
 - `episodes` is an inclusive range of episode indices recorded in that session.
+- `clock` anchors the session's host clock. Sidecar `host_ts` values come from a monotonic clock with no epoch, and LeRobot's own `timestamp` column is `frame_index / fps`, restarting at zero in every episode. `wall_time` is the UTC time at `connect()` and `host_clock` the host clock value at the same instant, so any `host_ts` maps to the calendar as `wall_time + (host_ts − host_clock)`. `episode_origins` holds one value per episode in `episodes`, in order: the host clock value when the episode's first dataset frame was built. Dataset frame `k` of that episode is at `origin + k / fps` on the host clock, which is also the target time its dataset-rate copy was reduced at.
+- `frames` holds the sensor's frame counters since `connect()`, so per session: `received` by the host, `dropped` at the source (gaps in `seq`), `overflowed` on the host because the recorder did not drain the sensor in time. They come from the sensor's counters, not from the episode files; when `seq` is present, `dropped` equals the sum of the `seq` gaps across the session's episode files.
 - `device` holds the hub's `serial` and `firmware` for that session, and is `null` when the instance's `info.device` is `null`. Per-fingertip identity (serial, gel or skin, calibration) stays with the instance, so replacing one fingertip does not change the identity of the others.
 - `adapter` names the code that turned the sensor's output into the stored values, and its version. A bug found in an adapter can then be traced to the datasets it affected.
 - `calibration.method` is free text for now (`vendor`, `3dcal`, `nano17-press`, `uncalibrated-by-design`). A controlled vocabulary can come later once there are a few real values.
@@ -209,9 +217,11 @@ When the rates differ, the native-rate stream is required (except the visuotacti
 | `seq` | int64 or null | Device sequence number if provided; gaps mean dropped frames at the source |
 | `data` | float32 | One sample, same shape as the feature's per-frame shape |
 
+`data` is stored as an Arrow fixed-shape tensor column (the `fixed_shape_tensor` canonical extension type), which pyarrow reads back as one `(n_samples, …)` array; the other columns are plain.
+
 A suffixed stream keeps its own files: `tactile/<instance_id>/<suffix>/episode-{index:06d}.parquet` (for example `tactile/right_fingertip/markers/`), with the same columns.
 
-A copy at the dataset fps in the main table is optional and recommended, since most training code reads one table. When present, the feature's `info.reduction` says how it was made. A reader that needs the timing aligns from the sidecar by nearest `host_ts` or by a window; the alignment policy lives in the loader, not the file.
+A copy at the dataset fps in the main table is optional and recommended, since most training code reads one table. When present, the feature's `info.reduction` says how it was made. A reader that needs the timing aligns from the sidecar by nearest `host_ts` or by a window; the alignment policy lives in the loader, not the file. The host time of dataset frame `k` of an episode is the episode's origin from the session record's `clock` plus `k / fps`.
 
 A dataset-rate copy cannot show dropped frames or clock skew. Those are only visible in the native stream, which is why it is never optional when the rates differ. A visuotactile image at the dataset fps carries only what the video shows; its suffixed streams, when present, carry the native timing.
 
@@ -289,4 +299,5 @@ Thresholds are conservative defaults and are recorded with the result so a later
   - Record path: the public dataset API writes tactile features with no core change; stock `lerobot-record` does not, so recording goes through `tactile-record`, with the upstream change opened as [huggingface/lerobot#5149](https://github.com/huggingface/lerobot/pull/5149).
   - Sibling `.displacement` / `.force` keys checked against 0.6.1: they load, get stats and carry `info` exactly as a single key does, so they stay.
   - Interoperability rewritten against PR #4469's code and TLabel's spec. Open questions revised.
+  - 2026-10-30: `clock` (`wall_time`, `host_clock`, `episode_origins`) and `frames` (`received`, `dropped`, `overflowed`) added to the session record. The host clock has no epoch and LeRobot's timestamps restart in every episode; the anchor and the per-episode origins make sidecar `host_ts` comparable with both, and the counters record losses as the sensor counted them.
 - 0.1 (Oct 2026): first draft for feedback.

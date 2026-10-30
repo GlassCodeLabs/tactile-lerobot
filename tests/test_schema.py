@@ -9,6 +9,8 @@ from taxel.schema import (
     Adapter,
     Baseline,
     Calibration,
+    Clock,
+    FrameCounts,
     SchemaError,
     SessionMeta,
     SessionRecord,
@@ -80,6 +82,12 @@ LEFT_FINGERTIP_META = {
         {
             "session_id": "2026-11-21a",
             "episodes": [0, 41],
+            "clock": {
+                "wall_time": "2026-11-21T14:03:05.117Z",
+                "host_clock": 10234.117,
+                "episode_origins": [10240.004 + 61.5 * i for i in range(42)],
+            },
+            "frames": {"received": 30412, "dropped": 7, "overflowed": 0},
             "serial": "PX3-00412",
             "firmware": None,
             "device": {"serial": "PXH-0193", "firmware": "1.4.2"},
@@ -318,6 +326,38 @@ class TestSessionValidation:
         with pytest.raises(SchemaError, match="adapter.version"):
             Adapter("taxel.simulated", "")
         assert Calibration().to_dict() == {"version": None, "method": None, "date": None, "reference": None}
+
+
+class TestClockAndFrames:
+    def test_clock_validation(self) -> None:
+        Clock(wall_time="2026-11-21T14:03:05Z", host_clock=1, episode_origins=[])
+        with pytest.raises(SchemaError, match="clock.wall_time must be UTC ISO 8601"):
+            Clock(wall_time="2026-11-21 14:03:05", host_clock=1.0, episode_origins=[])
+        with pytest.raises(SchemaError, match="clock.wall_time must be UTC ISO 8601"):
+            Clock(wall_time="2026-11-21T14:03:05+01:00", host_clock=1.0, episode_origins=[])
+        with pytest.raises(SchemaError, match="clock.host_clock must be a number"):
+            Clock(wall_time="2026-11-21T14:03:05Z", host_clock="1.0", episode_origins=[])
+        with pytest.raises(SchemaError, match="clock.episode_origins must be numbers"):
+            Clock(wall_time="2026-11-21T14:03:05Z", host_clock=1.0, episode_origins=[1.0, None])
+
+    def test_frames_validation(self) -> None:
+        FrameCounts(received=0, dropped=0, overflowed=0)
+        for bad in ({"received": -1}, {"dropped": 1.5}, {"overflowed": True}):
+            with pytest.raises(SchemaError, match="must be a non-negative integer"):
+                FrameCounts(**{"received": 0, "dropped": 0, "overflowed": 0, **bad})
+
+    def test_one_origin_per_episode(self) -> None:
+        record = dict(LEFT_FINGERTIP_META["sessions"][0])
+        record["clock"] = {**record["clock"], "episode_origins": [10240.0]}
+        with pytest.raises(SchemaError, match="episode_origins has 1 values for 42 episodes"):
+            SessionRecord.from_dict(record)
+
+    def test_clock_and_frames_are_written_as_null_when_unknown(self) -> None:
+        record = SessionRecord(session_id="s", episodes=(0, 0), adapter=None, calibration=None, baseline=None)
+        encoded = record.to_dict()
+        assert list(encoded)[:4] == ["session_id", "episodes", "clock", "frames"]
+        assert encoded["clock"] is None and encoded["frames"] is None
+        assert SessionRecord.from_dict(encoded) == record
 
 
 class TestHelpers:

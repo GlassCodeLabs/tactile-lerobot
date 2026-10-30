@@ -35,10 +35,12 @@ __all__ = [
     "Baseline",
     "Block",
     "Calibration",
+    "Clock",
     "Derived",
     "DeviceGroup",
     "DeviceSession",
     "FEATURE_KEY_PREFIX",
+    "FrameCounts",
     "Gel",
     "Layout",
     "Markers",
@@ -73,6 +75,7 @@ REDUCTION_METHODS = ("nearest", "mean", "last")
 
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 _SESSION_META = re.compile(r"^tactile/[A-Za-z0-9_-]+/meta\.json$")
+_WALL_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
 
 
 class SchemaError(ValueError):
@@ -359,6 +362,57 @@ def read_info_lenient(data: Mapping[str, Any]) -> tuple[TactileInfo, list[str]]:
 
 
 @dataclass
+class Clock(Block):
+    """Anchors a session's host clock to the calendar and to the dataset's frames.
+
+    Sidecar ``host_ts`` values come from ``time.perf_counter()``, which has no epoch,
+    and LeRobot's own ``timestamp`` column is ``frame_index / fps``, restarting at
+    zero in every episode. ``wall_time`` and ``host_clock`` are the UTC time and the
+    host clock read at ``connect()``, so any ``host_ts`` maps to the calendar as
+    ``wall_time + (host_ts - host_clock)``. ``episode_origins`` holds, for each
+    episode in ``episodes`` in order, the host clock value when that episode's first
+    dataset frame was built, so frame ``k`` of the episode sits at
+    ``origin + k / fps`` on the host clock.
+    """
+
+    wall_time: str
+    host_clock: float
+    episode_origins: list[float]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.wall_time, str) or not _WALL_TIME.match(self.wall_time):
+            raise SchemaError(
+                "clock.wall_time must be UTC ISO 8601 like '2026-11-21T14:03:05.117Z', "
+                f"got {self.wall_time!r}"
+            )
+        if not _is_number(self.host_clock):
+            raise SchemaError(f"clock.host_clock must be a number, got {self.host_clock!r}")
+        if not isinstance(self.episode_origins, list) or any(not _is_number(v) for v in self.episode_origins):
+            raise SchemaError(f"clock.episode_origins must be numbers, got {self.episode_origins!r}")
+
+
+@dataclass
+class FrameCounts(Block):
+    """The sensor's frame counters since ``connect()``, so per session.
+
+    ``received`` frames reached the host; ``dropped`` were lost at the source, seen as
+    gaps in ``seq``; ``overflowed`` were discarded on the host because the recorder
+    did not drain the sensor in time. They are read from the sensor's counters, not
+    reconstructed from the episode files.
+    """
+
+    received: int
+    dropped: int
+    overflowed: int
+
+    def __post_init__(self) -> None:
+        for name in ("received", "dropped", "overflowed"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise SchemaError(f"frames.{name} must be a non-negative integer, got {value!r}")
+
+
+@dataclass
 class DeviceSession(Block):
     """Serial and firmware of the shared hub during one session."""
 
@@ -451,6 +505,8 @@ class SessionRecord(Block):
     ``adapter``, ``calibration`` and ``baseline`` have no default: they are
     always written, as ``null`` when unknown, so their absence is a visible fact.
     ``episodes`` is the inclusive range of episode indices the session covers.
+    ``clock`` and ``frames`` are written by the recorder; a ``clock`` must carry
+    one episode origin per episode in the range.
     """
 
     session_id: str
@@ -458,6 +514,8 @@ class SessionRecord(Block):
     adapter: Adapter | None
     calibration: Calibration | None
     baseline: Baseline | None
+    clock: Clock | None = None
+    frames: FrameCounts | None = None
     serial: str | None = None
     firmware: str | None = None
     device: DeviceSession | None = None
@@ -468,6 +526,8 @@ class SessionRecord(Block):
     _key_order: ClassVar[tuple[str, ...] | None] = (
         "session_id",
         "episodes",
+        "clock",
+        "frames",
         "serial",
         "firmware",
         "device",
@@ -488,6 +548,11 @@ class SessionRecord(Block):
         first, last = self.episodes
         if first < 0 or last < first:
             raise SchemaError(f"episodes must satisfy 0 <= first <= last, got {list(self.episodes)}")
+        if self.clock is not None and len(self.clock.episode_origins) != last - first + 1:
+            raise SchemaError(
+                f"clock.episode_origins has {len(self.clock.episode_origins)} values for "
+                f"{last - first + 1} episodes {list(self.episodes)}"
+            )
 
 
 @dataclass
@@ -646,6 +711,10 @@ def _require_slug(value: Any, path: str) -> None:
 def _require_session_meta(value: Any) -> None:
     if not isinstance(value, str) or not _SESSION_META.match(value):
         raise SchemaError(f"session_meta must look like 'tactile/<instance_id>/meta.json', got {value!r}")
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _require_positive(value: Any, path: str) -> None:
