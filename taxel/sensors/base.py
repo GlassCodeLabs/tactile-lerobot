@@ -366,8 +366,8 @@ class TactileSensor(abc.ABC):
 
         The buffer holds ``config.buffer_size`` frames; when it overflows the oldest are
         discarded and ``overflowed_frames`` grows. Draining does not affect ``async_read``.
+        Works after :meth:`disconnect` too, so a recorder can flush the tail of a stream.
         """
-        self._require_connected()
         with self._cond:
             frames = list(self._buffer)
             self._buffer.clear()

@@ -7,8 +7,11 @@ from taxel.sensors.base import (
     host_clock,
     make_tactile_sensor,
 )
+from taxel.sensors.simulated import SimulatedTactile, SimulatedTactileConfig
 
 __all__ = [
+    "SimulatedTactile",
+    "SimulatedTactileConfig",
     "TactileReading",
     "TactileSensor",
     "TactileSensorConfig",

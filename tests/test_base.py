@@ -200,11 +200,21 @@ class TestContract:
 
     def test_reads_require_connection(self) -> None:
         sensor = fake()
-        for call in (sensor.read, sensor.async_read, sensor.read_latest, sensor.drain):
+        for call in (sensor.read, sensor.async_read, sensor.read_latest):
             with pytest.raises(ConnectionError, match="not connected"):
                 call()
         with pytest.raises(ConnectionError):
             sensor.capture_baseline(0.1)
+        assert sensor.drain() == []  # nothing received yet; no connection needed
+
+    def test_drain_after_disconnect_flushes_the_tail(self) -> None:
+        sensor = fake()
+        sensor.connect()
+        time.sleep(0.03)
+        sensor.disconnect()
+        frames = sensor.drain()
+        assert len(frames) == sensor.frames_received >= 2
+        assert sensor.drain() == []
 
     def test_warmup_timeout_disconnects(self) -> None:
         sensor = fake(seqs=(), timeout_ms=100.0)  # exhausted at once: never a frame
