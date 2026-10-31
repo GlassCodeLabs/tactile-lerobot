@@ -39,7 +39,7 @@ A suffixed key is its own feature entry. Its `info` carries only `reduction`, wh
 
 ## Static metadata: the feature entry's `info`
 
-Each instance's static metadata goes in its feature entry in `meta/info.json`, under `info`, the slot LeRobot core already uses for its own per-feature metadata (video and depth parameters). LeRobot 0.6.1 keeps extra keys there through `finalize`, reload, `resume` and the edit tools, and uploads them unchanged with `push_to_hub` (checked on array features; video features untested, see question 6). It drops unknown top-level keys in `info.json`, so a top-level `tactile_sensors` block does not work.
+Each instance's static metadata goes in its feature entry in `meta/info.json`, under `info`, the slot LeRobot core already uses for its own per-feature metadata (video and depth parameters). LeRobot 0.6.1 keeps extra keys there through `finalize`, reload, `resume` and the edit tools, and uploads them unchanged with `push_to_hub` (checked on array features, and for video features core merges its probed `video.*` keys into the existing `info` rather than replacing it). It drops unknown top-level keys in `info.json`, so a top-level `tactile_sensors` block does not work.
 
 Only facts that hold for every session go here. `lerobot-edit-dataset merge` requires non-video feature entries to be identical, `info` included, so anything that varies between sessions in `info` would make two sessions impossible to merge.
 
@@ -164,7 +164,7 @@ One file per instance, holding one record per recording session and the episodes
 Field notes:
 
 - `episodes` is an inclusive range of episode indices recorded in that session.
-- `clock` anchors the session's host clock. Sidecar `host_ts` values come from a monotonic clock with no epoch, and LeRobot's own `timestamp` column is `frame_index / fps`, restarting at zero in every episode. `wall_time` is the UTC time at `connect()` and `host_clock` the host clock value at the same instant, so any `host_ts` maps to the calendar as `wall_time + (host_ts − host_clock)`. `episode_origins` holds one value per episode in `episodes`, in order: the host clock value when the episode's first dataset frame was built. Dataset frame `k` of that episode is at `origin + k / fps` on the host clock, which is also the target time its dataset-rate copy was reduced at.
+- `clock` anchors the session's host clock. Sidecar `host_ts` values come from a monotonic clock with no epoch, and LeRobot's own `timestamp` column is `frame_index / fps`, restarting at zero in every episode. `wall_time` is the UTC time when the session starts, right after `connect()`, and `host_clock` the host clock value at the same instant, so any `host_ts` maps to the calendar as `wall_time + (host_ts − host_clock)`. `episode_origins` holds one value per episode in `episodes`, in order: the host clock value when the episode's first dataset frame was built. Dataset frame `k` of that episode is at `origin + k / fps` on the host clock, which is also the target time its dataset-rate copy was reduced at.
 - `frames` holds the sensor's frame counters since `connect()`, so per session: `received` by the host, `dropped` at the source (gaps in `seq`), `overflowed` on the host because the recorder did not drain the sensor in time. They come from the sensor's counters, not from the episode files; when `seq` is present, `dropped` equals the sum of the `seq` gaps across the session's episode files.
 - `device` holds the hub's `serial` and `firmware` for that session, and is `null` when the instance's `info.device` is `null`. Per-fingertip identity (serial, gel or skin, calibration) stays with the instance, so replacing one fingertip does not change the identity of the others.
 - `adapter` names the code that turned the sensor's output into the stored values, and its version. A bug found in an adapter can then be traced to the datasets it affected.
@@ -186,7 +186,7 @@ Field notes:
 
 Parquet stores the array features as Hugging Face `Array2D` columns, readable with plain pyarrow or pandas, without LeRobot.
 
-**Normalization stats are per channel, not per element.** LeRobot computes `stats.json` over the last dimension, so a `(52, 3)` feature gets stats of shape `(3,)` and a policy normalizer scales every taxel by the same three numbers. Per-taxel baselines and drift are computed from the data by `tactile doctor`, never read from `stats.json`. For the same reason, main-table layouts that pad a fixed-size block of samples per row are avoided: NaN padding makes the stats NaN, and zero padding biases them.
+**Normalization stats are per channel, not per element.** LeRobot computes `stats.json` over the last dimension, so a `(52, 3)` feature gets stats of shape `(3,)` and a policy normalizer scales every taxel by the same three numbers. Per-taxel baselines and drift are computed from the data by `taxel doctor`, never read from `stats.json`. For the same reason, main-table layouts that pad a fixed-size block of samples per row are avoided: NaN padding makes the stats NaN, and zero padding biases them.
 
 ## Native-rate streams: `tactile/<instance_id>/episode-{index:06d}.parquet`
 
@@ -225,7 +225,7 @@ A copy at the dataset fps in the main table is optional and recommended, since m
 
 A dataset-rate copy cannot show dropped frames or clock skew. Those are only visible in the native stream, which is why it is never optional when the rates differ. A visuotactile image at the dataset fps carries only what the video shows; its suffixed streams, when present, carry the native timing.
 
-What core does and doesn't do with sidecars in 0.6.1: a full load ignores them and works normally, and `push_to_hub` uploads them with the rest of the folder. `lerobot-edit-dataset` copies only `meta/`, `data/` and `videos/`, and a partial load (`episodes=[…]`) downloads only the listed files, so both leave the sidecar behind. Tools in this project carry it; core tools do not yet.
+What core does and doesn't do with sidecars in 0.6.1: a full load ignores them and works normally, and `push_to_hub` uploads them with the rest of the folder. `lerobot-edit-dataset` copies only `meta/`, `data/` and `videos/`, and a partial load (`episodes=[…]`) downloads only the listed files, so both leave the sidecar behind. Tools in this project carry it; core tools do not yet. `lerobot-edit-dataset merge` also fails on any dataset with a 2-D feature in 0.6.x, tactile or not, because it rewrites the data parquet through pandas and pyarrow cannot convert a 2-D array column from a DataFrame; merging a tactile dataset therefore needs a tool in this project.
 
 ## Writing tactile data
 
@@ -233,11 +233,11 @@ The public dataset API (`LeRobotDataset.create` → `add_frame` → `save_episod
 
 Stock `lerobot-record` does not. A robot that returns a `(52, 3)` array from `get_observation()` is rejected by `hw_to_dataset_features`, which treats any non-1-D shape as a camera and expects `(H, W, C)`, and `build_dataset_frame` passes through only 1-D float arrays and images. Folding the taxels into `observation.state` or declaring a `(52, 3, 1)` "depth camera" both load, and both lose what the data is. Plugin discovery offers no other route.
 
-This project therefore records through the public API with its own `tactile-record` command, built on `make_robot_from_config`, `build_dataset_frame` and `LeRobotDataset.add_frame`. A small upstream change to `lerobot/utils/feature_utils.py` (accept an N-D numeric spec in `hw_to_dataset_features`, pass N-D arrays through in `build_dataset_frame`), open as [huggingface/lerobot#5149](https://github.com/huggingface/lerobot/pull/5149), would let `lerobot-record` do the same once merged.
+This project therefore records through the public API with its own `taxel record` command ([docs/recording.md](docs/recording.md)), built on `make_robot_from_config`, `build_dataset_frame` and `LeRobotDataset.add_frame`. A small upstream change to `lerobot/utils/feature_utils.py` (accept an N-D numeric spec in `hw_to_dataset_features`, pass N-D arrays through in `build_dataset_frame`), open as [huggingface/lerobot#5149](https://github.com/huggingface/lerobot/pull/5149), would let `lerobot-record` do the same once merged.
 
 ## Health annotations
 
-`tactile doctor` writes a per-episode report to `tactile/health.json`, beside the data and never inside `info.json`:
+`taxel doctor` writes a per-episode report to `tactile/health.json`, beside the data and never inside `info.json`:
 
 ```json
 {
@@ -276,7 +276,7 @@ Thresholds are conservative defaults and are recorded with the result so a later
 3. Sidecars: core edit tools and partial loads leave `tactile/` behind. Would you accept that until core knows about it, or would you rather keep native-rate data in the main table despite the padding cost to stats?
 4. Normalization: is per-channel normalization acceptable for tactile policies, or do you normalize per taxel, and where?
 5. Is `layout.positions_mm` the right level of geometry, or do people need full per-element frames (position + orientation)? Does anyone actually use this in a policy today?
-6. For visuotactile sensors, is a reference frame pointer enough for `baseline`, or should a small reference image be stored directly? And does core's own write of video `info` keep the extra keys on a video feature? (Checked for parquet features, not yet for video.)
+6. For visuotactile sensors, is a reference frame pointer enough for `baseline`, or should a small reference image be stored directly? (Core's own write of video `info` keeps extra keys in 0.6.1: it merges the probed `video.*` values into the existing dict.)
 7. What does your pipeline do with the no-contact baseline today? Subtract at record time, at load time, or never?
 8. What calibration methods are in use that should be in a controlled vocabulary?
 9. For derived point-set streams (`.displacement`, `.force`), should point positions be stored, and where: per frame, or once in `info`?
@@ -294,9 +294,9 @@ Thresholds are conservative defaults and are recorded with the result so a later
   - New principle 5, "raw is always recoverable".
   - Static metadata moved from a top-level `tactile_sensors` block, which LeRobot 0.6.1 drops, to each feature entry's `info`.
   - Static and per-session metadata split: serial, firmware, the hub's serial and firmware, `adapter`, `calibration`, `baseline`, `gel` and `skin` move to `tactile/<instance_id>/meta.json`, since `merge` requires identical feature entries.
-  - `channels` required for `taxel_array`, `magnetic` and `force_torque`; per-frame shape is `(n_elements, len(channels))`, with `force_torque` as `(1, 6)`. Stats are per channel; per-taxel statistics are computed by `tactile doctor`.
+  - `channels` required for `taxel_array`, `magnetic` and `force_torque`; per-frame shape is `(n_elements, len(channels))`, with `force_torque` as `(1, 6)`. Stats are per channel; per-taxel statistics are computed by `taxel doctor`.
   - Native-rate sidecar layout defined: `tactile/<instance_id>/episode-{index:06d}.parquet` with `episode_index`, `sample_index`, `host_ts`, `device_ts`, `seq`, `data`. Health reports move to `tactile/health.json`.
-  - Record path: the public dataset API writes tactile features with no core change; stock `lerobot-record` does not, so recording goes through `tactile-record`, with the upstream change opened as [huggingface/lerobot#5149](https://github.com/huggingface/lerobot/pull/5149).
+  - Record path: the public dataset API writes tactile features with no core change; stock `lerobot-record` does not, so recording goes through `taxel record`, with the upstream change opened as [huggingface/lerobot#5149](https://github.com/huggingface/lerobot/pull/5149).
   - Sibling `.displacement` / `.force` keys checked against 0.6.1: they load, get stats and carry `info` exactly as a single key does, so they stay.
   - Interoperability rewritten against PR #4469's code and TLabel's spec. Open questions revised.
   - 2026-10-30: `clock` (`wall_time`, `host_clock`, `episode_origins`) and `frames` (`received`, `dropped`, `overflowed`) added to the session record. The host clock has no epoch and LeRobot's timestamps restart in every episode; the anchor and the per-episode origins make sidecar `host_ts` comparable with both, and the counters record losses as the sensor counted them.

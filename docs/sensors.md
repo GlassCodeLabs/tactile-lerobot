@@ -40,7 +40,7 @@ While connected, three methods return a `TactileReading` with different guarante
 - `device_ts`: the sensor's own timestamp in seconds, or `None` when it has no clock.
 - `seq`: the sensor's own frame counter, or `None`. A jump means the device dropped frames before they reached the host.
 
-`host_clock()` is `time.perf_counter()`, the clock LeRobot's cameras stamp frames with, so tactile and video timestamps are comparable within one process. It is monotonic and has no epoch: two values from different processes or different runs cannot be compared, and a value on its own cannot be placed on a calendar. To make a sidecar's timestamps meaningful later, the session record must store the wall-clock time and the `host_clock()` value taken at `connect()`. Writing that pair is the dataset writer's responsibility, not the backend's.
+`host_clock()` is `time.perf_counter()`, the clock LeRobot's cameras stamp frames with, so tactile and video timestamps are comparable within one process. It is monotonic and has no epoch: two values from different processes or different runs cannot be compared, and a value on its own cannot be placed on a calendar. To make a sidecar's timestamps meaningful later, the session record's `clock` block stores the wall-clock time and the `host_clock()` value read together when a session starts, right after `connect()`. The dataset writer writes that pair, not the backend; see [recording.md](recording.md).
 
 ## Counters
 
