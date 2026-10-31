@@ -9,9 +9,10 @@ The caller creates the dataset through LeRobot's public API with the entries fro
         writer.start_episode()
         for each dataset frame:
             dataset.add_frame({**robot_frame, **writer.frame(), "task": task})
-        writer.end_episode()
-        dataset.save_episode()
+        writer.stop_episode()
         writer.idle()  # while the environment is reset
+        writer.end_episode()  # or discard_episode() to re-record
+        dataset.save_episode()
     writer.finalize()
     dataset.finalize()
 
@@ -165,6 +166,7 @@ class TactileDatasetWriter:
             raise ValueError("no sensors given")
         self._session_id: str | None = None
         self._episode: int | None = None
+        self._capturing = False
         self._origin = 0.0
         self._n_frames = 0
 
@@ -209,6 +211,7 @@ class TactileDatasetWriter:
         if self._episode is not None:
             raise RuntimeError(f"episode {self._episode} is still open")
         self._episode = int(self._dataset.meta.total_episodes)
+        self._capturing = True
         self._n_frames = 0
         for stream in self._streams.values():
             stream.drain()
@@ -222,6 +225,8 @@ class TactileDatasetWriter:
         """
         if self._episode is None:
             raise RuntimeError("call start_episode() first")
+        if not self._capturing:
+            raise RuntimeError(f"episode {self._episode} is stopped; end or discard it, then start the next")
         k = self._n_frames
         if k == 0:
             self._origin = host_clock()
@@ -236,15 +241,32 @@ class TactileDatasetWriter:
         self._n_frames = k + 1
         return out
 
+    def stop_episode(self) -> None:
+        """End the episode's capture: native frames that arrive from now on are not part of it.
+
+        Call it when the last dataset frame has been built, before any reset pause, so
+        the episode can still be ended or discarded afterwards.
+        """
+        if self._episode is None:
+            raise RuntimeError("no episode is open")
+        if self._capturing:
+            for stream in self._streams.values():
+                stream.drain()
+                stream.stop_episode()
+            self._capturing = False
+
     def end_episode(self) -> int:
-        """Write the episode's native frames and update every session record; return the episode index."""
+        """Write the episode's native frames and update every session record; return the episode index.
+
+        Stops the capture first if :meth:`stop_episode` was not called.
+        """
         if self._episode is None:
             raise RuntimeError("no episode is open")
         if self._n_frames == 0:
             raise RuntimeError(f"episode {self._episode} has no dataset frame; discard it instead")
+        self.stop_episode()
         index = self._episode
         for stream in self._streams.values():
-            stream.drain()
             stream.end_episode(index, self._origin)
         self._episode = None
         return index
@@ -256,12 +278,14 @@ class TactileDatasetWriter:
         for stream in self._streams.values():
             stream.discard_episode()
         self._episode = None
+        self._capturing = False
 
     def idle(self) -> None:
         """Drain the sensors between episodes so their buffers do not overflow.
 
-        Call it from the loop that runs while the environment is reset. Only the
-        newest window of frames is kept, for the next episode's first frame.
+        Call it from the loop that runs while the environment is reset, after
+        :meth:`stop_episode`. Only the newest window of frames is kept, for the next
+        episode's first frame.
         """
         for stream in self._streams.values():
             stream.drain()
@@ -405,6 +429,9 @@ class _Stream:
                 value = self._readings[before - 1].data.astype(np.float32)
         self._previous = value
         return value
+
+    def stop_episode(self) -> None:
+        self._in_episode = False
 
     def end_episode(self, index: int, origin: float) -> None:
         write_episode(episode_path(self.root, self.instance_id, index), index, self._readings, self.shape)

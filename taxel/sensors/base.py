@@ -77,7 +77,9 @@ class TactileSensorConfig:
     mount: Mount | None = None
     device: DeviceGroup | None = None
 
-    _choice_registry: ClassVar[dict[str, type[TactileSensorConfig]]] = {}
+    # `dict[str, Any]`, not `dict[str, type[...]]`: the `type` property below would shadow the builtin
+    # when typing.get_type_hints evaluates this annotation.
+    _choice_registry: ClassVar[dict[str, Any]] = {}
 
     def __post_init__(self) -> None:
         feature_key(self.instance_id)  # validates the slug

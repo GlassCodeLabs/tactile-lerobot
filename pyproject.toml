@@ -29,6 +29,9 @@ dependencies = ["numpy>=1.24"]
 lerobot = ["lerobot[dataset]>=0.6.1,<0.7", "pyarrow>=21"]
 dev = ["pytest>=8", "ruff==0.17.3"]
 
+[project.scripts]
+taxel = "taxel.cli.main:main"
+
 [project.urls]
 Homepage = "https://github.com/GlassCodeLabs/tactile-lerobot"
 Issues = "https://github.com/GlassCodeLabs/tactile-lerobot/issues"

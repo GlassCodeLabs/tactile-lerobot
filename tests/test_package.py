@@ -1,6 +1,9 @@
+import importlib.util
 import subprocess
 import sys
 from importlib.metadata import version
+
+import pytest
 
 import taxel
 
@@ -19,3 +22,12 @@ def test_core_packages_import_without_optional_dependencies() -> None:
     )
     out = subprocess.run([sys.executable, "-c", script], check=True, capture_output=True, text=True)
     assert out.stdout.strip() == "[]"
+
+
+@pytest.mark.skipif(importlib.util.find_spec("lerobot") is not None, reason="LeRobot is installed")
+def test_record_without_the_extra_names_it(capsys) -> None:
+    from taxel.cli.main import main
+
+    assert main(["record", "--robot.type=cameras_only"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("taxel record: LeRobot is not installed") and "pip install 'taxel[lerobot]'" in err
