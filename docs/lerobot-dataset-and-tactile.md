@@ -119,6 +119,6 @@ These were open when the page was first written. Each is now settled in [SCHEMA.
 
 1. *Does LeRobot preserve unknown keys inside a feature's `info.json` entry?* Yes, under the entry's `info`; unknown top-level keys are dropped. SCHEMA.md, Static metadata.
 2. *Where should per-sensor metadata and native-rate timestamps live?* Static facts in the feature entry's `info`; per-session facts and native-rate samples in `tactile/<instance_id>/` sidecars. SCHEMA.md, Per-session metadata and Native-rate streams.
-3. *Does TLabel's 14-dimension schema map onto one-key-per-instance?* TLabel is an annotation layer that sits above a raw format; its code handles one sensor per file. SCHEMA.md, Interoperability.
+3. *Does TLabel's 14-dimension schema map onto one-key-per-instance?* TLabel is a storage format (one `TLabelData` document per sensor stream) with a label schema on top, so the mapping is bidirectional rather than layered; its documents hold one sensor stream each. SCHEMA.md, Interoperability.
 4. *For a visuotactile sensor stored as a video key, where do gel ID and calibration version attach?* Gel and calibration are per-session and go in the instance's sidecar `meta.json`; static keys go in the video feature's `info`. Whether core's own video write keeps extra `info` keys is still open (SCHEMA.md, question 6).
 5. *What does `create()` → `add_frame()` → `save_episode()` → `finalize()` require of a new feature?* A `dtype`, `shape`, `names` entry; an N-D float32 feature round-trips with no core change. `examples/write_tactile_feature.py` shows it.

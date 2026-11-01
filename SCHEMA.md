@@ -1,6 +1,6 @@
-# Tactile data schema for LeRobot datasets — draft 0.2
+# Tactile data schema for LeRobot datasets — draft 0.3
 
-*Status: draft for feedback, October 2026. Nothing here is final. The goal is to converge with [LeRobot PR #4469](https://github.com/huggingface/lerobot/pull/4469), [TLabel](https://github.com/liesliy/tlabel) and [Multi-Frequency-LeRobot](https://github.com/RoboCoin-BAAI/Multi-Frequency-LeRobot), not to add a fourth incompatible layout. Open questions are listed at the end; those are the ones I'd most like answered.*
+*Status: draft for feedback, November 2026. Nothing here is final. The goal is to converge with [LeRobot PR #4469](https://github.com/huggingface/lerobot/pull/4469), [TLabel](https://github.com/liesliy/tlabel) and [Multi-Frequency-LeRobot](https://github.com/RoboCoin-BAAI/Multi-Frequency-LeRobot), not to add a fourth incompatible layout. 0.3 applies the answers given on #4469 ([comment](https://github.com/huggingface/lerobot/pull/4469#issuecomment-6555461272)) to 0.2's open questions. The questions still open are listed at the end; those are the ones I'd most like answered.*
 
 Everything below targets LeRobot 0.6.1 (dataset format v3.0) and was checked against it: an `(N, C)` float32 tactile feature with per-instance metadata in its `info` entry writes, reloads and resumes through the public `LeRobotDataset` API with no change to LeRobot core. [`examples/write_tactile_feature.py`](examples/write_tactile_feature.py) shows the round trip.
 
@@ -35,7 +35,7 @@ observation.tactile.<instance_id>.force
 
 `.displacement` and `.force` are allowed only when the instance's `info` carries a `derived` block naming the method that produced them. In 0.6.1 these sibling keys and a single `(N, 6)` key behave the same on every check (loading, stats, metadata, `delta_timestamps`, file size); siblings are used here because they keep the image as the instance's main stream.
 
-A suffixed key is its own feature entry. Its `info` carries only `reduction`, when its main-table column is a dataset-rate copy of a faster native stream, and `session_meta`, pointing at the instance's sidecar. Everything else (`family`, `derived`, `mount`, `device`) is read from the instance's entry.
+A suffixed key is its own feature entry. Its `info` carries only `reduction`, when its main-table column is a dataset-rate copy of a faster native stream, and `session_meta`, pointing at the instance's sidecar. Everything else (`family`, `derived`, `layout`, `mount`, `device`) is read from the instance's entry.
 
 ## Static metadata: the feature entry's `info`
 
@@ -55,7 +55,13 @@ Only facts that hold for every session go here. `lerobot-edit-dataset merge` req
     "units": {"force": "N"},
     "channels": ["fx", "fy", "fz"],
     "layout": {
-      "frame": "sensor",
+      "origin": {"at": "corner", "description": "taxel 0, the corner of the array nearest the connector"},
+      "axes": {
+        "x": "along the long side of the array, away from the connector",
+        "y": "across the array, from taxel 0 toward taxel 8",
+        "z": "out of the sensing surface, toward the contacting object"
+      },
+      "surface": "pad",
       "positions_mm": [[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], "..."],
       "normals": [[0, 0, 1], [0, 0, 1], "..."]
     },
@@ -76,6 +82,15 @@ Only facts that hold for every session go here. `lerobot-edit-dataset merge` req
     "vendor": "GelSight",
     "model": "DIGIT",
     "declared_rate_hz": 60,
+    "layout": {
+      "origin": {"at": "corner", "description": "the top-left pixel of the image"},
+      "axes": {
+        "x": "along an image row, toward the right",
+        "y": "down an image column",
+        "z": "out of the gel, toward the contacting object"
+      },
+      "surface": "gel"
+    },
     "reduction": {"method": "nearest", "window_ms": 33.3},
     "markers": {"count": 63, "grid": [7, 9]},
     "derived": {"method": "marker-flow-depth", "version": "0.1.0"},
@@ -96,7 +111,13 @@ Only facts that hold for every session go here. `lerobot-edit-dataset merge` req
     "units": {"field": "uT"},
     "channels": ["bx", "by", "bz"],
     "layout": {
-      "frame": "sensor",
+      "origin": {"at": "element", "description": "the central magnetometer"},
+      "axes": {
+        "x": "across the board, from the central magnetometer toward the second",
+        "y": "across the board, from the central magnetometer toward the fourth",
+        "z": "out of the skin, toward the contacting object"
+      },
+      "surface": "die",
       "positions_mm": [[0, 0, 0], [6, 0, 0], [-6, 0, 0], [0, 6, 0], [0, -6, 0]],
       "normals": null
     },
@@ -112,14 +133,15 @@ Core keys (`dtype`, `shape`, `names`) follow LeRobot's rules; only `info` is add
 
 - `family` is one of `taxel_array`, `visuotactile`, `magnetic`, `force_torque`. Adding a family is a schema change; adding a vendor is not.
 - `channels` is required for `taxel_array`, `magnetic` and `force_torque`, and fixes the last dimension: per-frame shape is `(n_elements, len(channels))`. A force-torque sensor is one element, `(1, 6)`, so every array family shares this shape and the key stays its own feature instead of folding into `observation.state` as a 1-D array would. Order is the declared order, so `["fx", "fy", "fz", "dx", "dy", "dz"]` is as valid as `["fx", "fy", "fz"]`.
-- `layout.positions_mm` is the physical position of each element in the sensor's own frame. For taxel arrays and magnetic sensors its length equals `n_elements`. For visuotactile sensors the image itself is the layout; `markers.grid` gives the marker arrangement.
+- `layout` is required for every family and declares the sensor's own coordinate frame, because two sensors can both publish `positions_mm` and be mutually uninterpretable if one measures from a top-left origin and the other from a bottom-left one, or one from the gel surface and the other from the sensor die. `origin.at` says where (0, 0, 0) sits on the sensor body: `center` or `corner` of the sensing area, `element` for a sensing element, or `mount` for the mounting face; `origin.description` says which corner or element in words. `axes.x`, `axes.y` and `axes.z` say in words where +x, +y and +z point, in the sensor's own terms. The frame is right-handed, and +z out of the sensing surface toward the contacting object is the convention; an adapter that keeps a vendor frame with another convention says so in `axes.z`. `surface` says which surface the frame and the positions describe: `gel` (the outer face of a transparent elastomer), `die` (the plane of the sensing elements, under whatever covers them), `skin` (the outer face of a replaceable skin), `pad` (the outer face of a fixed contact pad over the elements), or `vendor` (positions copied from the vendor's documentation, whose own frame definition applies; the document is named in the session record's `calibration.reference`). Any other value is an error.
+- `layout.positions_mm` is the physical position of each element in that frame, in millimetres, one `[x, y, z]` row per element. It is required for `taxel_array` and `magnetic`, where its length equals `n_elements`; optional for `force_torque`, one row if given; and omitted for `visuotactile`, where the image is the element arrangement and `markers.grid` the marker arrangement, while `layout` still declares the frame the `.displacement` and `.force` streams are expressed in and the surface the image shows. `layout.normals` is optional: one unit vector per position.
 - `reduction` is present only when the main-table column is a copy at the dataset fps of a faster native stream, or, for a video feature, when the sensor runs faster than the dataset fps. `method` is one of `nearest`, `mean`, `last`; `window_ms` is the span of native samples each dataset frame was reduced from.
 - `derived` is required when `.displacement` or `.force` streams are present, and names the algorithm (`method`) and its `version`. Point count and order are defined by that method.
 - `mount` records where on the robot the sensor sits. `pose` is a 4×4 or (xyz, quat) in the link frame if known, else `null`. Moving a sensor to another link makes it a different instance.
 - `device` groups instances that share one physical connection, such as several fingertips on one serial hub. `id` is a slug unique in the dataset; `clock` names the timebase, and instances with the same `clock` have directly comparable `device_ts`. `device` is `null` for a sensor with its own connection. The grouping is structural, so it lives here: five keys with the same `device.id` are one hand. The hub's serial and firmware can change and live in the session record.
 - `session_meta` points to the instance's sidecar `meta.json`, relative to the dataset root.
 - On video features, the tactile keys sit beside core's own `video.*` keys and never use that prefix.
-- For visuotactile sensors the image stream is stored at the dataset fps. When the sensor runs faster, `info.reduction` records `{"method": "nearest", "window_ms": …}` and the native-rate requirement applies to the instance's array streams (`.markers`, `.displacement`, `.force`), when present, not to the image; storing raw frames outside the video encoder is out of scope for 0.2.
+- For visuotactile sensors the image stream is stored at the dataset fps. When the sensor runs faster, `info.reduction` records `{"method": "nearest", "window_ms": …}` and the native-rate requirement applies to the instance's array streams (`.markers`, `.displacement`, `.force`), when present, not to the image; storing raw frames outside the video encoder is out of scope for 0.3.
 
 ## Per-session metadata: `tactile/<instance_id>/meta.json`
 
@@ -152,8 +174,10 @@ One file per instance, holding one record per recording session and the episodes
         "captured_at": "2026-11-21T14:03:11Z",
         "duration_s": 2.0,
         "applied": true,
+        "frame_range": [364, 545],
         "values": [[0.01, -0.02, 0.00], "..."]
       },
+      "baseline_stream": {"sample_every": 100},
       "gel": null,
       "skin": null
     }
@@ -168,8 +192,9 @@ Field notes:
 - `frames` holds the sensor's frame counters since `connect()`, so per session: `received` by the host, `dropped` at the source (gaps in `seq`), `overflowed` on the host because the recorder did not drain the sensor in time. They come from the sensor's counters, not from the episode files; when `seq` is present, `dropped` equals the sum of the `seq` gaps across the session's episode files.
 - `device` holds the hub's `serial` and `firmware` for that session, and is `null` when the instance's `info.device` is `null`. Per-fingertip identity (serial, gel or skin, calibration) stays with the instance, so replacing one fingertip does not change the identity of the others.
 - `adapter` names the code that turned the sensor's output into the stored values, and its version. A bug found in an adapter can then be traced to the datasets it affected.
-- `calibration.method` is free text for now (`vendor`, `3dcal`, `nano17-press`, `uncalibrated-by-design`). A controlled vocabulary can come later once there are a few real values.
-- `baseline` is what the sensor read with nothing touching it at session start. For taxel and magnetic families it is stored as `values`; for visuotactile it is a `reference_frame` pointer (`"episode_000000/frame_0000"`). `applied` says whether the values were subtracted at record time. When `applied` is `true`, stored data plus `baseline.values` must reconstruct the raw readings exactly. `applied: true` is valid only where the baseline is stored as values.
+- `calibration.method` is free text for now (`vendor`, `3dcal`, `nano17-press`, `uncalibrated-by-design`). A controlled vocabulary can come later once there are a few real values. `calibration.reference` names the document the calibration or, for `layout.surface: "vendor"`, the element positions were taken from.
+- `baseline` is what the sensor read with nothing touching it at session start. For taxel and magnetic families it is stored as `values`; for visuotactile it is a `reference_frame` pointer (`"episode_000000/frame_0000"`). `frame_range` is `[first_seq, last_seq]` of the native frames averaged into `values`, `null` when the sensor has no `seq`; it lets a consumer audit what the baseline absorbed, since a capture that starts with the sensor already loaded absorbs the load and offsets every later reading low. `applied` says whether the values were subtracted at record time. When `applied` is `true`, stored data plus the baseline in force must reconstruct the raw readings exactly; the baseline in force is read from the baseline stream, since a backend may re-baseline after this capture, and `baseline` here is only the capture at session start. `applied: true` is valid only where the baseline is stored as values.
+- `baseline_stream` declares the sampling period of the instance's baseline stream (see Baseline stream): one raw sample every `sample_every` native samples. It is `null` when the session wrote no baseline stream.
 - `gel` (`{"id", "installed_at", "cycles_at_install"}`) and `skin` (`{"id", "installed_at"}`) are the replaceable-part identifiers. They are what make "this sensor degraded 30% faster than that one" answerable later.
 
 ## Per-frame data
@@ -181,12 +206,12 @@ Field notes:
 | `visuotactile` `.markers` | float32 | `(n_markers, 2)` | Optional; marker pixel coordinates |
 | `visuotactile` `.displacement` | float32 | `(N, 3)` | Optional; dx, dy, dz; requires `derived` |
 | `visuotactile` `.force` | float32 | `(N, 3)` | Optional; fx, fy, fz; requires `derived` |
-| `magnetic` | float32 | `(n_sensors, len(channels))` | Raw field. Baseline-subtracted view is computed at read time, not stored |
+| `magnetic` | float32 | `(n_sensors, len(channels))` | Raw field unless `baseline.applied`; the no-contact baseline lives in the session record and the baseline stream |
 | `force_torque` | float32 | `(1, 6)` | `channels` `["fx", "fy", "fz", "mx", "my", "mz"]` in the sensor frame; one element, so the key stays standalone |
 
 Parquet stores the array features as Hugging Face `Array2D` columns, readable with plain pyarrow or pandas, without LeRobot.
 
-**Normalization stats are per channel, not per element.** LeRobot computes `stats.json` over the last dimension, so a `(52, 3)` feature gets stats of shape `(3,)` and a policy normalizer scales every taxel by the same three numbers. Per-taxel baselines and drift are computed from the data by `taxel doctor`, never read from `stats.json`. For the same reason, main-table layouts that pad a fixed-size block of samples per row are avoided: NaN padding makes the stats NaN, and zero padding biases them.
+**The format stores physical units and normalizes nothing.** `units` names the unit of each quantity, and no scaling is applied at record time: different policies want different statistics (unit variance, the sensor's rated range, none at all), and the format is not the place to choose. Normalization is a load-time step, per channel, derived from LeRobot's `stats.json`, which is per channel already: LeRobot computes stats over the last dimension, so a `(52, 3)` feature gets stats of shape `(3,)` and a policy normalizer scales every taxel by the same three numbers. That keeps the spatial gradient across taxels that distinguishes a flat press from a corner contact, which per-taxel normalization would erase, and it stays reversible. Per-taxel baselines and drift are computed from the data by `taxel doctor`, never read from `stats.json`. For the same reason, main-table layouts that pad a fixed-size block of samples per row are avoided: NaN padding makes the stats NaN, and zero padding biases them.
 
 ## Native-rate streams: `tactile/<instance_id>/episode-{index:06d}.parquet`
 
@@ -201,7 +226,10 @@ When the rates differ, the native-rate stream is required (except the visuotacti
     ├── left_fingertip/
     │   ├── meta.json
     │   ├── episode-000000.parquet
-    │   └── episode-000001.parquet
+    │   ├── episode-000001.parquet
+    │   └── baseline/              # the baseline stream, one file per episode
+    │       ├── episode-000000.parquet
+    │       └── episode-000001.parquet
     └── right_fingertip/
         ├── meta.json
         └── markers/               # a suffixed stream keeps its own files
@@ -219,13 +247,38 @@ When the rates differ, the native-rate stream is required (except the visuotacti
 
 `data` is stored as an Arrow fixed-shape tensor column (the `fixed_shape_tensor` canonical extension type), which pyarrow reads back as one `(n_samples, …)` array; the other columns are plain.
 
-A suffixed stream keeps its own files: `tactile/<instance_id>/<suffix>/episode-{index:06d}.parquet` (for example `tactile/right_fingertip/markers/`), with the same columns.
+A suffixed stream keeps its own files: `tactile/<instance_id>/<suffix>/episode-{index:06d}.parquet` (for example `tactile/right_fingertip/markers/`), with the same columns. The directory name `baseline` under an instance is reserved for the baseline stream and is not a stream suffix.
 
 A copy at the dataset fps in the main table is optional and recommended, since most training code reads one table. When present, the feature's `info.reduction` says how it was made. A reader that needs the timing aligns from the sidecar by nearest `host_ts` or by a window; the alignment policy lives in the loader, not the file. The host time of dataset frame `k` of an episode is the episode's origin from the session record's `clock` plus `k / fps`.
 
 A dataset-rate copy cannot show dropped frames or clock skew. Those are only visible in the native stream, which is why it is never optional when the rates differ. A visuotactile image at the dataset fps carries only what the video shows; its suffixed streams, when present, carry the native timing.
 
 What core does and doesn't do with sidecars in 0.6.1: a full load ignores them and works normally, and `push_to_hub` uploads them with the rest of the folder. `lerobot-edit-dataset` copies only `meta/`, `data/` and `videos/`, and a partial load (`episodes=[…]`) downloads only the listed files, so both leave the sidecar behind. Tools in this project carry it; core tools do not yet. `lerobot-edit-dataset merge` also fails on any dataset with a 2-D feature in 0.6.x, tactile or not, because it rewrites the data parquet through pandas and pyarrow cannot convert a 2-D array column from a DataFrame; merging a tactile dataset therefore needs a tool in this project.
+
+## Baseline stream: `tactile/<instance_id>/baseline/episode-{index:06d}.parquet`
+
+A baseline captured once at session start and subtracted at record time loses whatever the sensor drifts to afterwards (thermal, gel creep, hysteresis), and a backend that re-baselines internally loses the drift for good: the stored frames return to zero while the sensor has not. The baseline stream keeps both recoverable. It is defined for the array families (a visuotactile instance's baseline is its `reference_frame` and has no stream in 0.3), written for every array-family instance whether or not a baseline is applied, one file per instance per episode, with two kinds of row:
+
+| Column | dtype | `capture` row | `sample` row |
+| --- | --- | --- | --- |
+| `episode_index` | int64 | the episode | the episode |
+| `sample_index` | int64 | first native sample of the episode the baseline applies to | the sampled native sample |
+| `kind` | string | `capture` | `sample` |
+| `seq` | int64 or null | that sample's `seq` | that sample's `seq` |
+| `host_ts` | float64 | host clock when the baseline took effect | the sample's receive time |
+| `frame_range` | 2 × int64 or null | `[first_seq, last_seq]` of the raw frames averaged, `null` without `seq` | `null` |
+| `values` | float32 | the baseline, in raw terms | the unsubtracted sample |
+
+`values` is a fixed-shape tensor column of the feature's per-frame shape, as `data` is in the native stream.
+
+- A **capture row** records a baseline that was subtracted from the stored frames from `sample_index` on. Every file opens with a capture row at `sample_index` 0 for the baseline in force at the episode's first frame, repeated from where it was first captured (its `host_ts` may precede the episode), so each episode reconstructs on its own. A baseline that takes effect during the episode, whether a backend re-baselined or the recorder did, adds a capture row at the first sample it applies to. Clearing a baseline is a capture row of zeros with `frame_range` `null`.
+- A **sample row** is the unsubtracted frame at every native sample whose `sample_index` is a multiple of the session record's `baseline_stream.sample_every`, so sample 0 is always sampled and every episode opens with a raw reading. One rule covers sensors with and without `seq`. The default period is 100: one raw sample per second at 100 Hz, one percent of the native stream.
+
+**Reconstruction (principle 5).** The raw value of native sample `i` is its stored `data` plus the `values` of the latest capture row with `sample_index <= i`; when there is no such row, the stored data is raw. When nothing was applied, the file has no capture rows and its samples equal the stored frames.
+
+**Why both kinds.** Capture rows are what reconstruction needs, exact to the sample. Sample rows are ground truth that does not depend on the subtractor reporting honestly: a firmware that re-zeroes without telling the host, a filter that tracks slowly, or an adapter bug all show up as a sample that disagrees with stored data plus the capture in force, which a validator reports as an integrity failure. Drift is read from the samples: with nothing touching the sensor, a sample minus the baseline in force should be zero, and its growth over an episode is the sensor drifting, visible even when the stored frames sit at zero because a backend re-baselined. That is what lets a health check tell "sensor drifted" from "policy is pressing".
+
+A backend may subtract only what it can report. A device-side tare whose values the host cannot read back is not allowed under principle 5; the backend subtracts on the host instead, or declares the device's values, so that every stored frame carries the baseline that was taken from it ([docs/sensors.md](docs/sensors.md)).
 
 ## Writing tactile data
 
@@ -259,31 +312,38 @@ This project therefore records through the public API with its own `taxel record
 }
 ```
 
-Thresholds are conservative defaults and are recorded with the result so a later run with different thresholds is distinguishable. For a video feature with `reduction`, `framerate` is measured against the dataset fps; the native rate is checked from the suffixed streams when present.
+Thresholds are conservative defaults and are recorded with the result so a later run with different thresholds is distinguishable. For a video feature with `reduction`, `framerate` is measured against the dataset fps; the native rate is checked from the suffixed streams when present. For array families `drift` is read from the baseline stream: the raw samples against the baseline in force, which separates sensor drift from a sustained press.
 
 ## Interoperability
 
-- **PR #4469.** The `TactileSensor` base class in this project follows that PR's method surface (`connect`, `read`, `async_read`, `read_latest`, `disconnect`) and config registry, so a merge or dependency is possible. Type mapping: `taxel_array` → `force`, `force_torque` → `wrench`; the PR's `displacement` and `force` point sets correspond to the optional `.displacement` and `.force` streams here, and its 6-D `full` layout to a single key with six declared `channels`. `magnetic` and visuotactile images have no PR type. The PR's `read()` returns no timestamps or per-sensor metadata and the PR defines no dataset layer; those are what this schema adds. A recording made with the PR's record-time tare is compliant if the tare values are stored with `baseline.applied: true`.
-- **TLabel.** TLabel is an annotation layer: per-frame labels (contact, slip, force magnitude, manipulation phase and others) computed from raw data. It sits above this schema, not beside it. Overlap is in the sensor description: TLabel's `manufacturer`, `model`, `sensor_type`, `frame_rate` and `provenance` (firmware, calibration date, sampling rate) map to `vendor`, `model`, `family`, `declared_rate_hz`, `firmware` and `calibration.date`. A converter would feed these recordings to TLabel's adapters, one instance at a time, and could store TLabel labels back alongside the raw data per instance.
+- **PR #4469.** The `TactileSensor` base class in this project follows that PR's method surface (`connect`, `read`, `async_read`, `read_latest`, `disconnect`) and config registry, so a merge or dependency is possible. Type mapping: `taxel_array` → `force`, `force_torque` → `wrench`; the PR's `displacement` and `force` point sets correspond to the optional `.displacement` and `.force` streams here, and its 6-D `full` layout to a single key with six declared `channels`. `magnetic` and visuotactile images have no PR type. The PR's `read()` returns no timestamps or per-sensor metadata and the PR defines no dataset layer; those are what this schema adds. A recording made with the PR's record-time tare is compliant if the tare values are stored with `baseline.applied: true` and the baseline stream carries the capture.
+- **TLabel.** TLabel is two things. It is a storage format: a `TLabelData` document, sensor-agnostic and lossless to round-trip, with `sensor_info` (the sensor and the adapter that produced the document), `capabilities` (which of its fourteen per-frame dimensions the producer actually emits) and `episodes` whose per-frame annotations carry `confidence` and a compliance level `L1` to `L4` (the #4469 discussion refers to these as its `provenance` and `data_quality` blocks). Adapters convert vendor formats into that document and exporters convert it back out. On top of the format it is a label schema: `contact`, `contact_centroid`, `slip_event`, `manipulation_phase` and the rest. So TLabel is a sibling format with a bidirectional mapping, not a layer above this schema: a recording in this layout is a source for TLabel documents, and TLabel's dimensions are a specification for what labels stored beside a recording mean. The converter lives in `tlabel` as an adapter, following the rule that conversion belongs to the package that owns the target format ([#4469 comment](https://github.com/huggingface/lerobot/pull/4469#issuecomment-6555461272)). This side of the contract is `taxel record` output, kept stable and listed in [docs/recording.md](docs/recording.md#interop-contract): per-instance `(N, C)` keys with channels declared in `info`, the native-rate sidecar, the baseline stream and `meta.json` for the session. The other side is one TLabel document per instance; back-conversion writes TLabel labels beside the raw data, per instance. Field overlap: `sensor_info.manufacturer`, `model`, `sensor_type`, `frame_rate`, `adapter_name` and `adapter_version` map to `vendor`, `model`, `family`, `declared_rate_hz` and the session record's `adapter`. TLabel models one sensor stream per document; instances that share a hub are grouped here by `device.id` and `device.clock`, which stay stable so documents from one hand can be grouped the same way.
 - **MCAP.** One channel per instance, schema per family, `host_ts` as the log time, `device_ts` as publish time where present, read from the native-rate sidecar where one exists. Camera and joint channels exported alongside so Foxglove opens the whole episode.
 
 ## Open questions (please answer any of these)
 
-0.1's questions on per-instance keys vs a ragged dimension, multi-rate storage, and TLabel field overlap are answered in 0.2; see Feature keys, Native-rate streams, and Interoperability.
+0.1's questions on per-instance keys vs a ragged dimension, multi-rate storage, and TLabel field overlap are answered in 0.2; see Feature keys, Native-rate streams, and Interoperability. Questions 3, 4, 5 and 7 were answered on [#4469](https://github.com/huggingface/lerobot/pull/4469#issuecomment-6555461272) and are resolved in 0.3; they keep their numbers and carry their answers so the numbering stays stable.
 
 1. Per-instance keys: does any training code need a stacked per-hub view (five fingertips as one array), and if so, should the loader build it from the `device` grouping rather than storing it?
 2. Static vs per-session: which facts change between your recording sessions? A fact placed in `info` that varies makes `merge` fail; one placed in the sidecar that never varies costs nothing.
-3. Sidecars: core edit tools and partial loads leave `tactile/` behind. Would you accept that until core knows about it, or would you rather keep native-rate data in the main table despite the padding cost to stats?
-4. Normalization: is per-channel normalization acceptable for tactile policies, or do you normalize per taxel, and where?
-5. Is `layout.positions_mm` the right level of geometry, or do people need full per-element frames (position + orientation)? Does anyone actually use this in a policy today?
+3. Sidecars: settled. Core edit tools and partial loads leave `tactile/` behind, and that is accepted until core knows about the directory, because padding the main table to protect native-rate data would cost the stats (see Per-frame data). The mitigation is a validator, `taxel doctor`, that detects a dataset whose sidecar is missing or incomplete and checks that the stored copy and the raw readings are reproducible from it, which is what makes principle 5 checkable rather than a promise.
+4. Normalization: resolved. Per channel, at load time, never inside the format; see Per-frame data.
+5. Geometry: resolved. `positions_mm` is the right level for storage, and its consumer is spatial alignment and multi-finger fusion rather than the policy, which reads a derived contact centroid. The gap was not orientation but a defined coordinate frame, which `layout` now declares; see Static metadata.
 6. For visuotactile sensors, is a reference frame pointer enough for `baseline`, or should a small reference image be stored directly? (Core's own write of video `info` keeps extra keys in 0.6.1: it merges the probed `video.*` values into the existing dict.)
-7. What does your pipeline do with the no-contact baseline today? Subtract at record time, at load time, or never?
+7. Baseline: resolved. Subtraction at record time is allowed provided what was subtracted is stored and raw stays reconstructable: `baseline.frame_range` says which frames a capture absorbed, and the baseline stream records every capture applied and a periodic raw sample, so drift is auditable even after a backend re-baselines; see Baseline stream.
 8. What calibration methods are in use that should be in a controlled vocabulary?
 9. For derived point-set streams (`.displacement`, `.force`), should point positions be stored, and where: per frame, or once in `info`?
-10. What is missing that would make you refuse to use this?
+10. Coverage: a float32 array cannot say "not measured", so a channel a sensor does not measure is filled with zero and "measured 0 N" and "not measured" become the same number. `derived.method` names how a stream was produced (a GelSight `.force` reconstructed from displacement looks like a PaXini `.force` measured directly) but not whether a number is a measurement at all, and a consumer should not have to parse a method string to learn that. Two designs: a per-channel `measured: true|false` beside `info.channels`, or a `capabilities` block on the instance mirroring TLabel's. Which would a converter find easier to emit and to check? The choice waits on that answer.
 
 ## Changelog
 
+- 0.3 (2026-11-01), applying the answers to 0.2's questions given on [#4469](https://github.com/huggingface/lerobot/pull/4469#issuecomment-6555461272):
+  - `layout` made explicit and required for every family: `origin` (`at` plus `description`), `axes` (`x`, `y`, `z` in words) and `surface` (`gel`, `die`, `skin`, `pad`, `vendor`) declare the coordinate frame `positions_mm` is expressed in. `positions_mm` is required for `taxel_array` and `magnetic`, optional for `force_torque`, omitted for `visuotactile`. `layout.frame` removed: it only ever said `sensor`, and `origin` and `axes` now say what that frame is. (Q5)
+  - `baseline.frame_range` added: `[first_seq, last_seq]` of the native frames a capture averaged, so a baseline that absorbed a load can be found. (Q7)
+  - Baseline stream `tactile/<instance_id>/baseline/episode-{index:06d}.parquet` added, with a capture row for every baseline applied and a raw sample every `baseline_stream.sample_every` native samples; stored data plus the baseline in force reconstructs raw, and the samples make that checkable. The session record's `baseline` is the capture at session start; later captures live in the stream. (Q7, principle 5)
+  - Normalization stated normatively: the format stores physical units and applies no scaling; normalization is per channel at load time from `stats.json`. (Q4)
+  - TLabel described as a sibling storage format with a bidirectional mapping, not an annotation layer above this schema. The converter lives in `tlabel`; this side's stable surfaces are listed in docs/recording.md, Interop contract.
+  - Open questions: 3 settled with the validator as the mitigation; 4, 5 and 7 resolved; 10 rewritten as the choice between a per-channel `measured` flag and a `capabilities` block, left open.
 - 0.2 (2026-10-29):
   - Timing: a native-rate stream with device and host timestamps is required whenever the sensor rate differs from the dataset fps; an optional dataset-rate copy in the main table must declare its `reduction` (`method`, `window_ms`).
   - Baseline: `baseline.applied` added. Record-time subtraction is allowed if the baseline values are stored; stored data plus baseline must reconstruct raw.

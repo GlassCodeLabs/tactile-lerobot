@@ -155,6 +155,18 @@ dataset.finalize()
 - A partial load (`episodes=[...]`) downloads only the listed files, and `lerobot-edit-dataset` copies only `meta/`, `data/` and `videos/`, so both leave the sidecar behind.
 - `lerobot-edit-dataset merge` fails on any dataset with a 2-D feature, tactile or not: it rewrites the data parquet through pandas, and pyarrow cannot convert a 2-D array column from a DataFrame. Merging a tactile dataset in 0.6.x therefore needs a tool in this project, which also has to concatenate the session records and offset their episode ranges, since core does not know the sidecar. There is no such tool yet.
 
+## Interop contract
+
+A converter that reads `taxel record` output, such as a TLabel adapter, targets the surfaces below and nothing else. They change only with a version bump of [SCHEMA.md](../SCHEMA.md), listed in its changelog.
+
+- **Feature key and per-frame copy.** `observation.tactile.<instance_id>`, float32 `(n_elements, len(channels))` in the main table, one feature per instance. The entry's `info` declares the channel order (`channels`), the units (`units`), the coordinate frame and element positions (`layout`), where the sensor sits (`mount`), the hub it shares (`device`) and, when the sensor is faster than the dataset, how the copy was reduced (`reduction`). `info` is read strictly: SCHEMA.md, Static metadata.
+- **Native-rate stream.** `tactile/<instance_id>/episode-{index:06d}.parquet`, every native frame of the episode, columns `episode_index`, `sample_index`, `host_ts`, `device_ts`, `seq` and `data` (a fixed-shape tensor), readable with pyarrow alone: SCHEMA.md, Native-rate streams.
+- **Baseline stream.** `tactile/<instance_id>/baseline/episode-{index:06d}.parquet`, the baselines applied and a periodic raw sample, columns `episode_index`, `sample_index`, `kind`, `seq`, `host_ts`, `frame_range` and `values`, with the reconstruction rule in SCHEMA.md, Baseline stream.
+- **Session record.** `tactile/<instance_id>/meta.json`: `instance_id` and `sessions`, one record per recording session with `session_id`, `episodes`, `clock`, `frames`, `serial`, `firmware`, `device`, `adapter`, `calibration`, `baseline`, `baseline_stream`, `gel` and `skin`. The provenance keys are present even when `null`: SCHEMA.md, Per-session metadata.
+- **Multi-instance grouping.** Instances on one hub share `info.device.id`, and instances with the same `info.device.clock` have comparable `device_ts`. The instance list and these two keys do not change without a version bump.
+
+Not part of the contract: `tactile/health.json`, the `taxel` Python API, and the files LeRobot core writes.
+
 ## Reading the sidecar without LeRobot
 
 The episode files are plain parquet. `data` is an Arrow fixed-shape tensor column, so pyarrow returns it as one array:
