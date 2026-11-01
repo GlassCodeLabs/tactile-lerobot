@@ -23,11 +23,15 @@ SENSOR = {
 }
 
 
-def is_dropped(seq: int) -> bool:
+def simulated() -> SimulatedTactile:
     config = SimulatedTactileConfig(
         instance_id="left_fingertip", **{k: v for k, v in SENSOR.items() if k != "type"}
     )
-    return SimulatedTactile(config)._is_dropped(seq)
+    return SimulatedTactile(config)
+
+
+def is_dropped(seq: int) -> bool:
+    return simulated()._is_dropped(seq)
 
 
 def tactile_arg(**overrides) -> str:
@@ -80,6 +84,10 @@ class TestUsage:
         assert "at least one tactile sensor" in capsys.readouterr().err
         assert main(record_args(tmp_path, tactile_arg(instance_id="thumb"))) == 2
         assert capsys.readouterr().err == "error: --tactile key 'left_fingertip' is not instance_id 'thumb'\n"
+        assert main(record_args(tmp_path, "--apply_baseline=true", "--baseline_s=0")) == 2
+        assert "--apply_baseline needs a baseline" in capsys.readouterr().err
+        assert main(record_args(tmp_path, "--baseline_sample_every=0")) == 2
+        assert "--baseline_sample_every must be at least 1" in capsys.readouterr().err
         assert not (tmp_path / "ds").exists()
 
 
@@ -88,7 +96,12 @@ class TestRecording:
         assert main(record_args(tmp_path)) == 0
         root = tmp_path / "ds"
         dataset, info, record = check_recording(
-            root, REPO_ID, "left_fingertip", is_dropped=is_dropped, device_offset_s=0.25
+            root,
+            REPO_ID,
+            "left_fingertip",
+            is_dropped=is_dropped,
+            device_offset_s=0.25,
+            raw_of_seq=simulated()._frame,
         )
         assert dataset.num_episodes == 2 and record.episodes == (0, 1)
         assert dataset.meta.robot_type == "cameras_only"
@@ -104,8 +117,18 @@ class TestRecording:
             assert 25 <= int(dataset.meta.episodes[e]["length"]) <= 35  # one second at 30 fps
         assert info.reduction.method == "mean" and info.reduction.window_ms == 33.333
         assert record.baseline is not None and record.baseline.duration_s == 0.2
+        assert not record.baseline.applied and record.baseline.frame_range is not None
+        assert record.baseline_stream.sample_every == 100
         assert record.adapter.name == "taxel.simulated"
         assert dataset.meta.tasks is not None and "press" in dataset.meta.tasks.index
+
+    def test_apply_baseline_subtracts_and_the_stream_recovers_raw(self, tmp_path) -> None:
+        args = record_args(tmp_path, "--apply_baseline=true", "--baseline_sample_every=50")
+        assert main(args) == 0
+        _, _, record = check_recording(
+            tmp_path / "ds", REPO_ID, "left_fingertip", is_dropped=is_dropped, raw_of_seq=simulated()._frame
+        )
+        assert record.baseline.applied and record.baseline_stream.sample_every == 50
 
     def test_resume_appends_a_session(self, tmp_path) -> None:
         assert main(record_args(tmp_path, "--session_id=first")) == 0

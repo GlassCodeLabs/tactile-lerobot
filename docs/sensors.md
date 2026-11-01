@@ -39,6 +39,7 @@ While connected, three methods return a `TactileReading` with different guarante
 - `host_ts`: host receive time from `host_clock()`, in seconds.
 - `device_ts`: the sensor's own timestamp in seconds, or `None` when it has no clock.
 - `seq`: the sensor's own frame counter, or `None`. A jump means the device dropped frames before they reached the host.
+- `baseline`: what was subtracted from `data`, as an `AppliedBaseline` (`values`, `frame_range`, `host_ts`), or `None` when `data` is raw. `reading.raw` adds it back.
 
 `host_clock()` is `time.perf_counter()`, the clock LeRobot's cameras stamp frames with, so tactile and video timestamps are comparable within one process. It is monotonic and has no epoch: two values from different processes or different runs cannot be compared, and a value on its own cannot be placed on a calendar. To make a sidecar's timestamps meaningful later, the session record's `clock` block stores the wall-clock time and the `host_clock()` value read together when a session starts, right after `connect()`. The dataset writer writes that pair, not the backend; see [recording.md](recording.md).
 
@@ -52,7 +53,9 @@ All three reset on `connect()`. A later framerate check reads `dropped_frames` r
 
 ## Baseline
 
-`capture_baseline(seconds)` averages the frames received over `seconds` and returns a `Baseline` record from `taxel.schema` with `values` set to that mean, `frame_range` set to the `seq` of the first and last frame averaged (`None` without `seq`), `captured_at` in UTC and `applied=False`. It subtracts nothing from later readings; whether and how a baseline is applied is recorded in the session record, never done silently. Call it with nothing touching the sensor. Backends whose frames are images override it to return a `reference_frame` pointer instead, which is what `SCHEMA.md` specifies for visuotactile sensors.
+`capture_baseline(seconds)` averages every frame the read thread receives during `seconds`, in raw terms, and returns a `Baseline` record from `taxel.schema` with `values` set to that mean, `frame_range` set to the `seq` of the first and last frame averaged (`None` without `seq`), `captured_at` in UTC and `applied=False`. It takes nothing from the `drain()` buffer, so a recorder draining at the same time still sees every frame. Call it with nothing touching the sensor. Backends whose frames are images override it to return a `reference_frame` pointer instead, which is what `SCHEMA.md` specifies for visuotactile sensors.
+
+Subtraction is never silent. `apply_baseline(values, frame_range)` makes the read thread subtract `values` from every frame from the next one on and stamp each reading's `baseline` with one `AppliedBaseline` object (`values`, `frame_range`, and `host_ts` when it took effect); `reading.raw` is the frame before subtraction. Calling it again replaces the baseline with a new object, and `clear_baseline()` stops subtracting. A recorder detects a re-baseline by the object changing and writes it to the baseline stream, which is what keeps every stored frame reconstructable ([SCHEMA.md](../SCHEMA.md), Baseline stream). A device that subtracts on its own is declared the same way: the backend builds its readings with `baseline` already set, keeps one object until the device re-baselines, and the base class leaves those readings alone. A device-side tare whose values the host cannot read back is not allowed; subtract on the host instead.
 
 ## Metadata
 
@@ -140,6 +143,6 @@ Rules the base class relies on:
 - Take `host_ts` as early as possible after the bytes arrive, before decoding, so it measures arrival and not parsing.
 - Give `seq` as a monotonically increasing integer or `None`. Unwrap a wrapping device counter.
 - Any other exception from `_read_frame` is logged and remembered, the thread continues, and the next read that times out quotes it. A device that fails on every call therefore logs at the sensor's rate; an adapter should rate-limit that warning, for instance by raising once and then `TimeoutError` until the fault clears.
-- Store nothing in the reading that is not from the device. Baseline subtraction, scaling and resampling belong to the recorder and are recorded in metadata.
+- Store nothing in the reading that is not from the device, except a baseline the device itself subtracted, declared through `baseline`. Host-side subtraction goes through `apply_baseline`; scaling and resampling belong to the recorder and are recorded in metadata.
 
 Test a backend the way `tests/test_base.py` tests the base class: a fake device that yields scripted frames, no hardware. Use `SimulatedTactile` when a test needs a realistic stream with known faults: drift, dead elements, dropped frames, a clock offset and saturation are each switched on through its config, and every frame it produces is a pure function of the seed and `seq`, so expected values can be recomputed in a test.

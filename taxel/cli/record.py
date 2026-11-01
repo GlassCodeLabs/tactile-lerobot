@@ -108,6 +108,10 @@ class RecordConfig:
     window_ms: float | None = None
     # Seconds of no-contact frames averaged into the session baseline, hands off; 0 skips it.
     baseline_s: float = 2.0
+    # Subtract the session baseline from every recorded frame; the baseline stream keeps raw recoverable.
+    apply_baseline: bool = False
+    # Native frames between raw samples in the baseline stream.
+    baseline_sample_every: int = 100
     # Session record id; default the UTC start time.
     session_id: str | None = None
     # Use vocal synthesis to read events.
@@ -123,6 +127,10 @@ class RecordConfig:
                 raise UsageError(f"--tactile key {instance_id!r} is not instance_id {config.instance_id!r}")
         if self.reduction not in ("mean", "last"):
             raise UsageError(f"--reduction must be mean or last, got {self.reduction!r}")
+        if self.apply_baseline and self.baseline_s <= 0:
+            raise UsageError("--apply_baseline needs a baseline: set --baseline_s above 0")
+        if self.baseline_sample_every < 1:
+            raise UsageError(f"--baseline_sample_every must be at least 1, got {self.baseline_sample_every}")
         if not self.dataset.repo_id:
             raise UsageError("--dataset.repo_id is required")
 
@@ -365,7 +373,13 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 streaming_encoding=cfg.dataset.streaming_encoding,
                 encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
             )
-        writer = TactileDatasetWriter(dataset, sensors, baseline_s=cfg.baseline_s)
+        writer = TactileDatasetWriter(
+            dataset,
+            sensors,
+            baseline_s=cfg.baseline_s,
+            apply_baseline=cfg.apply_baseline,
+            baseline_sample_every=cfg.baseline_sample_every,
+        )
 
         if teleop is not None:
             teleop.connect()

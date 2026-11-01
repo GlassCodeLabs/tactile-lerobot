@@ -21,10 +21,10 @@ episode and returns one dataset-rate array per instance, reduced from the native
 frames by the method in the feature's ``info.reduction`` at the frame's nominal
 time ``origin + k / fps``, where ``origin`` is the host clock when the episode's
 first frame was built. At the end of the episode the native frames are written to
-``tactile/<instance_id>/episode-{index:06d}.parquet`` and the session record in
-``meta.json`` gets the episode range, the episode origin and the sensor's
-counters. The dataset is used through ``fps``, ``root`` and ``meta`` only, so
-nothing here imports LeRobot.
+``tactile/<instance_id>/episode-{index:06d}.parquet``, the baseline stream beside
+them (:func:`baseline_rows`), and the session record in ``meta.json`` gets the
+episode range, the episode origin and the sensor's counters. The dataset is used
+through ``fps``, ``root`` and ``meta`` only, so nothing here imports LeRobot.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ from __future__ import annotations
 import logging
 import time
 from bisect import bisect_right
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,14 +45,18 @@ from taxel import __version__
 from taxel.dataset.features import feature_entries, read_feature_entry
 from taxel.dataset.reduce import reduce_frame
 from taxel.dataset.sidecar import (
+    BaselineRow,
+    baseline_path,
     episode_path,
     meta_path,
     read_session_meta,
+    write_baseline_episode,
     write_episode,
     write_session_meta,
 )
 from taxel.schema import (
     ARRAY_FAMILIES,
+    BaselineStream,
     Block,
     FrameCounts,
     Reduction,
@@ -62,9 +66,9 @@ from taxel.schema import (
     TactileInfo,
     feature_key,
 )
-from taxel.sensors.base import TactileReading, TactileSensor, host_clock
+from taxel.sensors.base import AppliedBaseline, TactileReading, TactileSensor, host_clock
 
-__all__ = ["TactileDatasetWriter", "tactile_features"]
+__all__ = ["TactileDatasetWriter", "baseline_rows", "tactile_features"]
 
 logger = logging.getLogger(__name__)
 
@@ -108,12 +112,19 @@ class TactileDatasetWriter:
         sensors: Connected sensors, one per instance.
         baseline_s: Seconds of no-contact frames averaged into the session's baseline
             at :meth:`start_session`; ``0`` records no baseline.
+        apply_baseline: Subtract the session baseline from every recorded frame, through
+            the sensor, so each native frame carries what was taken from it; the session
+            record then says ``applied: true`` and the baseline stream holds the capture.
+            Needs ``baseline_s > 0``.
+        baseline_sample_every: Period of the baseline stream's raw samples: one every
+            that many native samples of each episode, recorded as
+            ``baseline_stream.sample_every``.
         session: Values for the session record's ``serial``, ``firmware``, ``device``,
             ``calibration``, ``gel`` and ``skin``, as schema objects or dicts. Anything
             not given is written as ``null``.
 
     Raises:
-        ValueError: If a sensor is not connected.
+        ValueError: If a sensor is not connected, or ``apply_baseline`` is set without a baseline.
         SchemaError: If the dataset's feature entry for an instance does not match the
             sensor's metadata, or declares a reduction the writer does not produce.
     """
@@ -124,12 +135,18 @@ class TactileDatasetWriter:
         sensors: Iterable[TactileSensor],
         *,
         baseline_s: float = 2.0,
+        apply_baseline: bool = False,
+        baseline_sample_every: int = 100,
         session: Mapping[str, Any] | None = None,
     ) -> None:
         self._dataset = dataset
         self._fps = float(dataset.fps)
         self._root = Path(dataset.root)
+        if apply_baseline and baseline_s <= 0:
+            raise ValueError("apply_baseline needs a baseline: set baseline_s > 0")
         self._baseline_s = baseline_s
+        self._apply_baseline = apply_baseline
+        self._sample_every = BaselineStream(baseline_sample_every).sample_every
         self._session_fields = {
             k: v.to_dict() if isinstance(v, Block) else v for k, v in (session or {}).items()
         }
@@ -201,7 +218,15 @@ class TactileDatasetWriter:
         wall_time = wall.isoformat(timespec="milliseconds").replace("+00:00", "Z")
         self._session_id = session_id or wall.strftime("%Y%m%dT%H%M%SZ")
         for stream in self._streams.values():
-            stream.open_session(self._session_id, wall_time, host, self._baseline_s, self._session_fields)
+            stream.open_session(
+                self._session_id,
+                wall_time,
+                host,
+                self._baseline_s,
+                self._apply_baseline,
+                self._sample_every,
+                self._session_fields,
+            )
 
     # --- Episodes ---------------------------------------------------------------------------------
 
@@ -327,6 +352,7 @@ class _Stream:
         self.window_ms = window_ms
         self.root = root
         self.instance_id = sensor.config.instance_id
+        self.sample_every = 1
         self.record: SessionRecord | None = None
         self._fields: dict[str, Any] = {}
         self._existing: list[SessionRecord] = []
@@ -342,19 +368,39 @@ class _Stream:
     # --- Session ----------------------------------------------------------------------------------
 
     def open_session(
-        self, session_id: str, wall_time: str, host: float, baseline_s: float, fields: Mapping[str, Any]
+        self,
+        session_id: str,
+        wall_time: str,
+        host: float,
+        baseline_s: float,
+        apply: bool,
+        sample_every: int,
+        fields: Mapping[str, Any],
     ) -> None:
         if meta_path(self.root, self.instance_id).exists():
             self._existing = list(read_session_meta(self.root, self.instance_id).sessions)
             if any(s.session_id == session_id for s in self._existing):
                 raise SchemaError(f"{self.instance_id}: session {session_id!r} already exists in meta.json")
-        baseline = self.sensor.capture_baseline(baseline_s).to_dict() if baseline_s > 0 else None
+        baseline = None
+        if baseline_s > 0:
+            baseline = self.sensor.capture_baseline(baseline_s)
+            if apply:
+                self.sensor.apply_baseline(
+                    np.asarray(baseline.values, dtype=np.float32), baseline.frame_range
+                )
+                baseline = replace(baseline, applied=True)
+                # Frames received before the baseline took effect are raw: drop them, then wait for
+                # the first subtracted frame, so the first episode's window holds subtracted frames only.
+                self.sensor.drain()
+                self.sensor.read()
+        self.sample_every = sample_every
         self._fields = {
             "session_id": session_id,
             "clock": {"wall_time": wall_time, "host_clock": host, "episode_origins": []},
             "adapter": {"name": f"taxel.{self.sensor.config.type}", "version": __version__},
             "calibration": None,
-            "baseline": baseline,
+            "baseline": None if baseline is None else baseline.to_dict(),
+            "baseline_stream": {"sample_every": sample_every},
             **dict(fields),
         }
 
@@ -435,6 +481,8 @@ class _Stream:
 
     def end_episode(self, index: int, origin: float) -> None:
         write_episode(episode_path(self.root, self.instance_id, index), index, self._readings, self.shape)
+        rows = baseline_rows(self._readings, self.sample_every, self.shape)
+        write_baseline_episode(baseline_path(self.root, self.instance_id, index), index, rows, self.shape)
         self._origins.append(origin)
         if self._first_episode is None:
             self._first_episode = index
@@ -457,6 +505,38 @@ class _Stream:
         self._ts = []
         self._in_episode = False
         self._previous = None
+
+
+def baseline_rows(
+    readings: Sequence[TactileReading], sample_every: int, shape: tuple[int, ...]
+) -> list[BaselineRow]:
+    """The baseline stream rows of one episode's native frames (``SCHEMA.md``, Baseline stream).
+
+    A capture row at sample 0 for the baseline in force at the first frame, one more at
+    every sample whose reading carries a different baseline object than the one before
+    (a cleared baseline becomes a row of zeros), and a sample row with the raw frame at
+    every sample index that is a multiple of ``sample_every``. With no baseline applied
+    there are no capture rows and the samples equal the stored frames.
+    """
+    rows: list[BaselineRow] = []
+    current: AppliedBaseline | None = None
+    for i, reading in enumerate(readings):
+        applied = reading.baseline
+        if applied is not current:
+            if applied is not None:
+                rows.append(
+                    BaselineRow(
+                        "capture", i, reading.seq, applied.host_ts, applied.frame_range, applied.values
+                    )
+                )
+            else:
+                zeros = np.zeros(shape, dtype=np.float32)
+                rows.append(BaselineRow("capture", i, reading.seq, reading.host_ts, None, zeros))
+            current = applied
+        if i % sample_every == 0:
+            raw = np.asarray(reading.raw, dtype=np.float32)
+            rows.append(BaselineRow("sample", i, reading.seq, reading.host_ts, None, raw))
+    return rows
 
 
 def _instance(sensor: TactileSensor) -> tuple[TactileInfo, tuple[int, ...]]:

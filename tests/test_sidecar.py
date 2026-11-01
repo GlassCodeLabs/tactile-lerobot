@@ -2,19 +2,28 @@
 
 import hashlib
 import json
+from dataclasses import replace
 
 import numpy as np
 import pytest
 
 from taxel.dataset.sidecar import (
+    BASELINE_COLUMNS,
     COLUMNS,
+    BaselineRow,
+    BaselineRows,
+    EpisodeStream,
     align_nearest,
+    baseline_path,
     episode_path,
     frame_times,
     meta_path,
+    raw_frames,
+    read_baseline_episode,
     read_episode,
     read_session_meta,
     sidecar_dir,
+    write_baseline_episode,
     write_episode,
     write_session_meta,
 )
@@ -56,6 +65,9 @@ class TestPaths:
         assert meta_path(tmp_path, "left_fingertip") == tmp_path / "tactile" / "left_fingertip" / "meta.json"
         assert episode_path(tmp_path, "left_fingertip", 7).name == "episode-000007.parquet"
         assert episode_path(tmp_path, "right", 0, "force").parent.name == "force"
+        assert baseline_path(tmp_path, "left_fingertip", 7) == (
+            tmp_path / "tactile" / "left_fingertip" / "baseline" / "episode-000007.parquet"
+        )
 
     def test_validation(self, tmp_path) -> None:
         with pytest.raises(SchemaError):
@@ -64,6 +76,10 @@ class TestPaths:
             episode_path(tmp_path, "right", 0, "depth")
         with pytest.raises(ValueError):
             episode_path(tmp_path, "right", -1)
+        with pytest.raises(SchemaError):
+            sidecar_dir(tmp_path, "right", "baseline")  # reserved for the baseline stream, not a suffix
+        with pytest.raises(ValueError):
+            baseline_path(tmp_path, "right", -1)
 
 
 class TestSessionMeta:
@@ -149,6 +165,105 @@ class TestEpisodeFiles:
         path = write_episode(tmp_path / "e.parquet", 0, frames, SHAPE)
         with pytest.raises(SchemaError, match="'seq' is null on 1 of 3"):
             read_episode(path)
+
+
+def filled(value: float) -> np.ndarray:
+    return np.full(SHAPE, value, dtype=np.float32)
+
+
+class TestBaselineFiles:
+    @pytest.fixture(autouse=True)
+    def _needs_pyarrow(self):
+        pytest.importorskip("pyarrow")
+
+    def test_round_trip_and_column_types(self, tmp_path) -> None:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        rows = [
+            BaselineRow("capture", 0, 10, 99.5, (3, 9), filled(0.25)),
+            BaselineRow("sample", 0, 10, 100.0, None, filled(1.0)),
+            BaselineRow("capture", 7, 17, 100.014, None, filled(0.0)),
+            BaselineRow("sample", 100, 110, 100.2, None, filled(2.0)),
+        ]
+        path = write_baseline_episode(baseline_path(tmp_path, "left_fingertip", 3), 3, rows, SHAPE)
+        assert path == tmp_path / "tactile" / "left_fingertip" / "baseline" / "episode-000003.parquet"
+        table = pq.read_table(path)
+        assert table.column_names == list(BASELINE_COLUMNS)
+        types = {name: table.schema.field(name).type for name in BASELINE_COLUMNS}
+        assert types["kind"] == pa.string() and types["seq"] == pa.int64()
+        assert types["frame_range"] == pa.list_(pa.int64(), 2)
+        assert isinstance(types["values"], pa.FixedShapeTensorType) and tuple(types["values"].shape) == SHAPE
+        assert set(table.column("episode_index").to_pylist()) == {3}
+
+        got = read_baseline_episode(path)
+        assert got.episode_index == 3 and len(got) == 4 and got.shape == SHAPE
+        assert got.kind.tolist() == ["capture", "sample", "capture", "sample"]
+        assert got.sample_index.tolist() == [0, 0, 7, 100] and got.seq.tolist() == [10, 10, 17, 110]
+        np.testing.assert_array_equal(got.host_ts, [99.5, 100.0, 100.014, 100.2])
+        assert got.frame_range == [(3, 9), None, None, None]
+        np.testing.assert_array_equal(got.values, np.stack([r.values for r in rows]))
+        assert got.captures.tolist() == [True, False, True, False]
+        assert got.samples.tolist() == [False, True, False, True]
+
+    def test_empty_file_and_sensor_without_seq(self, tmp_path) -> None:
+        empty = read_baseline_episode(write_baseline_episode(tmp_path / "b.parquet", 2, [], SHAPE))
+        assert len(empty) == 0 and empty.episode_index == 2 and empty.shape == SHAPE and empty.seq is None
+        rows = [BaselineRow("sample", 0, None, 1.0, None, filled(1.0))]
+        got = read_baseline_episode(write_baseline_episode(tmp_path / "c.parquet", 0, rows, SHAPE))
+        assert got.seq is None and got.frame_range == [None] and got.samples.tolist() == [True]
+
+    def test_validation(self, tmp_path) -> None:
+        with pytest.raises(ValueError, match="kind must be one of"):
+            BaselineRow("tare", 0, None, 1.0, None, filled(1.0))
+        with pytest.raises(ValueError, match="sample row has no frame_range"):
+            BaselineRow("sample", 0, None, 1.0, (0, 1), filled(1.0))
+        wrong = [BaselineRow("sample", 0, None, 1.0, None, np.ones((4, 2), np.float32))]
+        with pytest.raises(ValueError, match="expected float32"):
+            write_baseline_episode(tmp_path / "d.parquet", 0, wrong, SHAPE)
+        out_of_order = [
+            BaselineRow("sample", 5, None, 1.0, None, filled(1.0)),
+            BaselineRow("sample", 0, None, 1.1, None, filled(1.0)),
+        ]
+        with pytest.raises(ValueError, match="sample_index order"):
+            write_baseline_episode(tmp_path / "e.parquet", 0, out_of_order, SHAPE)
+        sample_first = [
+            BaselineRow("sample", 0, None, 1.0, None, filled(1.0)),
+            BaselineRow("capture", 0, None, 0.5, None, filled(0.0)),
+        ]
+        with pytest.raises(ValueError, match="capture row comes before"):
+            write_baseline_episode(tmp_path / "f.parquet", 0, sample_first, SHAPE)
+
+    def test_raw_frames_applies_the_latest_capture(self) -> None:
+        native = EpisodeStream(0, np.arange(10.0), None, None, np.zeros((10, *SHAPE), np.float32))
+        rows = BaselineRows(
+            episode_index=0,
+            kind=np.array(["capture", "sample", "capture", "sample"]),
+            sample_index=np.array([0, 0, 4, 8], dtype=np.int64),
+            seq=None,
+            host_ts=np.zeros(4),
+            frame_range=[None] * 4,
+            values=np.stack([filled(1.0), filled(1.0), filled(3.0), filled(3.0)]),
+        )
+        raw = raw_frames(native, rows)
+        assert raw.dtype == np.float32 and raw.shape == (10, *SHAPE)
+        assert np.all(raw[:4] == 1.0) and np.all(raw[4:] == 3.0)
+        np.testing.assert_array_equal(raw[rows.sample_index[rows.samples]], rows.values[rows.samples])
+        none = BaselineRows(
+            0,
+            np.array([], dtype=str),
+            np.array([], np.int64),
+            None,
+            np.array([]),
+            [],
+            np.empty((0, *SHAPE), np.float32),
+        )
+        np.testing.assert_array_equal(raw_frames(native, none), native.data)
+        with pytest.raises(ValueError, match="episode"):
+            raw_frames(replace(native, episode_index=1), rows)
+        beyond = replace(rows, sample_index=np.array([0, 0, 12, 8], dtype=np.int64))
+        with pytest.raises(ValueError, match="outside"):
+            raw_frames(native, beyond)
 
 
 class TestAlignment:

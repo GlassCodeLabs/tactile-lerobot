@@ -17,7 +17,10 @@ For a dataset with one robot camera and one tactile instance `left_fingertip`:
     └── left_fingertip/
         ├── meta.json                       # one session record per recording session
         ├── episode-000000.parquet          # every native frame of episode 0, with its timing
-        └── episode-000001.parquet
+        ├── episode-000001.parquet
+        └── baseline/
+            ├── episode-000000.parquet      # the baseline in force, and a raw sample every N frames
+            └── episode-000001.parquet
 ```
 
 | What | Where | Written by |
@@ -25,7 +28,8 @@ For a dataset with one robot camera and one tactile instance `left_fingertip`:
 | Static metadata of the instance: family, vendor, model, declared rate, channels, layout, mount, hub, `reduction` | `meta/info.json`, feature entry `observation.tactile.left_fingertip`, key `info` | `LeRobotDataset.create`, from `tactile_features()` |
 | Dataset-rate copy, float32 `(n_elements, len(channels))` per frame | the main table, same feature key | `add_frame`, from `TactileDatasetWriter.frame()` |
 | Native-rate stream with `host_ts`, `device_ts`, `seq` | `tactile/left_fingertip/episode-{index:06d}.parquet` | `end_episode()` |
-| Session record: serial, adapter, calibration, baseline, clock anchor, frame counters, episode range | `tactile/left_fingertip/meta.json` | `end_episode()` and `finalize()` |
+| Baseline stream: the baseline subtracted, from which frame on, and a raw sample every N native frames | `tactile/left_fingertip/baseline/episode-{index:06d}.parquet` | `end_episode()` |
+| Session record: serial, adapter, calibration, baseline, baseline stream period, clock anchor, frame counters, episode range | `tactile/left_fingertip/meta.json` | `end_episode()` and `finalize()` |
 
 ## Static metadata in the feature, everything per-session beside it
 
@@ -68,7 +72,9 @@ Frames are reduced at these nominal times, not at the moment the loop happened t
 
 The session record's `frames` block is the sensor's own counters for the session: `received` by the host, `dropped` at the source (gaps in `seq`), `overflowed` on the host because the recorder did not drain the sensor in time. They are copied from the sensor, not reconstructed from the files; with `seq` present, `dropped` equals the sum of the `seq` gaps across the session's episode files.
 
-At the start of a session the writer averages `--baseline_s` seconds of frames (default 2) into the record's `baseline` with `applied: false`. Keep hands off the sensor while `taxel record` says so. Nothing is subtracted from the recorded data; the baseline is stored so a reader can subtract it, and so drift between sessions is measurable.
+At the start of a session the writer averages `--baseline_s` seconds of frames (default 2) into the record's `baseline`, with `frame_range` naming the first and last native frame averaged. Keep hands off the sensor while `taxel record` says so. By default nothing is subtracted from the recorded data (`applied: false`): the baseline is stored so a reader can subtract it, and so drift between sessions is measurable. With `--apply_baseline=true` the writer hands the captured baseline to the sensor, which subtracts it from every frame from then on and stamps each frame with what it subtracted; the main table and the native stream then hold subtracted values and the record says `applied: true`.
+
+Either way each episode gets a baseline stream beside its native file, `tactile/<instance_id>/baseline/episode-{index:06d}.parquet`, with two kinds of row. A capture row records the baseline in force at the episode's first frame and every change during the episode, whether a backend re-baselined or the baseline was cleared (a row of zeros). A sample row holds the unsubtracted frame at every native sample whose index is a multiple of `--baseline_sample_every` (default 100, recorded as `baseline_stream.sample_every` in the session record), so every episode opens with a raw reading. Stored data plus the capture in force is the raw reading, which `taxel.dataset.sidecar.raw_frames` computes from the two files, and the sample rows are what a check compares that against. When nothing is applied the file has no capture rows and its samples equal the stored frames. The rule and the reasons for both row kinds are in [SCHEMA.md](../SCHEMA.md), Baseline stream.
 
 ## Recording by hand: cameras and tactile, no robot
 
@@ -112,6 +118,8 @@ Everything under `--dataset.*` is `lerobot-record`'s `DatasetRecordConfig`, with
 | `--reduction` | `mean` | `mean` or `last`, for sensors faster than the dataset |
 | `--window_ms` | one frame period | Span of native samples each dataset frame is reduced from |
 | `--baseline_s` | `2` | Seconds averaged into the session baseline; `0` records none |
+| `--apply_baseline` | `false` | Subtract the session baseline from every recorded frame; the baseline stream keeps raw recoverable |
+| `--baseline_sample_every` | `100` | Native frames between raw samples in the baseline stream |
 | `--session_id` | UTC start time | Name of the session record |
 | `--resume` | `false` | Append to an existing dataset as a new session |
 | `--play_sounds` | `true` | Speak the recording events, as `lerobot-record` does |
@@ -182,4 +190,4 @@ host_ts = table.column("host_ts").to_numpy()
 meta = json.load(open("outputs/name/tactile/left_fingertip/meta.json"))
 ```
 
-`taxel.dataset.sidecar.read_episode` and `read_session_meta` do the same with validation, and need only numpy and pyarrow.
+`taxel.dataset.sidecar.read_episode` and `read_session_meta` do the same with validation, and need only numpy and pyarrow. The baseline stream is read the same way: `read_baseline_episode` returns its rows, and `raw_frames(native, rows)` applies the capture rows to the native stream to get the raw frames back.

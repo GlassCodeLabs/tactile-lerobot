@@ -13,10 +13,19 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
 from taxel import __version__  # noqa: E402
 from taxel.dataset.features import read_feature_entry  # noqa: E402
 from taxel.dataset.reduce import reduce_episode  # noqa: E402
-from taxel.dataset.sidecar import episode_path, frame_times, read_episode, read_session_meta  # noqa: E402
-from taxel.dataset.writer import TactileDatasetWriter, tactile_features  # noqa: E402
+from taxel.dataset.sidecar import (  # noqa: E402
+    baseline_path,
+    episode_path,
+    frame_times,
+    raw_frames,
+    read_baseline_episode,
+    read_episode,
+    read_session_meta,
+)
+from taxel.dataset.writer import TactileDatasetWriter, baseline_rows, tactile_features  # noqa: E402
 from taxel.schema import Reduction, SchemaError, Skin  # noqa: E402
-from taxel.sensors import SimulatedTactile, SimulatedTactileConfig, host_clock  # noqa: E402
+from taxel.sensors import SimulatedTactile, SimulatedTactileConfig, TactileReading, host_clock  # noqa: E402
+from taxel.sensors.base import AppliedBaseline  # noqa: E402
 
 FPS = 30
 KEY = "observation.tactile.left_fingertip"
@@ -106,6 +115,10 @@ class TestWriterSetup:
             TactileDatasetWriter(dataset, [connected(instance_id="thumb")])
         with pytest.raises(SchemaError, match="session fields \\['notes'\\]"):
             TactileDatasetWriter(dataset, [sensor], session={"notes": "x"})
+        with pytest.raises(ValueError, match="apply_baseline needs a baseline"):
+            TactileDatasetWriter(dataset, [sensor], baseline_s=0, apply_baseline=True)
+        with pytest.raises(SchemaError, match="sample_every"):
+            TactileDatasetWriter(dataset, [sensor], baseline_sample_every=0)
 
     def test_episode_protocol(self, connected, tmp_path) -> None:
         sensor = connected()
@@ -156,6 +169,8 @@ class TestEndToEnd:
         assert session.adapter.name == "taxel.simulated" and session.adapter.version == __version__
         assert session.baseline is not None and not session.baseline.applied
         assert np.asarray(session.baseline.values).shape == (16, 3)
+        lo_seq, hi_seq = session.baseline.frame_range
+        assert 0 <= lo_seq < hi_seq and session.baseline_stream.sample_every == 100
         assert session.skin == Skin(id="skin-7") and session.calibration is None and session.serial is None
         assert session.frames.received == counters[0]
         assert session.frames.dropped == counters[1]
@@ -167,6 +182,7 @@ class TestEndToEnd:
         # The sidecar: every native frame the sensor produced, timing intact, and the copy reproducible.
         files = sorted(p.name for p in (root / "tactile" / "left_fingertip").iterdir())
         assert files == [
+            "baseline",
             "episode-000000.parquet",
             "episode-000001.parquet",
             "episode-000002.parquet",
@@ -185,6 +201,114 @@ class TestEndToEnd:
             stored = np.stack([reloaded[e * 60 + k][KEY].numpy() for k in range(60)])
             np.testing.assert_array_equal(stored, expected)
             assert np.all(np.diff(targets) > 0) and stream.host_ts[0] <= targets[0]
+            # Nothing applied: the baseline stream has no capture rows and its samples are the stored frames.
+            rows = read_baseline_episode(baseline_path(root, "left_fingertip", e))
+            assert rows.episode_index == e and not rows.captures.any()
+            assert rows.sample_index.tolist() == list(range(0, len(stream), 100))
+            np.testing.assert_array_equal(rows.values, stream.data[rows.sample_index])
+            np.testing.assert_array_equal(rows.seq, stream.seq[rows.sample_index])
+            np.testing.assert_array_equal(raw_frames(stream, rows), stream.data)
+
+    def test_applied_baseline_and_a_rebaseline_mid_episode_stay_reproducible(
+        self, connected, tmp_path
+    ) -> None:
+        sensor = connected()
+        root = tmp_path / "ds"
+        dataset = make_dataset(root, [sensor])
+        writer = TactileDatasetWriter(
+            dataset, [sensor], baseline_s=0.2, apply_baseline=True, baseline_sample_every=50
+        )
+        writer.start_session("applied")
+        first = sensor.applied_baseline
+        assert first is not None and first.frame_range is not None
+        writer.start_episode()
+        t0 = None
+        second = None
+        for k in range(45):
+            if t0 is not None:
+                time.sleep(max(t0 + k / FPS - host_clock(), 0.0))
+            if k == 20:  # a backend re-baselining mid-episode
+                second = sensor.apply_baseline(
+                    first.values + np.float32(0.5), (first.frame_range[1] + 1, first.frame_range[1] + 10)
+                )
+            values = writer.frame()
+            if t0 is None:
+                t0 = host_clock()
+            dataset.add_frame({**values, "task": "press"})
+        writer.end_episode()
+        dataset.save_episode()
+        writer.finalize()
+        dataset.finalize()
+
+        session = read_session_meta(root, "left_fingertip").sessions[0]
+        assert session.baseline.applied and session.baseline.frame_range == first.frame_range
+        np.testing.assert_array_equal(np.asarray(session.baseline.values, np.float32), first.values)
+        assert session.baseline_stream.sample_every == 50
+
+        stream = read_episode(episode_path(root, "left_fingertip", 0))
+        rows = read_baseline_episode(baseline_path(root, "left_fingertip", 0))
+        captures = np.flatnonzero(rows.captures)
+        assert len(captures) == 2 and rows.sample_index[captures[0]] == 0
+        np.testing.assert_array_equal(rows.values[captures[0]], first.values)
+        assert (
+            rows.frame_range[captures[0]] == first.frame_range and rows.host_ts[captures[0]] == first.host_ts
+        )
+        change = int(rows.sample_index[captures[1]])
+        assert 0 < change < len(stream) and rows.seq[captures[1]] == stream.seq[change]
+        np.testing.assert_array_equal(rows.values[captures[1]], second.values)
+        assert (
+            rows.frame_range[captures[1]] == second.frame_range
+            and rows.host_ts[captures[1]] == second.host_ts
+        )
+        assert stream.host_ts[change - 1] < second.host_ts <= stream.host_ts[change] + 0.05
+
+        # Stored frames are raw minus the baseline in force; raw_frames undoes it to float32 rounding.
+        truth = np.stack([sensor._frame(int(s)) for s in stream.seq])
+        np.testing.assert_array_equal(stream.data[:change], truth[:change] - first.values)
+        np.testing.assert_array_equal(stream.data[change:], truth[change:] - second.values)
+        raw = raw_frames(stream, rows)
+        np.testing.assert_allclose(raw, truth, rtol=0, atol=1e-6)
+        samples = np.flatnonzero(rows.samples)
+        assert rows.sample_index[samples].tolist() == list(range(0, len(stream), 50))
+        np.testing.assert_array_equal(rows.values[samples], raw[rows.sample_index[samples]])
+
+        # The main-table copy is still the reduction of the stored (subtracted) native stream.
+        reloaded = LeRobotDataset("taxel/writer_test", root=root)
+        origin = session.clock.episode_origins[0]
+        expected = reduce_episode("mean", stream.host_ts, stream.data, frame_times(origin, 45, FPS), 33.333)
+        stored = np.stack([reloaded[k][KEY].numpy() for k in range(45)])
+        np.testing.assert_array_equal(stored, expected)
+
+    def test_baseline_rows_from_readings(self) -> None:
+        shape = (2, 3)
+        a = AppliedBaseline(np.full(shape, 1.0, np.float32), (0, 9), 10.0)
+        b = AppliedBaseline(np.full(shape, 2.0, np.float32), None, 11.0)
+        readings = [
+            TactileReading(np.full(shape, float(i), np.float32), 20.0 + i, seq=100 + i, baseline=base)
+            for i, base in enumerate([a, a, a, b, b, None, None, None])
+        ]
+        rows = baseline_rows(readings, 3, shape)
+        assert [(r.kind, r.sample_index, r.seq) for r in rows] == [
+            ("capture", 0, 100),
+            ("sample", 0, 100),
+            ("capture", 3, 103),
+            ("sample", 3, 103),
+            ("capture", 5, 105),
+            ("sample", 6, 106),
+        ]
+        assert rows[0].host_ts == 10.0 and rows[0].frame_range == (0, 9)
+        assert rows[2].host_ts == 11.0 and rows[2].frame_range is None
+        np.testing.assert_array_equal(rows[4].values, np.zeros(shape, np.float32))  # cleared: zeros
+        assert rows[4].host_ts == 25.0
+        np.testing.assert_array_equal(rows[1].values, np.full(shape, 1.0, np.float32))  # raw = 0 + a
+        np.testing.assert_array_equal(rows[3].values, np.full(shape, 5.0, np.float32))  # raw = 3 + b
+        np.testing.assert_array_equal(rows[5].values, np.full(shape, 6.0, np.float32))  # raw, nothing applied
+        assert baseline_rows([], 3, shape) == []
+        plain = [TactileReading(np.zeros(shape, np.float32), 1.0) for _ in range(4)]
+        assert [(r.kind, r.sample_index) for r in baseline_rows(plain, 2, shape)] == [
+            ("sample", 0),
+            ("sample", 2),
+        ]
 
     def test_slow_sensor_holds_the_last_sample_and_stays_reproducible(self, connected, tmp_path) -> None:
         sensor = connected(declared_rate_hz=5.0, drop_probability=0.0)
@@ -279,5 +403,6 @@ class TestEndToEnd:
         assert {
             "tactile/left_fingertip/meta.json",
             "tactile/left_fingertip/episode-000000.parquet",
+            "tactile/left_fingertip/baseline/episode-000000.parquet",
         } <= uploaded
         assert "meta/info.json" in uploaded

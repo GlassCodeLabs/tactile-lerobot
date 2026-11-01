@@ -5,7 +5,9 @@ The public method surface (``connect``, ``read``, ``async_read``, ``read_latest`
 LeRobot's tactile sensor proposal (huggingface/lerobot#4469), which in turn mirrors
 LeRobot's cameras. On top of that, every reading carries timestamps and a sequence
 number, the sensor can describe itself (:meth:`TactileSensor.metadata`), capture a
-no-contact baseline, and count the frames the device dropped.
+no-contact baseline and subtract it in the open (:meth:`TactileSensor.apply_baseline`
+stamps every reading with what was taken from it), and count the frames the device
+dropped.
 
 A backend implements three hooks, ``_open``, ``_read_frame`` and ``_close``, plus
 ``metadata`` and ``find_sensors``. The base class owns the background thread, the
@@ -20,16 +22,17 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, ClassVar, TypeVar
 
 import numpy as np
-from numpy.typing import NDArray
+from numpy.typing import ArrayLike, NDArray
 
 from taxel.schema import Baseline, DeviceGroup, Mount, SchemaError, TactileFamily, TactileInfo, feature_key
 
 __all__ = [
+    "AppliedBaseline",
     "TactileReading",
     "TactileSensor",
     "TactileSensorConfig",
@@ -141,6 +144,36 @@ class TactileSensorConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AppliedBaseline:
+    """A baseline subtracted from readings, shared by reference by every reading it was taken from.
+
+    Attributes:
+        values: The no-contact reading that is subtracted: float32, the frame's shape, in raw terms.
+        frame_range: ``(first_seq, last_seq)`` of the frames averaged into it, or ``None``.
+        host_ts: Host clock when it took effect.
+
+    One object stands for one capture. A recorder detects a re-baseline by the object a
+    reading carries changing, so a backend that subtracts on the device keeps one object
+    until the device re-baselines and builds a new one when it does.
+    """
+
+    values: NDArray[np.float32]
+    frame_range: tuple[int, int] | None
+    host_ts: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.values, np.ndarray) or self.values.dtype != np.float32:
+            raise TypeError("values must be a float32 numpy array")
+        if self.frame_range is not None:
+            items = tuple(self.frame_range)
+            if len(items) != 2 or any(isinstance(v, bool) or not isinstance(v, int) for v in items):
+                raise ValueError(f"frame_range must be (first_seq, last_seq), got {self.frame_range!r}")
+            if items[0] < 0 or items[1] < items[0]:
+                raise ValueError(f"frame_range must satisfy 0 <= first_seq <= last_seq, got {items}")
+            object.__setattr__(self, "frame_range", (int(items[0]), int(items[1])))
+
+
+@dataclass(frozen=True, slots=True)
 class TactileReading:
     """One frame from a sensor, with the timing fields of the native-rate sidecar.
 
@@ -150,12 +183,16 @@ class TactileReading:
         host_ts: Host receive time from :func:`host_clock`, seconds.
         device_ts: The sensor's own timestamp in seconds, or ``None`` if it has no clock.
         seq: The sensor's own frame counter, or ``None``. A jump means the device dropped frames.
+        baseline: What was subtracted from ``data``, by the base class after
+            :meth:`TactileSensor.apply_baseline` or by the device itself, or ``None`` when
+            ``data`` is raw. A backend whose device subtracts sets it on the readings it builds.
     """
 
     data: NDArray[Any]
     host_ts: float
     device_ts: float | None = None
     seq: int | None = None
+    baseline: AppliedBaseline | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.data, np.ndarray):
@@ -166,6 +203,15 @@ class TactileReading:
             raise TypeError(f"device_ts must be a float or None, got {self.device_ts!r}")
         if self.seq is not None and (isinstance(self.seq, bool) or not isinstance(self.seq, int)):
             raise TypeError(f"seq must be an int or None, got {self.seq!r}")
+        if self.baseline is not None and not isinstance(self.baseline, AppliedBaseline):
+            raise TypeError(
+                f"baseline must be an AppliedBaseline or None, got {type(self.baseline).__name__}"
+            )
+
+    @property
+    def raw(self) -> NDArray[Any]:
+        """The frame before baseline subtraction: ``data + baseline.values``, or ``data`` itself."""
+        return self.data if self.baseline is None else self.data + self.baseline.values
 
 
 class TactileSensor(abc.ABC):
@@ -183,6 +229,11 @@ class TactileSensor(abc.ABC):
 
     :meth:`drain` returns every frame received since the previous ``drain`` (or
     ``connect``), which is how a recorder captures the native-rate stream in full.
+
+    :meth:`capture_baseline` averages the no-contact reading and :meth:`apply_baseline`
+    subtracts it from every later frame, stamping each reading with what was taken from
+    it; the baseline persists across ``disconnect`` and ``connect`` until
+    :meth:`clear_baseline`.
 
     Subclasses set ``config_class`` so :func:`make_tactile_sensor` can find them, and
     implement :meth:`_open`, :meth:`_read_frame`, :meth:`_close`, :meth:`metadata` and
@@ -212,6 +263,8 @@ class TactileSensor(abc.ABC):
         self._dropped = 0
         self._overflowed = 0
         self._last_error: BaseException | None = None
+        self._applied: AppliedBaseline | None = None
+        self._capture: list[TactileReading] | None = None
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(instance_id={self.config.instance_id!r}, connected={self._connected})"
@@ -395,12 +448,15 @@ class TactileSensor(abc.ABC):
         return self._received
 
     def capture_baseline(self, seconds: float) -> Baseline:
-        """Average the frames received over ``seconds`` and return them as a :class:`Baseline`.
+        """Average the raw frames received over ``seconds`` and return them as a :class:`Baseline`.
 
-        Call with nothing touching the sensor. The result has ``applied=False``: nothing is
-        subtracted from later readings. ``frame_range`` is the ``seq`` of the first and last
-        frame averaged, or ``None`` when the sensor has no ``seq``. Backends whose frames are
-        images override this to return a ``reference_frame`` instead.
+        Call with nothing touching the sensor. Every frame the read thread receives during
+        the window is averaged, in raw terms (before any applied baseline), and none is
+        taken from the :meth:`drain` buffer, so a recorder draining concurrently still sees
+        every frame. The result has ``applied=False``: nothing is subtracted until
+        :meth:`apply_baseline` is called with it. ``frame_range`` is the ``seq`` of the
+        first and last frame averaged, or ``None`` when the sensor has no ``seq``. Backends
+        whose frames are images override this to return a ``reference_frame`` instead.
 
         Raises:
             ConnectionError: If not connected.
@@ -410,30 +466,20 @@ class TactileSensor(abc.ABC):
         if seconds <= 0:
             raise ValueError(f"seconds must be positive, got {seconds}")
         captured_at = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-        deadline = host_clock() + seconds
-        total: NDArray[np.float64] | None = None
-        count = 0
-        first_seq: int | None = None
-        last_seq: int | None = None
-        while True:
-            remaining_ms = (deadline - host_clock()) * 1000.0
-            if remaining_ms <= 0:
-                break
-            try:
-                frame = self.async_read(timeout_ms=remaining_ms)
-            except TimeoutError:
-                break
-            if frame.data.ndim != 2:
-                raise NotImplementedError(f"{self}: override capture_baseline for {frame.data.ndim}-D frames")
-            total = frame.data.astype(np.float64) if total is None else total + frame.data
-            count += 1
-            if frame.seq is not None:
-                first_seq = frame.seq if first_seq is None else first_seq
-                last_seq = frame.seq
-        if total is None:
+        with self._cond:
+            self._capture = []
+        try:
+            time.sleep(seconds)
+        finally:
+            with self._cond:
+                frames, self._capture = self._capture, None
+        if not frames:
             raise TimeoutError(f"{self}: no frame received in {seconds} s")
-        mean = (total / count).astype(np.float32)
-        frame_range = None if first_seq is None or last_seq is None else (first_seq, last_seq)
+        if frames[0].data.ndim != 2:
+            raise NotImplementedError(f"{self}: override capture_baseline for {frames[0].data.ndim}-D frames")
+        mean = np.mean([f.raw for f in frames], axis=0, dtype=np.float64).astype(np.float32)
+        seqs = [f.seq for f in frames if f.seq is not None]
+        frame_range = (seqs[0], seqs[-1]) if seqs else None
         return Baseline(
             captured_at=captured_at,
             duration_s=seconds,
@@ -441,6 +487,33 @@ class TactileSensor(abc.ABC):
             frame_range=frame_range,
             values=mean.tolist(),
         )
+
+    def apply_baseline(
+        self, values: ArrayLike, frame_range: tuple[int, int] | None = None
+    ) -> AppliedBaseline:
+        """Subtract ``values`` from every frame from the next one on, stamping each reading with it.
+
+        ``values`` is the no-contact reading in raw terms, typically ``Baseline.values``
+        from :meth:`capture_baseline`, and ``frame_range`` that capture's. Readings from
+        now on carry ``data - values`` and ``baseline`` set to the returned object, so a
+        recorder can write what was subtracted and from which frame on. Calling it again
+        replaces the baseline with a new object; :meth:`clear_baseline` removes it. A device
+        that subtracts on its own is declared differently: see :class:`TactileReading`.
+        """
+        applied = AppliedBaseline(np.asarray(values, dtype=np.float32), frame_range, host_clock())
+        with self._cond:
+            self._applied = applied
+        return applied
+
+    def clear_baseline(self) -> None:
+        """Stop subtracting: readings from the next frame on are raw and carry ``baseline=None``."""
+        with self._cond:
+            self._applied = None
+
+    @property
+    def applied_baseline(self) -> AppliedBaseline | None:
+        """The baseline the read thread currently subtracts, or ``None``."""
+        return self._applied
 
     # --- Internals ------------------------------------------------------------------------------
 
@@ -472,6 +545,11 @@ class TactileSensor(abc.ABC):
                 logger.warning("%s: _read_frame failed: %r", self, e)
                 continue
             with self._cond:
+                if frame.baseline is None and self._applied is not None:
+                    data = (frame.data - self._applied.values).astype(np.float32, copy=False)
+                    frame = replace(frame, data=data, baseline=self._applied)
+                if self._capture is not None:
+                    self._capture.append(frame)
                 if frame.seq is not None:
                     if self._last_seq is not None and frame.seq > self._last_seq + 1:
                         self._dropped += frame.seq - self._last_seq - 1

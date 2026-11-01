@@ -3,7 +3,7 @@
 import threading
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -20,6 +20,7 @@ from taxel.schema import (
     session_meta_path,
 )
 from taxel.sensors.base import (
+    AppliedBaseline,
     TactileReading,
     TactileSensor,
     TactileSensorConfig,
@@ -184,6 +185,20 @@ class TestReading:
             TactileReading(np.zeros(1), None)  # type: ignore[arg-type]
         with pytest.raises(TypeError, match="seq"):
             TactileReading(np.zeros(1), 1.0, seq=1.5)  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="baseline"):
+            TactileReading(np.zeros(1), 1.0, baseline=np.zeros(1))  # type: ignore[arg-type]
+
+    def test_raw_adds_the_baseline_back(self) -> None:
+        applied = AppliedBaseline(np.full((2, 3), 0.25, np.float32), (4, 9), 1.0)
+        subtracted = TactileReading(np.ones((2, 3), np.float32), 1.5, baseline=applied)
+        np.testing.assert_array_equal(subtracted.raw, np.full((2, 3), 1.25, np.float32))
+        plain = TactileReading(np.ones((2, 3), np.float32), 1.5)
+        assert plain.raw is plain.data
+        assert applied.frame_range == (4, 9)
+        with pytest.raises(TypeError, match="float32"):
+            AppliedBaseline(np.zeros((2, 3)), None, 0.0)
+        with pytest.raises(ValueError, match="frame_range"):
+            AppliedBaseline(np.zeros((2, 3), np.float32), (5, 2), 0.0)
 
 
 class TestContract:
@@ -342,6 +357,64 @@ class TestContract:
         first, last = baseline.frame_range
         assert 10 <= first < last < 1000
         assert float(np.asarray(baseline.values)[0, 0]) <= last - 10  # frame value k has seq 10 + k
+
+    def test_capture_baseline_does_not_consume_the_buffer(self) -> None:
+        drained: list[TactileReading] = []
+        stop = threading.Event()
+
+        def pump(sensor: FakeSensor) -> None:
+            while not stop.is_set():
+                drained.extend(sensor.drain())
+                time.sleep(0.002)
+
+        with fake(seqs=tuple(range(1000))) as sensor:
+            thread = threading.Thread(target=pump, args=(sensor,))
+            thread.start()
+            baseline = sensor.capture_baseline(0.05)
+            stop.set()
+            thread.join()
+        drained.extend(sensor.drain())  # the tail, after disconnect
+        seqs = [f.seq for f in drained]
+        assert seqs == list(range(seqs[0], seqs[0] + len(seqs)))  # nothing missing, nothing twice
+        assert len(seqs) == sensor.frames_received
+        first, last = baseline.frame_range
+        assert seqs[0] <= first < last <= seqs[-1] and last - first >= 4
+        averaged = [float(f.data[0, 0]) for f in drained if first <= f.seq <= last]
+        assert float(np.asarray(baseline.values)[0, 0]) == pytest.approx(sum(averaged) / len(averaged))
+
+    def test_apply_baseline_subtracts_from_the_next_frame_and_stamps_it(self) -> None:
+        with fake() as sensor:
+            before = sensor.read()
+            assert before.baseline is None and sensor.applied_baseline is None
+            applied = sensor.apply_baseline(np.full((4, 3), 0.5), frame_range=(0, 3))
+            assert sensor.applied_baseline is applied and applied.frame_range == (0, 3)
+            after = sensor.read()
+            assert after.baseline is applied
+            assert float(after.raw[0, 0]).is_integer()  # the device value, untouched
+            assert float(after.data[0, 0]) == float(after.raw[0, 0]) - 0.5
+            assert float(after.raw[0, 0]) > float(before.data[0, 0])
+            assert sensor.read().baseline is applied  # one object until it changes
+            captured = sensor.capture_baseline(0.03)  # averages raw values, not subtracted ones
+            assert float(np.asarray(captured.values)[0, 0]) > float(after.raw[0, 0])
+            sensor.clear_baseline()
+            cleared = sensor.read()
+            assert cleared.baseline is None and sensor.applied_baseline is None
+            assert float(cleared.data[0, 0]).is_integer()
+
+    def test_device_side_baseline_is_declared_not_subtracted_again(self) -> None:
+        tare = AppliedBaseline(np.full((4, 3), 2.0, np.float32), None, 0.0)
+
+        class Tared(FakeSensor):
+            def _read_frame(self) -> TactileReading:
+                frame = super()._read_frame()
+                return replace(frame, data=frame.data - tare.values, baseline=tare)
+
+        with Tared(FakeConfig(instance_id="x", timeout_ms=500.0)) as sensor:
+            sensor.apply_baseline(np.ones((4, 3), np.float32))  # not applied to frames that declare their own
+            frame = sensor.read()
+        assert frame.baseline is tare
+        np.testing.assert_array_equal(frame.raw, frame.data + 2.0)
+        assert float(frame.raw[0, 0]).is_integer()
 
     def test_capture_baseline_needs_frames(self) -> None:
         sensor = fake(seqs=(), timeout_ms=100.0)
