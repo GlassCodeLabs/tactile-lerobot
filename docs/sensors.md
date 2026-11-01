@@ -52,11 +52,11 @@ All three reset on `connect()`. A later framerate check reads `dropped_frames` r
 
 ## Baseline
 
-`capture_baseline(seconds)` averages the frames received over `seconds` and returns a `Baseline` record from `taxel.schema` with `values` set to that mean, `captured_at` in UTC and `applied=False`. It subtracts nothing from later readings; whether and how a baseline is applied is recorded in the session record, never done silently. Call it with nothing touching the sensor. Backends whose frames are images override it to return a `reference_frame` pointer instead, which is what `SCHEMA.md` specifies for visuotactile sensors.
+`capture_baseline(seconds)` averages the frames received over `seconds` and returns a `Baseline` record from `taxel.schema` with `values` set to that mean, `frame_range` set to the `seq` of the first and last frame averaged (`None` without `seq`), `captured_at` in UTC and `applied=False`. It subtracts nothing from later readings; whether and how a baseline is applied is recorded in the session record, never done silently. Call it with nothing touching the sensor. Backends whose frames are images override it to return a `reference_frame` pointer instead, which is what `SCHEMA.md` specifies for visuotactile sensors.
 
 ## Metadata
 
-`metadata()` returns a `TactileInfo`, the static `info` block of the instance's feature entry, built from what the backend knows (family, vendor, model, channels, layout) and what the config supplies (`declared_rate_hz`, `mount`, `device`, `instance_id`). It validates itself on construction, so a backend that declares `taxel_array` without `channels` fails at `metadata()`, not at write time.
+`metadata()` returns a `TactileInfo`, the static `info` block of the instance's feature entry, built from what the backend knows (family, vendor, model, channels, and the `layout`: the sensor's coordinate frame and the position of each element in it) and what the config supplies (`declared_rate_hz`, `mount`, `device`, `instance_id`). It validates itself on construction, so a backend that declares `taxel_array` without `channels` or without a `layout` fails at `metadata()`, not at write time.
 
 ## Registry
 
@@ -83,7 +83,7 @@ from typing import Any
 
 import numpy as np
 
-from taxel.schema import TactileFamily, TactileInfo, session_meta_path
+from taxel.schema import Axes, Layout, Origin, TactileFamily, TactileInfo, session_meta_path
 from taxel.sensors import TactileReading, TactileSensor, TactileSensorConfig, host_clock
 
 
@@ -118,6 +118,12 @@ class ExampleSensor(TactileSensor):
             declared_rate_hz=self.config.declared_rate_hz,
             units={"force": "N"},
             channels=["fx", "fy", "fz"],
+            layout=Layout(
+                origin=Origin(at="corner", description="taxel 0, nearest the cable"),
+                axes=Axes(x="along a row", y="down a column", z="out of the pad, toward the object"),
+                surface="pad",
+                positions_mm=[[1.5 * (i % 8), 1.5 * (i // 8), 0.0] for i in range(16)],
+            ),
             mount=self.config.mount,
             device=self.config.device,
             session_meta=session_meta_path(self.config.instance_id),

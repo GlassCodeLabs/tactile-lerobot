@@ -13,8 +13,13 @@ from taxel.dataset.features import (
     stream_entry,
     tactile_instances,
 )
-from taxel.schema import Reduction, SchemaError, StreamInfo, TactileInfo, feature_key
+from taxel.schema import Axes, Layout, Origin, Reduction, SchemaError, StreamInfo, TactileInfo, feature_key
 
+FRAME = {
+    "origin": {"at": "corner", "description": "taxel 0"},
+    "axes": {"x": "along a row", "y": "down a column", "z": "out of the surface"},
+    "surface": "pad",
+}
 LEFT = TactileInfo.from_dict(
     {
         "family": "taxel_array",
@@ -23,6 +28,7 @@ LEFT = TactileInfo.from_dict(
         "declared_rate_hz": 91,
         "units": {"force": "N"},
         "channels": ["fx", "fy", "fz"],
+        "layout": {**FRAME, "positions_mm": [[1.5 * i, 0.0, 0.0] for i in range(52)], "normals": None},
         "reduction": {"method": "mean", "window_ms": 33.3},
         "mount": {"body": "so101_follower", "link": "gripper_left_finger", "pose": None},
         "device": None,
@@ -35,6 +41,7 @@ RIGHT = TactileInfo.from_dict(
         "vendor": "GelSight",
         "model": "DIGIT",
         "declared_rate_hz": 60,
+        "layout": {**FRAME, "surface": "gel"},
         "reduction": {"method": "nearest", "window_ms": 33.3},
         "markers": {"count": 63, "grid": [7, 9]},
         "derived": {"method": "marker-flow-depth", "version": "0.1.0"},
@@ -47,6 +54,11 @@ WRENCH = TactileInfo(
     family="force_torque",
     declared_rate_hz=1000,
     channels=["fx", "fy", "fz", "mx", "my", "mz"],
+    layout=Layout(
+        origin=Origin("mount", "the centre of the mounting flange"),
+        axes=Axes("toward the cable exit", "right-handed with x and z", "out of the tool face"),
+        surface="vendor",
+    ),
     session_meta="tactile/wrist/meta.json",
 )
 
@@ -65,6 +77,11 @@ class TestFeatureEntry:
         with pytest.raises(SchemaError, match=r"\(n_elements, 6\)"):
             feature_entry(WRENCH, (1, 3))
         assert feature_entry(WRENCH, (1, 6))["shape"] == (1, 6)
+
+    def test_element_count_must_match_positions(self) -> None:
+        with pytest.raises(SchemaError, match="positions_mm has 52 rows for 51 elements"):
+            feature_entry(LEFT, (51, 3))
+        assert feature_entry(WRENCH, (1, 6))["info"]["layout"] == WRENCH.layout.to_dict()
 
     def test_shape_must_be_positive_integers(self) -> None:
         for bad in ((0, 3), (52, -3), (52.0, 3), "52x3", ()):

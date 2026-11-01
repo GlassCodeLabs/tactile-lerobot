@@ -67,6 +67,7 @@ class TestRegistryAndShape:
         assert info.units == {"field": "uT"}
         assert info.channels == ["bx", "by", "bz"]
         assert info.layout is not None and len(info.layout.positions_mm) == 5
+        assert info.layout.origin.at == "corner" and info.layout.surface == "pad"
         assert info.session_meta == "tactile/left_fingertip/meta.json"
         assert info.declared_rate_hz == RATE
 

@@ -9,7 +9,16 @@ from typing import Any
 import numpy as np
 import pytest
 
-from taxel.schema import Baseline, SchemaError, TactileFamily, TactileInfo, session_meta_path
+from taxel.schema import (
+    Axes,
+    Baseline,
+    Layout,
+    Origin,
+    SchemaError,
+    TactileFamily,
+    TactileInfo,
+    session_meta_path,
+)
 from taxel.sensors.base import (
     TactileReading,
     TactileSensor,
@@ -65,6 +74,12 @@ class FakeSensor(TactileSensor):
             declared_rate_hz=self.config.declared_rate_hz,
             session_meta=session_meta_path(self.config.instance_id),
             channels=["fx", "fy", "fz"],
+            layout=Layout(
+                origin=Origin("corner", "element 0"),
+                axes=Axes("along a row", "down a column", "out of the surface"),
+                surface="pad",
+                positions_mm=[[float(i), 0.0, 0.0] for i in range(4)],
+            ),
         )
 
     @staticmethod
@@ -319,6 +334,14 @@ class TestContract:
         assert values.shape == (4, 3)
         assert values.min() == values.max()  # every element has the same value
         assert values[0, 0] > 0  # an average over several frames, not the first frame
+        assert baseline.frame_range is None  # the fake has no seq unless asked
+
+    def test_capture_baseline_reports_the_frames_averaged(self) -> None:
+        with fake(seqs=tuple(range(10, 1000))) as sensor:
+            baseline = sensor.capture_baseline(0.05)
+        first, last = baseline.frame_range
+        assert 10 <= first < last < 1000
+        assert float(np.asarray(baseline.values)[0, 0]) <= last - 10  # frame value k has seq 10 + k
 
     def test_capture_baseline_needs_frames(self) -> None:
         sensor = fake(seqs=(), timeout_ms=100.0)

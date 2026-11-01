@@ -25,6 +25,13 @@ features = {
             "declared_rate_hz": 30,
             "channels": ["fx", "fy", "fz"],
             "units": {"force": "N"},
+            "layout": {
+                "origin": {"at": "corner", "description": "taxel 0"},
+                "axes": {"x": "along a row", "y": "down a column", "z": "out of the sensing surface"},
+                "surface": "pad",
+                "positions_mm": [[1.5 * (i % 8), 1.5 * (i // 8), 0.0] for i in range(N_TAXELS)],
+                "normals": None,
+            },
         },
     },
 }

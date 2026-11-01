@@ -52,7 +52,8 @@ def feature_entry(info: TactileInfo, shape: tuple[int, ...], *, use_videos: bool
 
     Raises:
         SchemaError: If ``shape`` disagrees with ``info`` (wrong rank, width not equal
-            to the channel count, or not three image channels).
+            to the channel count, element count not equal to the number of
+            ``layout.positions_mm`` rows, or not three image channels).
     """
     shape = _require_shape(shape, "shape")
     if info.family in ARRAY_FAMILIES:
@@ -62,6 +63,9 @@ def feature_entry(info: TactileInfo, shape: tuple[int, ...], *, use_videos: bool
                 f"{info.family.value} frames are (n_elements, {len(info.channels)}) for channels "
                 f"{info.channels}, got shape {shape}"
             )
+        positions = info.layout.positions_mm if info.layout is not None else None
+        if positions is not None and len(positions) != shape[0]:
+            raise SchemaError(f"layout.positions_mm has {len(positions)} rows for {shape[0]} elements")
         return {"dtype": ARRAY_DTYPE, "shape": shape, "names": None, "info": info.to_dict()}
     if len(shape) != 3 or shape[2] != 3:
         raise SchemaError(f"visuotactile frames are (height, width, 3), got shape {shape}")

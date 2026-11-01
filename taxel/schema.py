@@ -13,8 +13,10 @@ Every class validates itself on construction and offers ``to_dict`` /
 ``from_dict`` that round-trip to the JSON shapes in ``SCHEMA.md``. ``from_dict``
 is strict: an unknown key is an error, so a typo in hand-written metadata fails
 at load time rather than silently becoming an ignored field. Decoding goes
-through :class:`_Reader`, which is the one place a lenient, report-unknown-keys
-mode would plug in for third-party datasets.
+through :class:`_Reader`; :func:`read_info_lenient` and
+:func:`read_session_meta_lenient` use its lenient mode, which reports unknown keys
+and the keys a later schema version added instead of raising, for datasets this
+package did not write or wrote under an earlier version.
 """
 
 from __future__ import annotations
@@ -32,7 +34,9 @@ import numpy as np
 __all__ = [
     "ARRAY_FAMILIES",
     "Adapter",
+    "Axes",
     "Baseline",
+    "BaselineStream",
     "Block",
     "Calibration",
     "Clock",
@@ -45,10 +49,13 @@ __all__ = [
     "Layout",
     "Markers",
     "Mount",
+    "ORIGIN_AT",
+    "Origin",
     "REDUCTION_METHODS",
     "Reduction",
     "STREAM_SUFFIXES",
     "STREAM_WIDTHS",
+    "SURFACES",
     "SchemaError",
     "SessionMeta",
     "SessionRecord",
@@ -58,6 +65,7 @@ __all__ = [
     "TactileInfo",
     "feature_key",
     "read_info_lenient",
+    "read_session_meta_lenient",
     "session_meta_path",
 ]
 
@@ -72,6 +80,12 @@ STREAM_WIDTHS = {"markers": 2, "displacement": 3, "force": 3}
 
 REDUCTION_METHODS = ("nearest", "mean", "last")
 """How a dataset-rate copy was reduced from a faster native stream."""
+
+ORIGIN_AT = ("center", "corner", "element", "mount")
+"""Where a layout's origin sits on the sensor body."""
+
+SURFACES = ("gel", "die", "skin", "pad", "vendor")
+"""Which surface a layout's frame and positions describe."""
 
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 _SESSION_META = re.compile(r"^tactile/[A-Za-z0-9_-]+/meta\.json$")
@@ -89,13 +103,16 @@ class Block:
     """Mixin giving every schema dataclass ``to_dict`` and a strict ``from_dict``.
 
     Subclasses may set ``_label`` (the root of error paths), ``_omit_when_none``
-    (keys left out of the dict when ``None``) and ``_key_order`` (the key order
-    in ``SCHEMA.md``, when it differs from field order).
+    (keys left out of the dict when ``None``), ``_key_order`` (the key order in
+    ``SCHEMA.md``, when it differs from field order) and ``_lenient_missing``
+    (required keys a lenient read fills with ``None`` when absent, for documents
+    written under an earlier schema version).
     """
 
     _label: ClassVar[str]
     _omit_when_none: ClassVar[frozenset[str]] = frozenset()
     _key_order: ClassVar[tuple[str, ...] | None] = None
+    _lenient_missing: ClassVar[frozenset[str]] = frozenset()
 
     def to_dict(self) -> dict[str, Any]:
         """Return the JSON-ready form, exactly as ``SCHEMA.md`` shows it."""
@@ -140,26 +157,72 @@ def session_meta_path(instance_id: str) -> str:
 
 
 @dataclass
-class Layout(Block):
-    """Physical position of each element in the sensor's own frame.
+class Origin(Block):
+    """Where (0, 0, 0) of the sensor's frame sits on its body.
 
-    ``positions_mm`` has one ``[x, y, z]`` entry per element, in millimetres.
-    ``normals`` is either ``None`` or one unit vector per element.
+    ``at`` is one of :data:`ORIGIN_AT`; ``description`` says which corner or element in words.
     """
 
-    frame: str
-    positions_mm: list[list[float]]
-    normals: list[list[float]] | None = None
+    at: str
+    description: str
 
     def __post_init__(self) -> None:
-        _require_nonempty_str(self.frame, "layout.frame")
-        _require_rows(self.positions_mm, 3, "layout.positions_mm")
+        if self.at not in ORIGIN_AT:
+            raise SchemaError(f"origin.at must be one of {ORIGIN_AT}, got {self.at!r}")
+        _require_nonempty_str(self.description, "origin.description")
+
+
+@dataclass
+class Axes(Block):
+    """Where +x, +y and +z point, in the sensor's own terms. The frame is right-handed."""
+
+    x: str
+    y: str
+    z: str
+
+    def __post_init__(self) -> None:
+        for name in ("x", "y", "z"):
+            _require_nonempty_str(getattr(self, name), f"axes.{name}")
+
+
+@dataclass
+class Layout(Block):
+    """The sensor's coordinate frame and, for the array families, the position of each element in it.
+
+    ``origin``, ``axes`` and ``surface`` (one of :data:`SURFACES`) make the frame
+    explicit, so two sensors' positions are comparable. ``positions_mm`` has one
+    ``[x, y, z]`` row per element, in millimetres, and is omitted for an image
+    sensor, whose image is the element arrangement. ``normals`` is ``None`` or one
+    unit vector per position, and is written only beside ``positions_mm``.
+    """
+
+    origin: Origin
+    axes: Axes
+    surface: str
+    positions_mm: list[list[float]] | None = None
+    normals: list[list[float]] | None = None
+
+    _omit_when_none: ClassVar[frozenset[str]] = frozenset({"positions_mm"})
+
+    def __post_init__(self) -> None:
+        if self.surface not in SURFACES:
+            raise SchemaError(f"layout.surface must be one of {SURFACES}, got {self.surface!r}")
+        if self.positions_mm is not None:
+            _require_rows(self.positions_mm, 3, "layout.positions_mm")
         if self.normals is not None:
+            if self.positions_mm is None:
+                raise SchemaError("layout.normals is given without positions_mm")
             _require_rows(self.normals, 3, "layout.normals")
             if len(self.normals) != len(self.positions_mm):
                 raise SchemaError(
                     f"layout.normals has {len(self.normals)} rows, positions_mm has {len(self.positions_mm)}"
                 )
+
+    def to_dict(self) -> dict[str, Any]:
+        out = super().to_dict()
+        if self.positions_mm is None:
+            del out["normals"]
+        return out
 
 
 @dataclass
@@ -238,9 +301,12 @@ class TactileInfo(Block):
     requires feature entries to be identical, so anything that varies between
     sessions goes in :class:`SessionRecord` instead.
 
-    ``family``, ``vendor``, ``model``, ``declared_rate_hz``, ``mount``, ``device``
-    and ``session_meta`` are always written. ``units``, ``channels``, ``layout``,
-    ``reduction``, ``markers`` and ``derived`` are written only when set.
+    ``family``, ``vendor``, ``model``, ``declared_rate_hz``, ``layout``, ``mount``,
+    ``device`` and ``session_meta`` are always written. ``units``, ``channels``,
+    ``reduction``, ``markers`` and ``derived`` are written only when set. ``layout``
+    is required for every family; its ``positions_mm`` is required for
+    ``taxel_array`` and ``magnetic``, at most one row for ``force_torque``, and
+    omitted for ``visuotactile``.
     """
 
     family: TactileFamily
@@ -259,7 +325,7 @@ class TactileInfo(Block):
 
     _label: ClassVar[str] = "info"
     _omit_when_none: ClassVar[frozenset[str]] = frozenset(
-        {"units", "channels", "layout", "reduction", "markers", "derived"}
+        {"units", "channels", "reduction", "markers", "derived"}
     )
     _key_order: ClassVar[tuple[str, ...] | None] = (
         "family",
@@ -294,6 +360,17 @@ class TactileInfo(Block):
             not isinstance(k, str) or not isinstance(v, str) for k, v in self.units.items()
         ):
             raise SchemaError("units must map quantity names to unit strings")
+        if self.layout is None:
+            raise SchemaError("layout is required: origin, axes and surface declare the sensor's frame")
+        positions = self.layout.positions_mm
+        if self.family in (TactileFamily.TAXEL_ARRAY, TactileFamily.MAGNETIC) and positions is None:
+            raise SchemaError(f"layout.positions_mm is required for family {self.family.value!r}")
+        if self.family is TactileFamily.FORCE_TORQUE and positions is not None and len(positions) != 1:
+            raise SchemaError(f"force_torque is one element; layout.positions_mm has {len(positions)} rows")
+        if self.family is TactileFamily.VISUOTACTILE and positions is not None:
+            raise SchemaError(
+                "layout.positions_mm is omitted for visuotactile; the image is the element arrangement"
+            )
 
     @property
     def n_channels(self) -> int | None:
@@ -447,24 +524,31 @@ class Baseline(Block):
     """What the sensor read with nothing touching it at session start.
 
     Array families store the reading as ``values``; visuotactile sensors store a
-    ``reference_frame`` pointer. Exactly one of the two is set. ``applied`` says
-    whether ``values`` were subtracted at record time, which is only valid when
-    they are stored, so stored data plus ``values`` reconstructs the raw readings.
+    ``reference_frame`` pointer. Exactly one of the two is set. ``frame_range`` is
+    ``(first_seq, last_seq)`` of the native frames averaged, or ``None`` when the
+    sensor has no ``seq``; it is required on a strict read and tolerated as absent
+    on a lenient one, since 0.2 records do not have it. ``applied`` says whether
+    ``values`` were subtracted at record time, which is only valid when they are
+    stored; later captures live in the baseline stream, not here.
     """
 
     captured_at: str
     duration_s: float
     applied: bool
+    frame_range: tuple[int, int] | None
     values: list[list[float]] | None = None
     reference_frame: str | None = None
 
     _omit_when_none: ClassVar[frozenset[str]] = frozenset({"values", "reference_frame"})
+    _lenient_missing: ClassVar[frozenset[str]] = frozenset({"frame_range"})
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.captured_at, "baseline.captured_at")
         _require_positive(self.duration_s, "baseline.duration_s")
         if not isinstance(self.applied, bool):
             raise SchemaError(f"baseline.applied must be a boolean, got {self.applied!r}")
+        if self.frame_range is not None:
+            self.frame_range = _seq_range(self.frame_range, "baseline.frame_range")
         if (self.values is None) == (self.reference_frame is None):
             raise SchemaError("baseline needs exactly one of 'values' or 'reference_frame'")
         if self.values is not None:
@@ -473,6 +557,23 @@ class Baseline(Block):
             _require_nonempty_str(self.reference_frame, "baseline.reference_frame")
         if self.applied and self.values is None:
             raise SchemaError("baseline.applied is true but no values are stored")
+
+
+@dataclass
+class BaselineStream(Block):
+    """Sampling period of the baseline stream: one raw sample every ``sample_every`` native samples."""
+
+    sample_every: int
+
+    def __post_init__(self) -> None:
+        if (
+            isinstance(self.sample_every, bool)
+            or not isinstance(self.sample_every, int)
+            or self.sample_every < 1
+        ):
+            raise SchemaError(
+                f"baseline_stream.sample_every must be a positive integer, got {self.sample_every!r}"
+            )
 
 
 @dataclass
@@ -505,8 +606,8 @@ class SessionRecord(Block):
     ``adapter``, ``calibration`` and ``baseline`` have no default: they are
     always written, as ``null`` when unknown, so their absence is a visible fact.
     ``episodes`` is the inclusive range of episode indices the session covers.
-    ``clock`` and ``frames`` are written by the recorder; a ``clock`` must carry
-    one episode origin per episode in the range.
+    ``clock``, ``frames`` and ``baseline_stream`` are written by the recorder; a
+    ``clock`` must carry one episode origin per episode in the range.
     """
 
     session_id: str
@@ -514,6 +615,7 @@ class SessionRecord(Block):
     adapter: Adapter | None
     calibration: Calibration | None
     baseline: Baseline | None
+    baseline_stream: BaselineStream | None = None
     clock: Clock | None = None
     frames: FrameCounts | None = None
     serial: str | None = None
@@ -534,6 +636,7 @@ class SessionRecord(Block):
         "adapter",
         "calibration",
         "baseline",
+        "baseline_stream",
         "gel",
         "skin",
     )
@@ -572,15 +675,30 @@ class SessionMeta(Block):
                 raise SchemaError(f"session episode ranges overlap: {ranges}")
 
 
+def read_session_meta_lenient(data: Mapping[str, Any]) -> tuple[SessionMeta, list[str], list[str]]:
+    """Decode a ``meta.json`` from a dataset this package did not write, or wrote under an earlier schema.
+
+    Returns the metadata, the unknown keys and the tolerated missing keys, both as
+    dotted paths (``meta.sessions[0].baseline.frame_range``). A missing
+    ``baseline.frame_range``, added in 0.3, is read as ``None``. Wrong types and
+    other missing required keys still raise :class:`SchemaError`.
+    """
+    reader = _Reader(strict=False)
+    meta = _from_dict(SessionMeta, data, reader, "meta")
+    return meta, reader.unknown, reader.missing
+
+
 # --- Encoding and decoding -----------------------------------------------------------------------
 
 
 class _Reader:
-    """Decoding policy. Strict today; a lenient mode would record unknown keys instead of raising."""
+    """Decoding policy. Strict raises on an unknown key; lenient records it, and fills a required key a
+    later schema version added (``_lenient_missing``) with ``None``, recording that too."""
 
     def __init__(self, strict: bool = True) -> None:
         self.strict = strict
         self.unknown: list[str] = []
+        self.missing: list[str] = []
 
     def check_keys(self, data: Mapping[str, Any], allowed: Iterable[str], path: str) -> None:
         extra = sorted(set(data) - set(allowed))
@@ -605,6 +723,8 @@ def _to_dict(obj: Any) -> dict[str, Any]:
 
 
 def _encode(value: Any) -> Any:
+    if isinstance(value, Block):
+        return value.to_dict()
     if is_dataclass(value) and not isinstance(value, type):
         return _to_dict(value)
     if isinstance(value, Enum):
@@ -626,6 +746,10 @@ def _from_dict(cls: type, data: Any, reader: _Reader, path: str) -> Any:
     for field in fields(cls):
         if field.name not in data:
             if field.default is MISSING and field.default_factory is MISSING:
+                if not reader.strict and field.name in getattr(cls, "_lenient_missing", ()):
+                    reader.missing.append(f"{path}.{field.name}")
+                    kwargs[field.name] = None
+                    continue
                 raise SchemaError(f"{path}: missing required key {field.name!r}")
             continue
         kwargs[field.name] = _decode(hints[field.name], data[field.name], reader, f"{path}.{field.name}")
@@ -711,6 +835,17 @@ def _require_slug(value: Any, path: str) -> None:
 def _require_session_meta(value: Any) -> None:
     if not isinstance(value, str) or not _SESSION_META.match(value):
         raise SchemaError(f"session_meta must look like 'tactile/<instance_id>/meta.json', got {value!r}")
+
+
+def _seq_range(value: Any, path: str) -> tuple[int, int]:
+    """Require ``[first, last]`` sequence numbers with ``0 <= first <= last``."""
+    items = tuple(value) if isinstance(value, (list, tuple)) else ()
+    if len(items) != 2 or any(isinstance(v, bool) or not isinstance(v, int) for v in items):
+        raise SchemaError(f"{path} must be two integers [first_seq, last_seq], got {value!r}")
+    first, last = items
+    if first < 0 or last < first:
+        raise SchemaError(f"{path} must satisfy 0 <= first_seq <= last_seq, got {list(items)}")
+    return first, last
 
 
 def _is_number(value: Any) -> bool:

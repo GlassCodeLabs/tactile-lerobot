@@ -18,7 +18,7 @@ from taxel.dataset.sidecar import (
     write_episode,
     write_session_meta,
 )
-from taxel.schema import Clock, FrameCounts, SchemaError, SessionMeta, SessionRecord
+from taxel.schema import Axes, Clock, FrameCounts, Layout, Origin, SchemaError, SessionMeta, SessionRecord
 from taxel.sensors import TactileReading
 
 SHAPE = (4, 3)
@@ -184,6 +184,12 @@ class TestBesideLeRobot:
             family="taxel_array",
             declared_rate_hz=500,
             channels=["fx", "fy", "fz"],
+            layout=Layout(
+                origin=Origin("corner", "element 0"),
+                axes=Axes("along a row", "down a column", "out of the surface"),
+                surface="pad",
+                positions_mm=[[float(i), 0.0, 0.0] for i in range(4)],
+            ),
             session_meta="tactile/left_fingertip/meta.json",
         )
         key = feature_key("left_fingertip")

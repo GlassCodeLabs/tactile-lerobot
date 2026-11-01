@@ -16,7 +16,9 @@ from numpy.typing import NDArray
 
 from taxel.schema import (
     ARRAY_FAMILIES,
+    Axes,
     Layout,
+    Origin,
     SchemaError,
     TactileFamily,
     TactileInfo,
@@ -131,7 +133,17 @@ class SimulatedTactile(TactileSensor):
             declared_rate_hz=cfg.declared_rate_hz,
             units=dict(_UNITS[cfg.family]),
             channels=list(cfg.channels),
-            layout=Layout(frame="sensor", positions_mm=positions, normals=[[0.0, 0.0, 1.0]] * cfg.n_elements),
+            layout=Layout(
+                origin=Origin(at="corner", description="element 0, the corner of the grid"),
+                axes=Axes(
+                    x="along a row of the 8-wide grid, from element 0 toward element 7",
+                    y="down the grid columns, from element 0 toward element 8",
+                    z="out of the sensing surface, toward the contacting object",
+                ),
+                surface="pad",
+                positions_mm=positions,
+                normals=[[0.0, 0.0, 1.0]] * cfg.n_elements,
+            ),
             mount=cfg.mount,
             device=cfg.device,
             session_meta=session_meta_path(cfg.instance_id),

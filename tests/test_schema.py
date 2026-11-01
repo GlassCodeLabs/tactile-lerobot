@@ -7,10 +7,14 @@ import pytest
 
 from taxel.schema import (
     Adapter,
+    Axes,
     Baseline,
+    BaselineStream,
     Calibration,
     Clock,
     FrameCounts,
+    Layout,
+    Origin,
     SchemaError,
     SessionMeta,
     SessionRecord,
@@ -19,6 +23,7 @@ from taxel.schema import (
     TactileInfo,
     feature_key,
     read_info_lenient,
+    read_session_meta_lenient,
     session_meta_path,
 )
 
@@ -37,7 +42,17 @@ LEFT_FINGERTIP = {
     "declared_rate_hz": 91,
     "units": {"force": "N"},
     "channels": ["fx", "fy", "fz"],
-    "layout": {"frame": "sensor", "positions_mm": positions(N_TAXELS), "normals": [[0, 0, 1]] * N_TAXELS},
+    "layout": {
+        "origin": {"at": "corner", "description": "taxel 0, the corner of the array nearest the connector"},
+        "axes": {
+            "x": "along the long side of the array, away from the connector",
+            "y": "across the array, from taxel 0 toward taxel 8",
+            "z": "out of the sensing surface, toward the contacting object",
+        },
+        "surface": "pad",
+        "positions_mm": positions(N_TAXELS),
+        "normals": [[0, 0, 1]] * N_TAXELS,
+    },
     "reduction": {"method": "mean", "window_ms": 33.3},
     "mount": {"body": "so101_follower", "link": "gripper_left_finger", "pose": None},
     "device": {"id": "paxini_hub_0", "clock": "paxini_hub_0"},
@@ -49,6 +64,15 @@ RIGHT_FINGERTIP = {
     "vendor": "GelSight",
     "model": "DIGIT",
     "declared_rate_hz": 60,
+    "layout": {
+        "origin": {"at": "corner", "description": "the top-left pixel of the image"},
+        "axes": {
+            "x": "along an image row, toward the right",
+            "y": "down an image column",
+            "z": "out of the gel, toward the contacting object",
+        },
+        "surface": "gel",
+    },
     "reduction": {"method": "nearest", "window_ms": 33.3},
     "markers": {"count": 63, "grid": [7, 9]},
     "derived": {"method": "marker-flow-depth", "version": "0.1.0"},
@@ -65,7 +89,13 @@ PALM = {
     "units": {"field": "uT"},
     "channels": ["bx", "by", "bz"],
     "layout": {
-        "frame": "sensor",
+        "origin": {"at": "element", "description": "the central magnetometer"},
+        "axes": {
+            "x": "across the board, from the central magnetometer toward the second",
+            "y": "across the board, from the central magnetometer toward the fourth",
+            "z": "out of the skin, toward the contacting object",
+        },
+        "surface": "die",
         "positions_mm": [[0, 0, 0], [6, 0, 0], [-6, 0, 0], [0, 6, 0], [0, -6, 0]],
         "normals": None,
     },
@@ -102,13 +132,18 @@ LEFT_FINGERTIP_META = {
                 "captured_at": "2026-11-21T14:03:11Z",
                 "duration_s": 2.0,
                 "applied": True,
+                "frame_range": [364, 545],
                 "values": [[0.01, -0.02, 0.00]] * N_TAXELS,
             },
+            "baseline_stream": {"sample_every": 100},
             "gel": None,
             "skin": None,
         }
     ],
 }
+
+
+FRAME = {k: PALM["layout"][k] for k in ("origin", "axes", "surface")}
 
 
 def json_round_trip(obj: object) -> object:
@@ -129,7 +164,8 @@ class TestInfoRoundTrip:
 
     def test_optional_blocks_are_omitted_not_nulled(self) -> None:
         out = TactileInfo.from_dict(RIGHT_FINGERTIP).to_dict()
-        assert "channels" not in out and "layout" not in out and "units" not in out
+        assert "channels" not in out and "units" not in out
+        assert "positions_mm" not in out["layout"] and "normals" not in out["layout"]
         assert out["device"] is None  # always written
 
     def test_video_keys_are_ignored_on_read(self) -> None:
@@ -153,8 +189,8 @@ class TestInfoValidation:
     def test_force_torque_declares_six_channels(self) -> None:
         with pytest.raises(SchemaError, match="six channels"):
             TactileInfo.from_dict({**PALM, "family": "force_torque"})
-        ok = {**PALM, "family": "force_torque", "channels": ["fx", "fy", "fz", "mx", "my", "mz"]}
-        del ok["layout"]
+        channels = ["fx", "fy", "fz", "mx", "my", "mz"]
+        ok = {**PALM, "family": "force_torque", "channels": channels, "layout": FRAME}
         assert TactileInfo.from_dict(ok).n_channels == 6
 
     def test_visuotactile_needs_no_channels(self) -> None:
@@ -190,6 +226,58 @@ class TestInfoValidation:
     def test_session_meta_path_shape(self) -> None:
         with pytest.raises(SchemaError, match="session_meta"):
             TactileInfo.from_dict({**PALM, "session_meta": "/abs/meta.json"})
+
+
+class TestLayout:
+    def test_layout_is_required_for_every_family(self) -> None:
+        for example in (LEFT_FINGERTIP, RIGHT_FINGERTIP, PALM):
+            without = {k: v for k, v in example.items() if k != "layout"}
+            with pytest.raises(SchemaError, match="layout is required"):
+                TactileInfo.from_dict(without)
+
+    def test_origin_and_surface_are_closed_enums(self) -> None:
+        bad_origin = {**PALM["layout"], "origin": {"at": "top-left", "description": "x"}}
+        with pytest.raises(SchemaError, match=r"info\.layout\.origin: origin\.at must be one of"):
+            TactileInfo.from_dict({**PALM, "layout": bad_origin})
+        with pytest.raises(SchemaError, match=r"info\.layout: layout\.surface must be one of"):
+            TactileInfo.from_dict({**PALM, "layout": {**PALM["layout"], "surface": "elastomer"}})
+        for surface in ("gel", "die", "skin", "pad", "vendor"):
+            assert Layout.from_dict({**FRAME, "surface": surface}).surface == surface
+        for at in ("center", "corner", "element", "mount"):
+            assert Origin(at, "somewhere").at == at
+
+    def test_frame_text_is_required(self) -> None:
+        with pytest.raises(SchemaError, match="origin.description must be a non-empty string"):
+            Origin("corner", "")
+        with pytest.raises(SchemaError, match="axes.z must be a non-empty string"):
+            Axes("x", "y", "")
+        axes = {k: v for k, v in PALM["layout"]["axes"].items() if k != "z"}
+        with pytest.raises(SchemaError, match=r"info\.layout\.axes: missing required key 'z'"):
+            TactileInfo.from_dict({**PALM, "layout": {**PALM["layout"], "axes": axes}})
+
+    @pytest.mark.parametrize("family", ["taxel_array", "magnetic"])
+    def test_positions_required_for_element_arrays(self, family: str) -> None:
+        with pytest.raises(SchemaError, match=f"positions_mm is required for family '{family}'"):
+            TactileInfo.from_dict({**PALM, "family": family, "layout": FRAME})
+
+    def test_positions_omitted_for_visuotactile(self) -> None:
+        layout = {**RIGHT_FINGERTIP["layout"], "positions_mm": [[0, 0, 0]]}
+        with pytest.raises(SchemaError, match="omitted for visuotactile"):
+            TactileInfo.from_dict({**RIGHT_FINGERTIP, "layout": layout})
+
+    def test_force_torque_has_at_most_one_position(self) -> None:
+        wrench = {**PALM, "family": "force_torque", "channels": ["fx", "fy", "fz", "mx", "my", "mz"]}
+        with pytest.raises(SchemaError, match="one element; layout.positions_mm has 5 rows"):
+            TactileInfo.from_dict(wrench)
+        one = {**wrench, "layout": {**FRAME, "positions_mm": [[0, 0, 0]], "normals": None}}
+        assert TactileInfo.from_dict(one).to_dict()["layout"] == one["layout"]
+
+    def test_normals_only_beside_positions(self) -> None:
+        assert Layout.from_dict(FRAME).to_dict() == FRAME
+        with_positions = Layout.from_dict({**FRAME, "positions_mm": [[0, 0, 0]]}).to_dict()
+        assert with_positions == {**FRAME, "positions_mm": [[0, 0, 0]], "normals": None}
+        with pytest.raises(SchemaError, match="normals is given without positions_mm"):
+            Layout.from_dict({**FRAME, "normals": [[0, 0, 1]]})
 
 
 class TestStreams:
@@ -279,6 +367,7 @@ class TestSessionRoundTrip:
             "captured_at": "2026-11-21T14:03:11Z",
             "duration_s": 2.0,
             "applied": False,
+            "frame_range": None,
             "reference_frame": "episode_000000/frame_0000",
         }
         assert SessionRecord.from_dict(session).to_dict()["baseline"] == session["baseline"]
@@ -287,17 +376,39 @@ class TestSessionRoundTrip:
 class TestSessionValidation:
     def test_applied_requires_stored_values(self) -> None:
         with pytest.raises(SchemaError, match="applied is true but no values"):
-            Baseline("2026-11-21T14:03:11Z", 2.0, applied=True, reference_frame="episode_000000/frame_0000")
+            Baseline("2026-11-21T14:03:11Z", 2.0, True, None, reference_frame="episode_000000/frame_0000")
 
     def test_baseline_needs_exactly_one_representation(self) -> None:
         with pytest.raises(SchemaError, match="exactly one"):
-            Baseline("t", 2.0, applied=False)
+            Baseline("t", 2.0, applied=False, frame_range=None)
         with pytest.raises(SchemaError, match="exactly one"):
-            Baseline("t", 2.0, applied=False, values=[[0.0]], reference_frame="x")
+            Baseline("t", 2.0, False, None, values=[[0.0]], reference_frame="x")
 
     def test_baseline_values_must_be_rectangular(self) -> None:
         with pytest.raises(SchemaError, match="baseline.values"):
-            Baseline("t", 2.0, applied=False, values=[[0.0, 1.0], [0.0]])
+            Baseline("t", 2.0, False, None, values=[[0.0, 1.0], [0.0]])
+
+    def test_frame_range_is_an_ordered_seq_pair(self) -> None:
+        ok = Baseline("t", 2.0, False, [7, 7], values=[[0.0]])
+        assert ok.frame_range == (7, 7) and ok.to_dict()["frame_range"] == [7, 7]
+        for bad in ([5, 2], [-1, 3], [1.5, 2], [1], [True, 2]):
+            with pytest.raises(SchemaError, match="baseline.frame_range"):
+                Baseline("t", 2.0, False, bad, values=[[0.0]])
+
+    def test_frame_range_is_required_on_a_strict_read(self) -> None:
+        session = copy.deepcopy(LEFT_FINGERTIP_META["sessions"][0])
+        del session["baseline"]["frame_range"]
+        with pytest.raises(SchemaError, match="missing required key 'frame_range'"):
+            SessionRecord.from_dict(session)
+
+    def test_baseline_stream_period(self) -> None:
+        assert BaselineStream.from_dict({"sample_every": 100}).to_dict() == {"sample_every": 100}
+        for bad in (0, -5, 2.5, True):
+            with pytest.raises(SchemaError, match="sample_every must be a positive integer"):
+                BaselineStream(bad)
+        record = SessionRecord("s", (0, 0), adapter=None, calibration=None, baseline=None)
+        assert record.to_dict()["baseline_stream"] is None
+        assert SessionRecord.from_dict(record.to_dict()) == record
 
     def test_episode_range_order(self) -> None:
         with pytest.raises(SchemaError, match="0 <= first <= last"):
@@ -328,6 +439,37 @@ class TestSessionValidation:
         assert Calibration().to_dict() == {"version": None, "method": None, "date": None, "reference": None}
 
 
+class TestSessionLenientReader:
+    def test_missing_frame_range_is_tolerated_and_reported(self) -> None:
+        older = copy.deepcopy(LEFT_FINGERTIP_META)
+        del older["sessions"][0]["baseline"]["frame_range"]
+        meta, unknown, missing = read_session_meta_lenient(older)
+        assert meta.sessions[0].baseline.frame_range is None
+        assert meta.sessions[0].baseline.values == LEFT_FINGERTIP_META["sessions"][0]["baseline"]["values"]
+        assert unknown == [] and missing == ["meta.sessions[0].baseline.frame_range"]
+        with pytest.raises(SchemaError, match="frame_range"):
+            SessionMeta.from_dict(older)
+
+    def test_unknown_keys_are_reported_not_raised(self) -> None:
+        data = copy.deepcopy(LEFT_FINGERTIP_META)
+        data["sessions"][0]["operator"] = "vic"
+        data["sessions"][0]["calibration"]["expires"] = "never"
+        meta, unknown, missing = read_session_meta_lenient(data)
+        assert meta == SessionMeta.from_dict(LEFT_FINGERTIP_META)
+        assert unknown == ["meta.sessions[0].operator", "meta.sessions[0].calibration.expires"]
+        assert missing == []
+
+    def test_other_missing_keys_and_wrong_types_still_raise(self) -> None:
+        data = copy.deepcopy(LEFT_FINGERTIP_META)
+        del data["sessions"][0]["baseline"]["applied"]
+        with pytest.raises(SchemaError, match="missing required key 'applied'"):
+            read_session_meta_lenient(data)
+        data = copy.deepcopy(LEFT_FINGERTIP_META)
+        data["sessions"][0]["baseline"]["frame_range"] = "364-545"
+        with pytest.raises(SchemaError, match="frame_range"):
+            read_session_meta_lenient(data)
+
+
 class TestClockAndFrames:
     def test_clock_validation(self) -> None:
         Clock(wall_time="2026-11-21T14:03:05Z", host_clock=1, episode_origins=[])
@@ -356,6 +498,7 @@ class TestClockAndFrames:
         record = SessionRecord(session_id="s", episodes=(0, 0), adapter=None, calibration=None, baseline=None)
         encoded = record.to_dict()
         assert list(encoded)[:4] == ["session_id", "episodes", "clock", "frames"]
+        assert list(encoded)[-4:] == ["baseline", "baseline_stream", "gel", "skin"]
         assert encoded["clock"] is None and encoded["frames"] is None
         assert SessionRecord.from_dict(encoded) == record
 

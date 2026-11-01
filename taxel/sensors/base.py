@@ -398,8 +398,9 @@ class TactileSensor(abc.ABC):
         """Average the frames received over ``seconds`` and return them as a :class:`Baseline`.
 
         Call with nothing touching the sensor. The result has ``applied=False``: nothing is
-        subtracted from later readings. Backends whose frames are images override this to
-        return a ``reference_frame`` instead.
+        subtracted from later readings. ``frame_range`` is the ``seq`` of the first and last
+        frame averaged, or ``None`` when the sensor has no ``seq``. Backends whose frames are
+        images override this to return a ``reference_frame`` instead.
 
         Raises:
             ConnectionError: If not connected.
@@ -412,6 +413,8 @@ class TactileSensor(abc.ABC):
         deadline = host_clock() + seconds
         total: NDArray[np.float64] | None = None
         count = 0
+        first_seq: int | None = None
+        last_seq: int | None = None
         while True:
             remaining_ms = (deadline - host_clock()) * 1000.0
             if remaining_ms <= 0:
@@ -424,10 +427,20 @@ class TactileSensor(abc.ABC):
                 raise NotImplementedError(f"{self}: override capture_baseline for {frame.data.ndim}-D frames")
             total = frame.data.astype(np.float64) if total is None else total + frame.data
             count += 1
+            if frame.seq is not None:
+                first_seq = frame.seq if first_seq is None else first_seq
+                last_seq = frame.seq
         if total is None:
             raise TimeoutError(f"{self}: no frame received in {seconds} s")
         mean = (total / count).astype(np.float32)
-        return Baseline(captured_at=captured_at, duration_s=seconds, applied=False, values=mean.tolist())
+        frame_range = None if first_seq is None or last_seq is None else (first_seq, last_seq)
+        return Baseline(
+            captured_at=captured_at,
+            duration_s=seconds,
+            applied=False,
+            frame_range=frame_range,
+            values=mean.tolist(),
+        )
 
     # --- Internals ------------------------------------------------------------------------------
 
