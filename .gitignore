@@ -223,3 +223,6 @@ __marimo__/
 outputs/
 notes-private/
 scratch/
+
+.env
+.env.*
