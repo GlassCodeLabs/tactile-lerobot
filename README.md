@@ -14,6 +14,8 @@ An open-source LeRobot plugin for tactile sensors, plus a health-check CLI for t
 
 **Status:** the `taxel` package contains the schema dataclasses ([SCHEMA.md](SCHEMA.md)), the `TactileSensor` base class and a simulated backend with injectable faults ([docs/sensors.md](docs/sensors.md)), the dataset writer and the `taxel record` command ([docs/recording.md](docs/recording.md)); the health checks are the next component.
 
+[docs/datasets.md](docs/datasets.md) lists public tactile datasets and how each maps onto the schema.
+
 **Why**
 
 Tactile data goes into training sets with no record of which sensor produced it, where each taxel sat, whether the gel was worn, or which calibration converted the numbers. Drift and wear produce plausible-looking data that quietly corrupts policies. Every lab and startup rebuilds the same ingestion and QA plumbing. Several single-sensor integrations already exist — Columbia's [LeFlexiTac](https://github.com/TNA001-AI/lerobot_tactile) fork for FlexiTac, Xense's [LeRobot fork](https://github.com/XenseRobotics-AI/xense-taccap-lerobot), a community [PaXini plugin](https://github.com/Jingyi-Z/robotics_notes) — each solving it for one sensor in its own way. This project is the neutral, sensor-agnostic layer that lets those live side by side as plugins, built to converge with the LeRobot tactile work in [PR #3175](https://github.com/huggingface/lerobot/pull/3175) and [PR #4469](https://github.com/huggingface/lerobot/pull/4469) and the format conversion in [TLabel](https://github.com/liesliy/tlabel), not to compete with any of them.
