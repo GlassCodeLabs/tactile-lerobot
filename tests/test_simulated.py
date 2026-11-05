@@ -82,6 +82,13 @@ class TestRegistryAndShape:
             ({"drop_probability": 1.0}, "drop_probability"),
             ({"saturation_max": 0.0}, "saturation_max"),
             ({"noise_std": -1.0}, "non-negative"),
+            ({"contact_schedule": [(0.0, 0.0, 1.0)]}, "duration_s > 0"),
+            ({"contact_schedule": [(-1.0, 1.0, 1.0)]}, "start_s must be >= 0"),
+            ({"contact_schedule": [(0.0, 1.0)]}, "contact_schedule\\[0\\]"),
+            ({"contact_elements": [16]}, "contact_elements"),
+            ({"contact_elements": []}, "contact_elements"),
+            ({"rebaseline_at_s": [1.0, 0.5]}, "increasing"),
+            ({"rebaseline_at_s": [-1.0]}, "non-negative"),
         ],
     )
     def test_config_validation(self, overrides: dict, match: str) -> None:
@@ -215,3 +222,91 @@ class TestBaseline:
             baseline = sensor.capture_baseline(0.2)
             error = np.abs(np.asarray(baseline.values, np.float32) - sensor.rest)
         assert float(error.max()) < 0.01  # ~100 samples: standard error 0.001, generous bound
+
+
+class TestContactSchedule:
+    def test_press_adds_its_amplitude_on_the_pressed_elements_while_it_is_on(self) -> None:
+        clean = SimulatedTactile(config(seed=5))
+        pressed = SimulatedTactile(
+            config(seed=5, contact_schedule=[(0.1, 0.2, 2.0), (0.2, 0.05, 1.0)], contact_elements=[1, 3])
+        )
+        # seq / 500 Hz: the first press covers [0.1, 0.3) s, the second [0.2, 0.25) s, and they add up.
+        expected = {0: 0.0, 49: 0.0, 50: 2.0, 100: 3.0, 124: 3.0, 125: 2.0, 149: 2.0, 150: 0.0}
+        for seq, amplitude in expected.items():
+            assert pressed.press_amplitude(seq) == amplitude
+            delta = pressed._frame(seq) - clean._frame(seq)
+            wanted = np.zeros(clean.config.shape, np.float32)
+            wanted[[1, 3], :] = amplitude
+            np.testing.assert_allclose(delta, wanted, atol=1e-6)
+
+    def test_default_pressed_elements_are_the_first_quarter(self) -> None:
+        assert config(n_elements=16).pressed_elements == [0, 1, 2, 3]
+        assert config(n_elements=2).pressed_elements == [0]
+        assert config(n_elements=16, contact_elements=[7]).pressed_elements == [7]
+
+    def test_held_press_spans_a_detection_window(self) -> None:
+        sensor = SimulatedTactile(config(contact_schedule=[(0.2, 1.0, 1.5)]))
+        pressed = [seq for seq in range(int(2 * RATE)) if sensor.press_amplitude(seq) == 1.5]
+        assert pressed == list(range(100, 600))  # 1 s of 500 Hz frames, longer than a 0.5 s window
+        _, frames = collect(config(contact_schedule=[(0.0, 10.0, 1.5)], noise_std=0.0), 0.05)
+        for frame in frames:
+            np.testing.assert_allclose(frame.data[:4] - sensor.rest[:4], 1.5, atol=1e-6)
+            np.testing.assert_allclose(frame.data[4:], sensor.rest[4:], atol=1e-6)
+
+    def test_press_is_applied_before_the_clamp_and_under_dead_elements(self) -> None:
+        cfg = config(
+            contact_schedule=[(0.0, 1.0, 5.0)], saturation_max=1.0, dead_elements=[0], dead_value=-9.0
+        )
+        frame = SimulatedTactile(cfg)._frame(0)
+        assert np.all(frame[1:4] == np.float32(1.0)) and np.all(frame[0] == np.float32(-9.0))
+
+
+class TestRebaseline:
+    def test_rebaseline_subtracts_rest_plus_drift_from_the_scheduled_frame_on(self) -> None:
+        cfg = config(drift_per_s=[0.0, 0.0, 2.0], rebaseline_at_s=[0.05], noise_std=0.0)
+        sensor, frames = collect(cfg, 0.15)
+        before = [f for f in frames if f.seq < 25]
+        after = [f for f in frames if f.seq >= 25]
+        assert before and after
+        for f in before:
+            assert f.baseline is None
+            np.testing.assert_array_equal(f.data, sensor._frame(f.seq))
+        applied = after[0].baseline
+        assert applied is not None and applied.frame_range == (25, 25)
+        np.testing.assert_array_equal(applied.values, sensor.drifted_rest(25))
+        np.testing.assert_allclose(applied.values[:, 2] - sensor.rest[:, 2], 2.0 * 25 / RATE, atol=1e-6)
+        for f in after:
+            assert f.baseline is applied  # one object per re-baseline
+            np.testing.assert_array_equal(f.data, sensor._frame(f.seq) - applied.values)
+            np.testing.assert_allclose(f.data[:, 2], 2.0 * (f.seq - 25) / RATE, atol=1e-5)  # back to zero
+            np.testing.assert_allclose(f.raw, sensor._frame(f.seq), atol=1e-6)  # the sensor has not
+
+    def test_rebaseline_fires_on_the_next_produced_frame_after_a_drop(self) -> None:
+        seed = next(
+            s
+            for s in range(500)
+            if SimulatedTactile(config(seed=s, drop_probability=0.3))._is_dropped(25)
+            and not SimulatedTactile(config(seed=s, drop_probability=0.3))._is_dropped(26)
+        )
+        cfg = config(seed=seed, drop_probability=0.3, rebaseline_at_s=[0.05])
+        _, frames = collect(cfg, 0.12)
+        stamped = [f for f in frames if f.baseline is not None]
+        assert stamped and stamped[0].seq == 26 and stamped[0].baseline.frame_range == (26, 26)
+        assert all(f.baseline is None for f in frames if f.seq < 26)
+
+    def test_two_scheduled_times_give_two_captures_and_reconnect_restarts_them(self) -> None:
+        cfg = config(rebaseline_at_s=[0.02, 0.06], noise_std=0.0)
+        sensor = SimulatedTactile(cfg)
+        sensor.connect()
+        time.sleep(0.1)
+        sensor.disconnect()
+        frames = sensor.drain()
+        objects = []
+        for f in frames:
+            if f.baseline is not None and (not objects or f.baseline is not objects[-1]):
+                objects.append(f.baseline)
+        assert [o.frame_range for o in objects] == [(10, 10), (30, 30)]
+        sensor.connect()
+        sensor.disconnect()
+        again = sensor.drain()
+        assert again and again[0].seq == 0 and again[0].baseline is None

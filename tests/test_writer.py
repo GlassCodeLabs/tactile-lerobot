@@ -279,6 +279,44 @@ class TestEndToEnd:
         stored = np.stack([reloaded[k][KEY].numpy() for k in range(45)])
         np.testing.assert_array_equal(stored, expected)
 
+    def test_backend_rebaseline_writes_a_capture_row_and_raw_frames_keep_the_drift(
+        self, connected, tmp_path
+    ) -> None:
+        # The sensor re-baselines on its own 0.6 s after connect, during the first episode: the stored
+        # frames return to zero there, the baseline stream records it, and raw_frames() still shows the ramp.
+        sensor = connected(drop_probability=0.0, drift_per_s=[0.0, 0.0, 2.0], rebaseline_at_s=[0.6])
+        root = tmp_path / "ds"
+        dataset = make_dataset(root, [sensor])
+        writer = TactileDatasetWriter(
+            dataset, [sensor], baseline_s=0.2, apply_baseline=True, baseline_sample_every=50
+        )
+        writer.start_session("rebaseline")
+        first = sensor.applied_baseline
+        record(dataset, writer, n_episodes=1, n_frames=45)
+        writer.finalize()
+        dataset.finalize()
+
+        stream = read_episode(episode_path(root, "left_fingertip", 0))
+        rows = read_baseline_episode(baseline_path(root, "left_fingertip", 0))
+        captures = np.flatnonzero(rows.captures)
+        assert len(captures) == 2 and rows.sample_index[captures[0]] == 0
+        np.testing.assert_array_equal(rows.values[captures[0]], first.values)
+        change = int(rows.sample_index[captures[1]])
+        seq = int(stream.seq[change])
+        assert 0 < change < len(stream) and seq >= 300  # 0.6 s at 500 Hz
+        assert rows.frame_range[captures[1]] == (seq, seq)
+        np.testing.assert_array_equal(rows.values[captures[1]], sensor.drifted_rest(seq))
+
+        raw = raw_frames(stream, rows)
+        truth = np.stack([sensor._frame(int(s)) for s in stream.seq])
+        np.testing.assert_allclose(raw, truth, rtol=0, atol=1e-6)
+        assert float(np.abs(stream.data[change]).max()) < 0.1  # stored frame back at zero
+        assert float((raw[change] - sensor.rest)[:, 2].min()) > 1.0  # raw still carries 2 N/s * 0.6 s
+        np.testing.assert_array_equal(stream.data[:change], truth[:change] - first.values)
+        np.testing.assert_array_equal(stream.data[change:], truth[change:] - rows.values[captures[1]])
+        samples = np.flatnonzero(rows.samples)
+        np.testing.assert_array_equal(rows.values[samples], raw[rows.sample_index[samples]])
+
     def test_baseline_rows_from_readings(self) -> None:
         shape = (2, 3)
         a = AppliedBaseline(np.full(shape, 1.0, np.float32), (0, 9), 10.0)
