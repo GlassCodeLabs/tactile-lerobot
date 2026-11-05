@@ -95,6 +95,14 @@ class TestRegistryAndShape:
         with pytest.raises((ValueError, SchemaError), match=match):
             config(**overrides)
 
+    def test_metadata_declares_the_clamp_as_the_range(self) -> None:
+        assert SimulatedTactile(config()).metadata().range is None
+        declared = SimulatedTactile(config(saturation_max=2.0)).metadata().range
+        assert declared is not None and (declared.min, declared.max) == (-2.0, 2.0)
+        assert SimulatedTactile(config(saturation_max=2.0, declare_range=False)).metadata().range is None
+        info = SimulatedTactile(config(saturation_max=2.0)).metadata()
+        assert TactileInfo.from_dict(info.to_dict()) == info
+
 
 class TestDeterminism:
     def test_same_seed_same_frames(self) -> None:

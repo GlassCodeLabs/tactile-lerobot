@@ -16,7 +16,8 @@ def test_core_packages_import_without_optional_dependencies() -> None:
     """Importing the sensors, the schema and the package roots of the optional parts must not import
     LeRobot, draccus, torch or pyarrow, so the numpy-only install stays numpy-only at runtime."""
     script = (
-        "import sys, taxel.schema, taxel.sensors, taxel.dataset, taxel.cli; "
+        "import sys, taxel.schema, taxel.sensors, taxel.dataset, taxel.dataset.sidecar, "
+        "taxel.doctor.loader, taxel.cli; "
         "print(sorted(m.split('.')[0] for m in sys.modules "
         "if m.split('.')[0] in {'lerobot', 'draccus', 'torch', 'pyarrow', 'datasets'}))"
     )

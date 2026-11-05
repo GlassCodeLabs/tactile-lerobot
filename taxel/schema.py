@@ -8,6 +8,9 @@ Two documents are modelled here:
 - :class:`SessionMeta`, the per-instance sidecar ``tactile/<instance_id>/meta.json``.
   It holds one :class:`SessionRecord` per recording session: serial numbers,
   calibration, baseline, replaceable parts and the episodes the session covers.
+- :class:`HealthReport`, the health annotations ``taxel doctor`` writes to
+  ``tactile/health.json``: one block of checks per episode per instance, with the
+  thresholds the run used.
 
 Every class validates itself on construction and offers ``to_dict`` /
 ``from_dict`` that round-trip to the JSON shapes in ``SCHEMA.md``. ``from_dict``
@@ -27,6 +30,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import MISSING, dataclass, fields, is_dataclass
 from enum import Enum
 from itertools import pairwise
+from pathlib import Path
 from typing import Any, ClassVar, TypeVar, Union, get_args, get_origin, get_type_hints
 
 import numpy as np
@@ -39,31 +43,50 @@ __all__ = [
     "BaselineStream",
     "Block",
     "Calibration",
+    "CHECK_NAMES",
     "Clock",
+    "CopyCheck",
     "Derived",
     "DeviceGroup",
     "DeviceSession",
+    "DriftReport",
     "FEATURE_KEY_PREFIX",
+    "FilesCheck",
     "FrameCounts",
+    "FramerateReport",
+    "GapHistogram",
     "Gel",
+    "GelReport",
+    "HealthReport",
+    "InstanceChecks",
+    "InstanceReport",
+    "IntegrityReport",
     "Layout",
     "Markers",
     "Mount",
     "ORIGIN_AT",
     "Origin",
     "REDUCTION_METHODS",
+    "Range",
+    "RawCheck",
+    "RebaselineEvent",
     "Reduction",
     "STREAM_SUFFIXES",
     "STREAM_WIDTHS",
     "SURFACES",
+    "SaturationReport",
     "SchemaError",
     "SessionMeta",
     "SessionRecord",
+    "SkewReport",
     "Skin",
+    "Skipped",
     "StreamInfo",
     "TactileFamily",
     "TactileInfo",
+    "Thresholds",
     "feature_key",
+    "health_report_path",
     "read_info_lenient",
     "read_session_meta_lenient",
     "session_meta_path",
@@ -86,6 +109,12 @@ ORIGIN_AT = ("center", "corner", "element", "mount")
 
 SURFACES = ("gel", "die", "skin", "pad", "vendor")
 """Which surface a layout's frame and positions describe."""
+
+HEALTH_REPORT_PATH = "tactile/health.json"
+"""Where ``taxel doctor`` writes its report, relative to the dataset root."""
+
+CHECK_NAMES = ("integrity", "drift", "framerate", "saturation", "gel", "skew")
+"""The checks a health report carries per episode per instance, in report order."""
 
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
 _SESSION_META = re.compile(r"^tactile/[A-Za-z0-9_-]+/meta\.json$")
@@ -226,6 +255,45 @@ class Layout(Block):
 
 
 @dataclass
+class Range(Block):
+    """The rated range of the readings, in ``units``: what a reading cannot exceed.
+
+    ``min`` and ``max`` are numbers for the whole instance or lists with one value per
+    channel. A reading at or beyond a limit is saturated. Without a range, a health check
+    can only use the observed extremes.
+    """
+
+    min: float | list[float]
+    max: float | list[float]
+
+    def __post_init__(self) -> None:
+        for name in ("min", "max"):
+            value = getattr(self, name)
+            ok = _is_number(value) or (
+                isinstance(value, list) and value and all(_is_number(v) for v in value)
+            )
+            if not ok:
+                raise SchemaError(f"range.{name} must be a number or a list of numbers, got {value!r}")
+        lo, hi = np.asarray(self.min, dtype=np.float64), np.asarray(self.max, dtype=np.float64)
+        if lo.ndim == 1 and hi.ndim == 1 and lo.shape != hi.shape:
+            raise SchemaError(f"range.min has {lo.size} values and range.max {hi.size}")
+        if not np.all(lo < hi):
+            raise SchemaError("range.min must be below range.max on every channel")
+
+    @property
+    def n_channels(self) -> int | None:
+        """Length of the per-channel lists, or ``None`` when both limits are scalars."""
+        sizes = [len(v) for v in (self.min, self.max) if isinstance(v, list)]
+        return max(sizes) if sizes else None
+
+    def limits(self, n_channels: int) -> tuple[np.ndarray, np.ndarray]:
+        """The ``(min, max)`` limits as float64 arrays of ``n_channels`` values each."""
+        lo = np.broadcast_to(np.asarray(self.min, dtype=np.float64), (n_channels,))
+        hi = np.broadcast_to(np.asarray(self.max, dtype=np.float64), (n_channels,))
+        return lo.copy(), hi.copy()
+
+
+@dataclass
 class Reduction(Block):
     """How a dataset-rate copy was made from a faster native stream."""
 
@@ -303,7 +371,7 @@ class TactileInfo(Block):
 
     ``family``, ``vendor``, ``model``, ``declared_rate_hz``, ``layout``, ``mount``,
     ``device`` and ``session_meta`` are always written. ``units``, ``channels``,
-    ``reduction``, ``markers`` and ``derived`` are written only when set. ``layout``
+    ``range``, ``reduction``, ``markers`` and ``derived`` are written only when set. ``layout``
     is required for every family; its ``positions_mm`` is required for
     ``taxel_array`` and ``magnetic``, at most one row for ``force_torque``, and
     omitted for ``visuotactile``.
@@ -316,6 +384,7 @@ class TactileInfo(Block):
     model: str | None = None
     units: dict[str, str] | None = None
     channels: list[str] | None = None
+    range: Range | None = None
     layout: Layout | None = None
     reduction: Reduction | None = None
     markers: Markers | None = None
@@ -325,7 +394,7 @@ class TactileInfo(Block):
 
     _label: ClassVar[str] = "info"
     _omit_when_none: ClassVar[frozenset[str]] = frozenset(
-        {"units", "channels", "reduction", "markers", "derived"}
+        {"units", "channels", "range", "reduction", "markers", "derived"}
     )
     _key_order: ClassVar[tuple[str, ...] | None] = (
         "family",
@@ -334,6 +403,7 @@ class TactileInfo(Block):
         "declared_rate_hz",
         "units",
         "channels",
+        "range",
         "layout",
         "reduction",
         "markers",
@@ -360,6 +430,12 @@ class TactileInfo(Block):
             not isinstance(k, str) or not isinstance(v, str) for k, v in self.units.items()
         ):
             raise SchemaError("units must map quantity names to unit strings")
+        if self.range is not None:
+            if self.family not in ARRAY_FAMILIES:
+                raise SchemaError(f"range is defined for the array families, not {self.family.value!r}")
+            per_channel = self.range.n_channels
+            if per_channel is not None and per_channel != len(self.channels or ()):
+                raise SchemaError(f"range lists {per_channel} values for {len(self.channels or ())} channels")
         if self.layout is None:
             raise SchemaError("layout is required: origin, axes and surface declare the sensor's frame")
         positions = self.layout.positions_mm
@@ -688,6 +764,286 @@ def read_session_meta_lenient(data: Mapping[str, Any]) -> tuple[SessionMeta, lis
     return meta, reader.unknown, reader.missing
 
 
+# --- Health annotations: ``tactile/health.json`` --------------------------------------------------
+
+
+def health_report_path(root: str | Path) -> Path:
+    """``<root>/tactile/health.json``."""
+    return Path(root) / HEALTH_REPORT_PATH
+
+
+@dataclass
+class Skipped(Block):
+    """A check, or one part of one, that could not run: ``skipped`` says why. It is never a pass."""
+
+    skipped: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.skipped, "skipped")
+
+
+@dataclass
+class CopyCheck(Block):
+    """Integrity, part ``copy``: the main-table copy equals the reduction recomputed from the native stream.
+
+    ``first_mismatch`` is the frame index of the first disagreeing frame.
+    """
+
+    frames: int
+    mismatches: int
+    first_mismatch: int | None
+    max_abs_diff: float
+    flag: bool
+
+
+@dataclass
+class RawCheck(Block):
+    """Integrity, part ``raw``: every sample row equals the reconstruction from stored data plus captures.
+
+    ``first_mismatch`` is the ``sample_index`` of the first disagreeing sample. A mismatch
+    means the subtractor changed without reporting; it is never counted as drift.
+    """
+
+    samples: int
+    mismatches: int
+    first_mismatch: int | None
+    max_abs_diff: float
+    flag: bool
+
+
+@dataclass
+class FilesCheck(Block):
+    """Integrity, part ``files``: the sidecar is complete and consistent for the episode.
+
+    ``capture_at_zero`` is ``None`` when no baseline is applied. ``counters`` holds when the
+    session's ``frames.received`` is at least the native rows and ``frames.dropped`` at least
+    the ``seq`` gaps inside the session's files.
+    """
+
+    native: bool
+    baseline: bool
+    capture_at_zero: bool | None
+    origins: bool
+    counters: bool
+    flag: bool
+
+
+@dataclass
+class IntegrityReport(Block):
+    """The integrity check: three parts, each run or skipped on its own; ``flag`` when any part fails."""
+
+    copy: CopyCheck | Skipped
+    raw: RawCheck | Skipped
+    files: FilesCheck | Skipped
+    flag: bool
+
+
+@dataclass
+class RebaselineEvent(Block):
+    """A capture row inside an episode: the baseline changed at ``sample_index``.
+
+    ``delta`` is, per channel, the largest change of the baseline across elements. The
+    event is reported, not scored as drift.
+    """
+
+    sample_index: int
+    host_ts: float
+    delta: list[float]
+
+
+@dataclass
+class DriftReport(Block):
+    """The drift check: the no-contact level against the baseline in force, per channel.
+
+    ``no_contact_level`` and ``level_change`` come from the episode alone (the quiet-window
+    level at the start, and its change over the episode). ``offset`` is that level against
+    the baseline in force at the end of the episode, or ``skipped`` when there is no
+    baseline; ``offset_pct_range`` scales it by ``range`` when known. ``baseline`` says
+    where the baseline came from (``capture``, ``session``, ``none``), ``source`` what the
+    raw level was read from (``samples``, ``raw_frames``, ``main_table``). ``frame_range``
+    is the session baseline's, ``"not recorded"`` for a record without the key, ``"no seq"``
+    for a sensor without one. ``first_frame_zero`` names the case where the level at frame
+    0 is exactly zero on every channel.
+    """
+
+    no_contact_level: list[float]
+    level_change: list[float]
+    offset: list[float] | Skipped
+    offset_pct_range: list[float] | None
+    slope_per_s: list[float]
+    baseline: str
+    source: str
+    baseline_age_s: float | None
+    frame_range: list[int] | str | None
+    windows: int
+    no_contact_windows: int
+    first_frame_zero: bool
+    rebaselines: list[RebaselineEvent]
+    flag: bool
+
+    def __post_init__(self) -> None:
+        _require_one_of(self.baseline, ("capture", "session", "none"), "drift.baseline")
+        _require_one_of(self.source, ("samples", "raw_frames", "main_table"), "drift.source")
+
+
+@dataclass
+class GapHistogram(Block):
+    """Gaps between consecutive samples in units of the declared period: ``counts[i]`` gaps fall
+    between ``edges_periods[i - 1]`` and ``edges_periods[i]``; the last count is beyond the last edge."""
+
+    edges_periods: list[float]
+    counts: list[int]
+
+    def __post_init__(self) -> None:
+        if len(self.counts) != len(self.edges_periods) + 1:
+            raise SchemaError("gap_histogram.counts needs one more entry than edges_periods")
+
+
+@dataclass
+class FramerateReport(Block):
+    """The framerate check. ``source`` is ``sidecar`` (native ``host_ts`` and ``seq``) or
+    ``main_table``; ``timestamps`` says whether they were measured (``host_ts``) or are LeRobot's
+    nominal ``frame_index / fps`` (``nominal``), which says nothing about the sensor. ``frames``
+    is the session's counters when known."""
+
+    effective_hz: float
+    declared_hz: float | None
+    dropped_pct: float | None
+    max_gap_ms: float
+    max_gap_threshold_ms: float
+    gap_histogram: GapHistogram
+    frames: FrameCounts | None
+    source: str
+    timestamps: str
+    flag: bool
+
+    def __post_init__(self) -> None:
+        _require_one_of(self.source, ("sidecar", "main_table"), "framerate.source")
+        _require_one_of(self.timestamps, ("host_ts", "nominal"), "framerate.timestamps")
+
+
+@dataclass
+class SaturationReport(Block):
+    """The saturation check, per channel: the fraction of samples at or beyond the limit. ``limit`` is
+    ``declared`` (from ``range``) or ``observed`` (the extremes seen, ``confidence`` ``low``)."""
+
+    saturated_pct: list[float]
+    limit: str
+    min: list[float]
+    max: list[float]
+    confidence: str
+    source: str
+    flag: bool
+
+    def __post_init__(self) -> None:
+        _require_one_of(self.limit, ("declared", "observed"), "saturation.limit")
+        _require_one_of(self.confidence, ("declared", "low"), "saturation.confidence")
+        _require_one_of(self.source, ("sidecar", "main_table"), "saturation.source")
+
+
+@dataclass
+class GelReport(Block):
+    """The gel check. ``kind`` ``pixels``: dead pixels of an image stream, with the largest connected
+    cluster; ``kind`` ``elements``: zero-variance elements of an array stream, listed."""
+
+    kind: str
+    dead_pct: float
+    largest_cluster_px: int | None
+    dead_elements: list[int] | None
+    frames_used: int
+    flag: bool
+
+    def __post_init__(self) -> None:
+        _require_one_of(self.kind, ("pixels", "elements"), "gel.kind")
+
+
+@dataclass
+class SkewReport(Block):
+    """The skew check: the lag of the tactile stream behind ``reference`` (a camera key or another
+    instance) at a contact onset, with the cross-correlation peak as ``confidence``."""
+
+    lag_ms: float
+    confidence: float
+    reference: str
+    onsets: int
+    resolution_ms: float
+    flag: bool
+
+
+@dataclass
+class InstanceChecks(Block):
+    """One episode's checks for one instance, each a result or ``Skipped``."""
+
+    integrity: IntegrityReport | Skipped
+    drift: DriftReport | Skipped
+    framerate: FramerateReport | Skipped
+    saturation: SaturationReport | Skipped
+    gel: GelReport | Skipped
+    skew: SkewReport | Skipped
+
+
+@dataclass
+class InstanceReport(Block):
+    """What the run found out about an instance before checking any episode.
+
+    ``metadata`` is ``info`` when the feature entry carried a readable ``info`` block,
+    ``none`` when it had none (a plain LeRobot dataset), ``invalid`` when it failed even the
+    lenient read, with the reason in ``error``. ``unknown_keys`` and ``missing_keys`` are
+    the lenient readers' findings for the ``info`` block and the session record.
+    """
+
+    key: str
+    family: str
+    metadata: str
+    sidecar: bool
+    declared_rate_hz: float | None
+    range: Range | None
+    unknown_keys: list[str]
+    missing_keys: list[str]
+    error: str | None = None
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.key, "instance.key")
+        _require_one_of(self.metadata, ("info", "none", "invalid"), "instance.metadata")
+
+
+@dataclass
+class Thresholds(Block):
+    """The thresholds a run flagged against. The defaults are conservative. ``max_gap_ms`` ``None``
+    means ten declared periods, resolved per instance and recorded in the framerate block."""
+
+    drift: float = 0.05
+    dropped: float = 0.02
+    max_gap_ms: float | None = None
+    gel: float = 0.05
+    cluster_px: int = 25
+    skew: float = 50.0
+    saturated: float = 0.01
+    integrity: bool = True
+
+
+@dataclass
+class HealthReport(Block):
+    """The whole of ``tactile/health.json``: the doctor version, the thresholds, one
+    :class:`InstanceReport` per instance and, per episode (``episode_{index:06d}``), one
+    :class:`InstanceChecks` per instance."""
+
+    doctor_version: str
+    generated_at: str
+    thresholds: Thresholds
+    instances: dict[str, InstanceReport]
+    episodes: dict[str, dict[str, InstanceChecks]]
+
+    _label: ClassVar[str] = "health"
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.doctor_version, "doctor_version")
+        _require_nonempty_str(self.generated_at, "generated_at")
+        for name in self.episodes:
+            if not re.fullmatch(r"episode_\d{6}", name):
+                raise SchemaError(f"episodes keys look like 'episode_000012', got {name!r}")
+
+
 # --- Encoding and decoding -----------------------------------------------------------------------
 
 
@@ -767,7 +1123,9 @@ def _decode(hint: Any, value: Any, reader: _Reader, path: str) -> Any:
             if len(members) == len(get_args(hint)):
                 raise SchemaError(f"{path}: null is not allowed")
             return None
-        return _decode(members[0], value, reader, path)
+        if len(members) == 1:
+            return _decode(members[0], value, reader, path)
+        return _decode_union(members, value, reader, path)
     if is_dataclass(hint):
         return _from_dict(hint, value, reader, path)
     if isinstance(hint, type) and issubclass(hint, Enum):
@@ -815,6 +1173,32 @@ def _decode(hint: Any, value: Any, reader: _Reader, path: str) -> Any:
     raise TypeError(f"{path}: no decoder for type hint {hint!r}")
 
 
+def _decode_union(members: list[Any], value: Any, reader: _Reader, path: str) -> Any:
+    """Decode a value allowed to be one of several types.
+
+    A mapping goes to the first dataclass member whose required keys it carries, which is
+    how a check block is told apart from :class:`Skipped`; any other value goes to the first
+    member that accepts it, as in ``float | list[float]``.
+    """
+    classes = [m for m in members if is_dataclass(m)]
+    if isinstance(value, Mapping) and classes:
+        # The member whose required keys are all present, else the closest one, so the error names
+        # the unknown or missing key rather than the union.
+        def closeness(cls: type) -> tuple[int, int]:
+            required = {f.name for f in fields(cls) if f.default is MISSING and f.default_factory is MISSING}
+            return len(required & set(value)), -len(required - set(value))
+
+        return _from_dict(max(classes, key=closeness), value, reader, path)
+    for member in members:
+        if is_dataclass(member):
+            continue
+        try:
+            return _decode(member, value, reader, path)
+        except SchemaError:
+            continue
+    raise SchemaError(f"{path}: {value!r} fits none of the allowed types")
+
+
 def _enum(cls: type[Enum], value: Any, path: str) -> Any:
     try:
         return cls(value)
@@ -825,6 +1209,11 @@ def _enum(cls: type[Enum], value: Any, path: str) -> Any:
 def _require_nonempty_str(value: Any, path: str) -> None:
     if not isinstance(value, str) or not value:
         raise SchemaError(f"{path} must be a non-empty string, got {value!r}")
+
+
+def _require_one_of(value: Any, allowed: tuple[str, ...], path: str) -> None:
+    if value not in allowed:
+        raise SchemaError(f"{path} must be one of {allowed}, got {value!r}")
 
 
 def _require_slug(value: Any, path: str) -> None:

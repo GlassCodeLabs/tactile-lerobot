@@ -25,7 +25,7 @@ For a dataset with one robot camera and one tactile instance `left_fingertip`:
 
 | What | Where | Written by |
 | --- | --- | --- |
-| Static metadata of the instance: family, vendor, model, declared rate, channels, layout, mount, hub, `reduction` | `meta/info.json`, feature entry `observation.tactile.left_fingertip`, key `info` | `LeRobotDataset.create`, from `tactile_features()` |
+| Static metadata of the instance: family, vendor, model, declared rate, channels, `range`, layout, mount, hub, `reduction` | `meta/info.json`, feature entry `observation.tactile.left_fingertip`, key `info` | `LeRobotDataset.create`, from `tactile_features()` |
 | Dataset-rate copy, float32 `(n_elements, len(channels))` per frame | the main table, same feature key | `add_frame`, from `TactileDatasetWriter.frame()` |
 | Native-rate stream with `host_ts`, `device_ts`, `seq` | `tactile/left_fingertip/episode-{index:06d}.parquet` | `end_episode()` |
 | Baseline stream: the baseline subtracted, from which frame on, and a raw sample every N native frames | `tactile/left_fingertip/baseline/episode-{index:06d}.parquet` | `end_episode()` |
@@ -70,7 +70,7 @@ Frames are reduced at these nominal times, not at the moment the loop happened t
 
 ## Counters and baseline
 
-The session record's `frames` block is the sensor's own counters for the session: `received` by the host, `dropped` at the source (gaps in `seq`), `overflowed` on the host because the recorder did not drain the sensor in time. They are copied from the sensor, not reconstructed from the files; with `seq` present, `dropped` equals the sum of the `seq` gaps across the session's episode files.
+The session record's `frames` block is the sensor's own counters for the session: `received` by the host, `dropped` at the source (gaps in `seq`), `overflowed` on the host because the recorder did not drain the sensor in time. They are copied from the sensor, not reconstructed from the files, and they count every frame since `connect()`, including the baseline capture and the pauses between episodes, which the files do not hold: `received` is at least the number of native rows in the session's files and, with `seq` present, `dropped` is at least the sum of the `seq` gaps inside them.
 
 At the start of a session the writer averages `--baseline_s` seconds of frames (default 2) into the record's `baseline`, with `frame_range` naming the first and last native frame averaged. Keep hands off the sensor while `taxel record` says so. By default nothing is subtracted from the recorded data (`applied: false`): the baseline is stored so a reader can subtract it, and so drift between sessions is measurable. With `--apply_baseline=true` the writer hands the captured baseline to the sensor, which subtracts it from every frame from then on and stamps each frame with what it subtracted; the main table and the native stream then hold subtracted values and the record says `applied: true`.
 

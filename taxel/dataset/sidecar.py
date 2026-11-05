@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from taxel.dataset import missing_dependency
+from taxel.dataset import DOCTOR_EXTRA, missing_dependency
 from taxel.schema import SchemaError, SessionMeta, feature_key, session_meta_path
 
 if TYPE_CHECKING:
@@ -474,5 +474,5 @@ def _pyarrow() -> tuple[Any, Any]:
         import pyarrow as pa
         import pyarrow.parquet as pq
     except ImportError as e:
-        raise missing_dependency("pyarrow", e) from None
+        raise missing_dependency("pyarrow", e, DOCTOR_EXTRA) from None
     return pa, pq

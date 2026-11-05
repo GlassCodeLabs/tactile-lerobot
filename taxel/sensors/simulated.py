@@ -25,6 +25,7 @@ from taxel.schema import (
     Layout,
     Markers,
     Origin,
+    Range,
     SchemaError,
     TactileFamily,
     TactileInfo,
@@ -125,6 +126,8 @@ class SimulatedTactileConfig(TactileSensorConfig):
             its ``seq`` is skipped and the base class counts it in ``dropped_frames``.
         clock_offset_s: Fault. Constant offset of ``device_ts`` from ``host_ts``.
         saturation_max: Fault. Values are clamped to ``[-saturation_max, saturation_max]``.
+        declare_range: Whether ``metadata()`` declares ``[-saturation_max, saturation_max]`` as the
+            sensor's ``range`` when a clamp is set; off, a check must infer the limit.
         rebaseline_at_s: Fault. Sensor times at which the backend re-baselines on its own, as a
             firmware re-zero would: from the first frame at or past each time it subtracts the
             rest pattern plus the drift so far, so stored frames return to zero while the sensor
@@ -147,6 +150,7 @@ class SimulatedTactileConfig(TactileSensorConfig):
     drop_probability: float = 0.0
     clock_offset_s: float = 0.0
     saturation_max: float | None = None
+    declare_range: bool = True
     rebaseline_at_s: list[float] | None = None
 
     def __post_init__(self) -> None:
@@ -249,6 +253,11 @@ class SimulatedTactile(TactileSensor):
             declared_rate_hz=cfg.declared_rate_hz,
             units=dict(_UNITS[cfg.family]),
             channels=list(cfg.channels),
+            range=(
+                Range(min=-cfg.saturation_max, max=cfg.saturation_max)
+                if cfg.saturation_max is not None and cfg.declare_range
+                else None
+            ),
             layout=Layout(
                 origin=Origin(at="corner", description="element 0, the corner of the grid"),
                 axes=Axes(

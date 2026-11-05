@@ -6,22 +6,31 @@ import json
 import pytest
 
 from taxel.schema import (
+    CHECK_NAMES,
     Adapter,
     Axes,
     Baseline,
     BaselineStream,
     Calibration,
     Clock,
+    DriftReport,
     FrameCounts,
+    GelReport,
+    HealthReport,
+    InstanceChecks,
     Layout,
     Origin,
+    Range,
     SchemaError,
     SessionMeta,
     SessionRecord,
+    Skipped,
     StreamInfo,
     TactileFamily,
     TactileInfo,
+    Thresholds,
     feature_key,
+    health_report_path,
     read_info_lenient,
     read_session_meta_lenient,
     session_meta_path,
@@ -514,3 +523,218 @@ class TestHelpers:
 
     def test_session_meta_path(self) -> None:
         assert session_meta_path("palm_0") == "tactile/palm_0/meta.json"
+
+
+class TestRange:
+    def test_round_trips_scalar_and_per_channel(self) -> None:
+        for limits in ({"min": -5.0, "max": 25.5}, {"min": [-5.0, -5.0, 0.0], "max": [5.0, 5.0, 25.5]}):
+            data = {**LEFT_FINGERTIP, "range": limits}
+            info = TactileInfo.from_dict(data)
+            assert info.range is not None and info.to_dict() == data
+            keys = list(info.to_dict())
+            assert keys.index("range") == keys.index("channels") + 1
+        assert "range" not in TactileInfo.from_dict(LEFT_FINGERTIP).to_dict()
+
+    def test_limits_broadcast_per_channel(self) -> None:
+        lo, hi = Range(min=-1.0, max=2.0).limits(3)
+        assert lo.tolist() == [-1.0, -1.0, -1.0] and hi.tolist() == [2.0, 2.0, 2.0]
+        lo, hi = Range(min=[-1.0, -2.0], max=3.0).limits(2)
+        assert lo.tolist() == [-1.0, -2.0] and hi.tolist() == [3.0, 3.0]
+        assert Range(min=[-1.0, -2.0], max=3.0).n_channels == 2 and Range(min=0, max=1).n_channels is None
+
+    def test_validation(self) -> None:
+        with pytest.raises(SchemaError, match="below range.max"):
+            Range(min=1.0, max=1.0)
+        with pytest.raises(SchemaError, match="below range.max"):
+            Range(min=[0.0, 2.0], max=[1.0, 1.0])
+        with pytest.raises(SchemaError, match="2 values and range.max 3"):
+            Range(min=[0.0, 0.0], max=[1.0, 1.0, 1.0])
+        with pytest.raises(SchemaError, match="number or a list"):
+            Range(min="0", max=1.0)
+        with pytest.raises(SchemaError, match="range lists 2 values for 3 channels"):
+            TactileInfo.from_dict({**LEFT_FINGERTIP, "range": {"min": [0.0, 0.0], "max": [1.0, 1.0]}})
+        with pytest.raises(SchemaError, match="array families"):
+            TactileInfo.from_dict({**RIGHT_FINGERTIP, "range": {"min": 0.0, "max": 255.0}})
+
+
+# The report example from SCHEMA.md, "Health annotations".
+HEALTH = {
+    "doctor_version": "0.1.0",
+    "generated_at": "2026-11-05T14:03:05Z",
+    "thresholds": {
+        "drift": 0.05,
+        "dropped": 0.02,
+        "max_gap_ms": None,
+        "gel": 0.05,
+        "cluster_px": 25,
+        "skew": 50.0,
+        "saturated": 0.01,
+        "integrity": True,
+    },
+    "instances": {
+        "left_fingertip": {
+            "key": "observation.tactile.left_fingertip",
+            "family": "taxel_array",
+            "metadata": "info",
+            "sidecar": True,
+            "declared_rate_hz": 91,
+            "range": None,
+            "unknown_keys": [],
+            "missing_keys": ["meta.sessions[0].baseline.frame_range"],
+            "error": None,
+        }
+    },
+    "episodes": {
+        "episode_000012": {
+            "left_fingertip": {
+                "integrity": {
+                    "copy": {
+                        "frames": 612,
+                        "mismatches": 0,
+                        "first_mismatch": None,
+                        "max_abs_diff": 0.0,
+                        "flag": False,
+                    },
+                    "raw": {
+                        "samples": 7,
+                        "mismatches": 0,
+                        "first_mismatch": None,
+                        "max_abs_diff": 0.0,
+                        "flag": False,
+                    },
+                    "files": {
+                        "native": True,
+                        "baseline": True,
+                        "capture_at_zero": True,
+                        "origins": True,
+                        "counters": True,
+                        "flag": False,
+                    },
+                    "flag": False,
+                },
+                "drift": {
+                    "no_contact_level": [0.011, 0.008, 0.029],
+                    "level_change": [0.001, 0.001, 0.002],
+                    "offset": [0.012, 0.009, 0.031],
+                    "offset_pct_range": None,
+                    "slope_per_s": [0.001, 0.0, 0.002],
+                    "baseline": "capture",
+                    "source": "samples",
+                    "baseline_age_s": 3.2,
+                    "frame_range": "not recorded",
+                    "windows": 20,
+                    "no_contact_windows": 14,
+                    "first_frame_zero": False,
+                    "rebaselines": [{"sample_index": 1200, "host_ts": 10301.1, "delta": [0.0, 0.0, 0.03]}],
+                    "flag": False,
+                },
+                "framerate": {
+                    "effective_hz": 89.4,
+                    "declared_hz": 91,
+                    "dropped_pct": 0.018,
+                    "max_gap_ms": 31.0,
+                    "max_gap_threshold_ms": 109.9,
+                    "gap_histogram": {"edges_periods": [1.5, 2.5, 3.5], "counts": [600, 9, 2, 0]},
+                    "frames": {"received": 30412, "dropped": 7, "overflowed": 0},
+                    "source": "sidecar",
+                    "timestamps": "host_ts",
+                    "flag": False,
+                },
+                "saturation": {
+                    "saturated_pct": [0.0, 0.0, 0.0],
+                    "limit": "observed",
+                    "min": [-0.4, -0.5, -0.1],
+                    "max": [3.1, 2.9, 24.8],
+                    "confidence": "low",
+                    "source": "sidecar",
+                    "flag": False,
+                },
+                "gel": {"skipped": "no visuotactile feature"},
+                "skew": {
+                    "lag_ms": -12.0,
+                    "confidence": 0.81,
+                    "reference": "observation.images.front",
+                    "onsets": 3,
+                    "resolution_ms": 5.0,
+                    "flag": False,
+                },
+            }
+        }
+    },
+}
+
+
+class TestHealthReport:
+    def test_example_round_trips_exactly(self) -> None:
+        report = HealthReport.from_dict(HEALTH)
+        assert report.to_dict() == HEALTH
+        assert json.loads(json.dumps(report.to_dict())) == HEALTH
+        checks = report.episodes["episode_000012"]["left_fingertip"]
+        assert isinstance(checks, InstanceChecks) and isinstance(checks.drift, DriftReport)
+        assert isinstance(checks.gel, Skipped) and checks.gel.skipped == "no visuotactile feature"
+        assert checks.drift.frame_range == "not recorded" and checks.drift.rebaselines[0].sample_index == 1200
+        assert [f for f in checks.to_dict()] == list(CHECK_NAMES)
+
+    def test_skipped_is_told_apart_by_its_key(self) -> None:
+        data = copy.deepcopy(HEALTH)
+        block = data["episodes"]["episode_000012"]["left_fingertip"]
+        block["integrity"]["raw"] = {"skipped": "no baseline stream"}
+        block["drift"]["offset"] = {"skipped": "no session baseline"}
+        report = HealthReport.from_dict(data)
+        checks = report.episodes["episode_000012"]["left_fingertip"]
+        assert isinstance(checks.integrity.raw, Skipped) and isinstance(checks.drift.offset, Skipped)
+        assert report.to_dict() == data
+        block["drift"] = {"skipped": "x", "flag": False}  # a flag on a skipped check is not a shape
+        with pytest.raises(SchemaError, match="drift: unknown keys \\['flag'\\]"):
+            HealthReport.from_dict(data)
+        block["drift"] = {"no_contact_level": [0.0]}  # closest shape: the error names the missing key
+        with pytest.raises(SchemaError, match="drift: missing required key 'level_change'"):
+            HealthReport.from_dict(data)
+        block["drift"] = {"skipped": ""}
+        with pytest.raises(SchemaError, match="non-empty string"):
+            HealthReport.from_dict(data)
+
+    def test_frame_range_takes_a_pair_or_a_word(self) -> None:
+        data = copy.deepcopy(HEALTH)
+        drift = data["episodes"]["episode_000012"]["left_fingertip"]["drift"]
+        for value in ([364, 545], "no seq", None):
+            drift["frame_range"] = value
+            assert HealthReport.from_dict(data).to_dict() == data
+        drift["frame_range"] = 3.5
+        with pytest.raises(SchemaError, match="fits none"):
+            HealthReport.from_dict(data)
+
+    def test_thresholds_defaults_and_enums(self) -> None:
+        assert Thresholds().to_dict() == HEALTH["thresholds"]
+        with pytest.raises(SchemaError, match="gel.kind"):
+            GelReport(
+                kind="voxels",
+                dead_pct=0.0,
+                largest_cluster_px=None,
+                dead_elements=None,
+                frames_used=1,
+                flag=False,
+            )
+        data = copy.deepcopy(HEALTH)
+        data["episodes"]["episode_000012"]["left_fingertip"]["saturation"]["limit"] = "guessed"
+        with pytest.raises(SchemaError, match="saturation.limit"):
+            HealthReport.from_dict(data)
+        data = copy.deepcopy(HEALTH)
+        data["instances"]["left_fingertip"]["metadata"] = "partial"
+        with pytest.raises(SchemaError, match="instance.metadata"):
+            HealthReport.from_dict(data)
+
+    def test_unknown_keys_and_bad_episode_names_are_rejected(self) -> None:
+        data = copy.deepcopy(HEALTH)
+        data["episodes"]["episode_000012"]["left_fingertip"]["drift"]["trend"] = 1.0
+        with pytest.raises(SchemaError, match="unknown keys"):
+            HealthReport.from_dict(data)
+        data = copy.deepcopy(HEALTH)
+        data["episodes"]["ep12"] = data["episodes"].pop("episode_000012")
+        with pytest.raises(SchemaError, match="episode_000012"):
+            HealthReport.from_dict(data)
+        with pytest.raises(SchemaError, match="unknown keys"):
+            HealthReport.from_dict({**HEALTH, "notes": "x"})
+
+    def test_path(self) -> None:
+        assert str(health_report_path("outputs/name")) == "outputs/name/tactile/health.json"

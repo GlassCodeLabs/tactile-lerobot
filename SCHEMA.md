@@ -1,4 +1,4 @@
-# Tactile data schema for LeRobot datasets — draft 0.3
+# Tactile data schema for LeRobot datasets — draft 0.3.1
 
 *Status: draft for feedback, November 2026. Nothing here is final. The goal is to converge with [LeRobot PR #4469](https://github.com/huggingface/lerobot/pull/4469), [TLabel](https://github.com/liesliy/tlabel) and [Multi-Frequency-LeRobot](https://github.com/RoboCoin-BAAI/Multi-Frequency-LeRobot), not to add a fourth incompatible layout. 0.3 applies the answers given on #4469 ([comment](https://github.com/huggingface/lerobot/pull/4469#issuecomment-6555461272)) to 0.2's open questions. The questions still open are listed at the end; those are the ones I'd most like answered.*
 
@@ -133,6 +133,7 @@ Core keys (`dtype`, `shape`, `names`) follow LeRobot's rules; only `info` is add
 
 - `family` is one of `taxel_array`, `visuotactile`, `magnetic`, `force_torque`. Adding a family is a schema change; adding a vendor is not.
 - `channels` is required for `taxel_array`, `magnetic` and `force_torque`, and fixes the last dimension: per-frame shape is `(n_elements, len(channels))`. A force-torque sensor is one element, `(1, 6)`, so every array family shares this shape and the key stays its own feature instead of folding into `observation.state` as a 1-D array would. Order is the declared order, so `["fx", "fy", "fz", "dx", "dy", "dz"]` is as valid as `["fx", "fy", "fz"]`.
+- `range` (0.3.1) is optional and gives the rated range of the readings in `units`: `{"min": …, "max": …}`, each a number for the whole instance or a list with one value per channel, in channel order. A reading at or beyond a limit is saturated. It is defined for the array families; absent means unknown, and a health check then falls back to the observed extremes and says so.
 - `layout` is required for every family and declares the sensor's own coordinate frame, because two sensors can both publish `positions_mm` and be mutually uninterpretable if one measures from a top-left origin and the other from a bottom-left one, or one from the gel surface and the other from the sensor die. `origin.at` says where (0, 0, 0) sits on the sensor body: `center` or `corner` of the sensing area, `element` for a sensing element, or `mount` for the mounting face; `origin.description` says which corner or element in words. `axes.x`, `axes.y` and `axes.z` say in words where +x, +y and +z point, in the sensor's own terms. The frame is right-handed, and +z out of the sensing surface toward the contacting object is the convention; an adapter that keeps a vendor frame with another convention says so in `axes.z`. `surface` says which surface the frame and the positions describe: `gel` (the outer face of a transparent elastomer), `die` (the plane of the sensing elements, under whatever covers them), `skin` (the outer face of a replaceable skin), `pad` (the outer face of a fixed contact pad over the elements), or `vendor` (positions copied from the vendor's documentation, whose own frame definition applies; the document is named in the session record's `calibration.reference`). Any other value is an error.
 - `layout.positions_mm` is the physical position of each element in that frame, in millimetres, one `[x, y, z]` row per element. It is required for `taxel_array` and `magnetic`, where its length equals `n_elements`; optional for `force_torque`, one row if given; and omitted for `visuotactile`, where the image is the element arrangement and `markers.grid` the marker arrangement, while `layout` still declares the frame the `.displacement` and `.force` streams are expressed in and the surface the image shows. `layout.normals` is optional: one unit vector per position.
 - `reduction` is present only when the main-table column is a copy at the dataset fps of a faster native stream, or, for a video feature, when the sensor runs faster than the dataset fps. `method` is one of `nearest`, `mean`, `last`; `window_ms` is the span of native samples each dataset frame was reduced from.
@@ -189,7 +190,7 @@ Field notes:
 
 - `episodes` is an inclusive range of episode indices recorded in that session.
 - `clock` anchors the session's host clock. Sidecar `host_ts` values come from a monotonic clock with no epoch, and LeRobot's own `timestamp` column is `frame_index / fps`, restarting at zero in every episode. `wall_time` is the UTC time when the session starts, right after `connect()`, and `host_clock` the host clock value at the same instant, so any `host_ts` maps to the calendar as `wall_time + (host_ts − host_clock)`. `episode_origins` holds one value per episode in `episodes`, in order: the host clock value when the episode's first dataset frame was built. Dataset frame `k` of that episode is at `origin + k / fps` on the host clock, which is also the target time its dataset-rate copy was reduced at.
-- `frames` holds the sensor's frame counters since `connect()`, so per session: `received` by the host, `dropped` at the source (gaps in `seq`), `overflowed` on the host because the recorder did not drain the sensor in time. They come from the sensor's counters, not from the episode files; when `seq` is present, `dropped` equals the sum of the `seq` gaps across the session's episode files.
+- `frames` holds the sensor's frame counters since `connect()`, so per session: `received` by the host, `dropped` at the source (gaps in `seq`), `overflowed` on the host because the recorder did not drain the sensor in time. They come from the sensor's counters, not from the episode files, and they count every frame since `connect()`, including the baseline capture and the pauses between episodes, which the files do not hold. So `received` is at least the number of native rows in the session's episode files and, with `seq` present, `dropped` is at least the sum of the `seq` gaps inside them.
 - `device` holds the hub's `serial` and `firmware` for that session, and is `null` when the instance's `info.device` is `null`. Per-fingertip identity (serial, gel or skin, calibration) stays with the instance, so replacing one fingertip does not change the identity of the others.
 - `adapter` names the code that turned the sensor's output into the stored values, and its version. A bug found in an adapter can then be traced to the datasets it affected.
 - `calibration.method` is free text for now (`vendor`, `3dcal`, `nano17-press`, `uncalibrated-by-design`). A controlled vocabulary can come later once there are a few real values. `calibration.reference` names the document the calibration or, for `layout.surface: "vendor"`, the element positions were taken from.
@@ -290,29 +291,51 @@ This project therefore records through the public API with its own `taxel record
 
 ## Health annotations
 
-`taxel doctor` writes a per-episode report to `tactile/health.json`, beside the data and never inside `info.json`:
+`taxel doctor` writes one report per dataset to `tactile/health.json`, beside the data and never inside `info.json`. It carries the doctor version and the thresholds the run used, so two runs are distinguishable; what the run found out about each instance before checking any episode; and, per episode and per instance, the integrity check and the five health checks, each with its numbers and a `flag`:
 
 ```json
 {
-  "episode_000012": {
-    "left_fingertip": {
-      "drift": {"offset_pct_range": 0.031, "flag": false},
-      "framerate": {"effective_hz": 89.4, "dropped_pct": 0.018, "max_gap_ms": 31.0, "flag": false},
-      "saturation": {"saturated_pct": 0.0, "flag": false},
-      "skew": {"lag_ms": -12.0, "confidence": 0.81, "flag": false}
-    },
-    "right_fingertip": {
-      "gel": {"dead_pct": 0.062, "largest_cluster_px": 41, "flag": true},
-      "framerate": {"effective_hz": 29.1, "dropped_pct": 0.03, "max_gap_ms": 220.0, "flag": true},
-      "skew": {"lag_ms": 35.0, "confidence": 0.67, "flag": false}
-    },
-    "doctor_version": "0.1.0",
-    "thresholds": "default"
+  "doctor_version": "0.1.0",
+  "generated_at": "2026-11-05T14:03:05Z",
+  "thresholds": {"drift": 0.05, "dropped": 0.02, "max_gap_ms": null, "gel": 0.05,
+                 "cluster_px": 25, "skew": 50.0, "saturated": 0.01, "integrity": true},
+  "instances": {
+    "left_fingertip": {"key": "observation.tactile.left_fingertip", "family": "taxel_array", "metadata": "info",
+                       "sidecar": true, "declared_rate_hz": 91, "range": null,
+                       "unknown_keys": [], "missing_keys": ["meta.sessions[0].baseline.frame_range"]}
+  },
+  "episodes": {
+    "episode_000012": {
+      "left_fingertip": {
+        "integrity": {"copy": {"frames": 612, "mismatches": 0, "first_mismatch": null, "max_abs_diff": 0.0, "flag": false},
+                      "raw": {"samples": 7, "mismatches": 0, "first_mismatch": null, "max_abs_diff": 0.0, "flag": false},
+                      "files": {"native": true, "baseline": true, "capture_at_zero": true, "origins": true, "counters": true, "flag": false},
+                      "flag": false},
+        "drift": {"no_contact_level": [0.011, 0.008, 0.029], "level_change": [0.001, 0.001, 0.002],
+                  "offset": [0.012, 0.009, 0.031], "offset_pct_range": null, "slope_per_s": [0.001, 0.0, 0.002],
+                  "baseline": "capture", "source": "samples", "baseline_age_s": 3.2, "frame_range": "not recorded",
+                  "windows": 20, "no_contact_windows": 14, "first_frame_zero": false,
+                  "rebaselines": [{"sample_index": 1200, "host_ts": 10301.1, "delta": [0.0, 0.0, 0.03]}],
+                  "flag": false},
+        "framerate": {"effective_hz": 89.4, "declared_hz": 91, "dropped_pct": 0.018, "max_gap_ms": 31.0,
+                      "max_gap_threshold_ms": 109.9,
+                      "gap_histogram": {"edges_periods": [1.5, 2.5, 3.5], "counts": [600, 9, 2, 0]},
+                      "frames": {"received": 30412, "dropped": 7, "overflowed": 0},
+                      "source": "sidecar", "timestamps": "host_ts", "flag": false},
+        "saturation": {"saturated_pct": [0.0, 0.0, 0.0], "limit": "observed", "min": [-0.4, -0.5, -0.1],
+                       "max": [3.1, 2.9, 24.8], "confidence": "low", "source": "sidecar", "flag": false},
+        "gel": {"skipped": "no visuotactile feature"},
+        "skew": {"lag_ms": -12.0, "confidence": 0.81, "reference": "observation.images.front",
+                 "onsets": 3, "resolution_ms": 5.0, "flag": false}
+      }
+    }
   }
 }
 ```
 
-Thresholds are conservative defaults and are recorded with the result so a later run with different thresholds is distinguishable. For a video feature with `reduction`, `framerate` is measured against the dataset fps; the native rate is checked from the suffixed streams when present. For array families `drift` is read from the baseline stream: the raw samples against the baseline in force, which separates sensor drift from a sustained press.
+A check that cannot run because its input is missing is `{"skipped": "<reason>"}` and nothing else, so an absent `flag` means "not evaluated", never "passed". The `integrity` check has three parts, `copy`, `raw` and `files`, each run or skipped on its own; on a dataset without a sidecar all three are skipped. `thresholds` records the values used, not a name; `max_gap_ms` `null` means ten declared periods, resolved per instance into the framerate block's `max_gap_threshold_ms`. `instances` records how each instance's metadata was read (`info`, `none` for a plain LeRobot dataset, `invalid` with an `error`) and the lenient readers' unknown and missing keys. `gel` on an array instance reports `"kind": "elements"` and the zero-variance elements instead of pixel clusters. A flag is an annotation (principle 6); the exit code follows the thresholds the caller names.
+
+For a video feature with `reduction`, `framerate` is measured against the dataset fps; the native rate is checked from the suffixed streams when present. For array families `drift` is read from the baseline stream: the raw samples against the baseline in force, which separates sensor drift from a sustained press, and a capture row inside an episode is reported as a `rebaseline` event rather than scored. On a dataset without a sidecar the checks degrade to what the main table allows and say so in `source`.
 
 ## Interoperability
 
@@ -337,6 +360,10 @@ Thresholds are conservative defaults and are recorded with the result so a later
 
 ## Changelog
 
+- 0.3.1 (2026-11-05):
+  - `range` added to the static metadata, optional, array families only: the rated range of the readings per channel, so a saturation check has a limit to measure against instead of the observed extremes.
+  - Health report shape fixed: one document with `doctor_version`, `generated_at`, `thresholds` as the values used, an `instances` block with how each instance's metadata was read and the lenient readers' findings, and `episodes` keyed `episode_{index:06d}`; the `integrity` check with its three parts; the `{"skipped": reason}` form for a check that could not run; `gel` on array instances with `"kind": "elements"`.
+  - `frames` field note corrected: the counters count every frame since `connect()`, so `received` is at least the native rows in the session's files and `dropped` at least the `seq` gaps inside them, not equal to them.
 - 0.3 (2026-11-01), applying the answers to 0.2's questions given on [#4469](https://github.com/huggingface/lerobot/pull/4469#issuecomment-6555461272):
   - `layout` made explicit and required for every family: `origin` (`at` plus `description`), `axes` (`x`, `y`, `z` in words) and `surface` (`gel`, `die`, `skin`, `pad`, `vendor`) declare the coordinate frame `positions_mm` is expressed in. `positions_mm` is required for `taxel_array` and `magnetic`, optional for `force_torque`, omitted for `visuotactile`. `layout.frame` removed: it only ever said `sensor`, and `origin` and `axes` now say what that frame is. (Q5)
   - `baseline.frame_range` added: `[first_seq, last_seq]` of the native frames a capture averaged, so a baseline that absorbed a load can be found. (Q7)

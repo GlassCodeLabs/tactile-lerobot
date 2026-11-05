@@ -27,6 +27,9 @@ dependencies = ["numpy>=1.24"]
 [project.optional-dependencies]
 # Dataset writer and `taxel record`: everything under taxel/dataset/ and taxel/cli/.
 lerobot = ["lerobot[dataset]>=0.6.1,<0.7", "pyarrow>=21"]
+# `taxel doctor` on array datasets without torch: parquet and the Hub. A subset of `lerobot`,
+# which adds video decoding for the image checks.
+doctor = ["pyarrow>=21", "huggingface_hub>=0.30"]
 dev = ["pytest>=8", "ruff==0.17.3"]
 
 [project.scripts]
