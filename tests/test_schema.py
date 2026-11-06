@@ -563,12 +563,13 @@ HEALTH = {
     "generated_at": "2026-11-05T14:03:05Z",
     "thresholds": {
         "drift": 0.05,
+        "drift_units": None,
         "dropped": 0.02,
         "max_gap_ms": None,
         "gel": 0.05,
         "cluster_px": 25,
         "skew": 50.0,
-        "confidence": 0.5,
+        "confidence": 0.6,
         "saturated": 0.01,
         "integrity": True,
     },
@@ -628,6 +629,7 @@ HEALTH = {
                     "candidates": 91,
                     "first_frame_zero": False,
                     "rebaselines": [{"sample_index": 1200, "host_ts": 10301.1, "delta": [0.0, 0.0, 0.03]}],
+                    "confidence": "normal",
                     "flag": False,
                 },
                 "framerate": {

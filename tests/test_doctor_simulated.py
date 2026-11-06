@@ -200,6 +200,7 @@ class TestPlainDataset:
         assert isinstance(probe.drift, DriftReport) and probe.drift.baseline == "none"
         assert probe.drift.source == "main_table" and isinstance(probe.drift.offset, Skipped)
         assert probe.drift.offset.skipped == "no session baseline" and not probe.drift.first_frame_zero
+        assert probe.drift.confidence == "low" and not probe.drift.flag
         gel = report.episodes["episode_000000"]["gel"]
         assert isinstance(gel.integrity, Skipped) and isinstance(gel.drift, Skipped)
         assert gel.framerate.source == "main_table"

@@ -15,6 +15,7 @@ from taxel import __version__
 
 SUBCOMMANDS: dict[str, tuple[str, str]] = {
     "record": ("taxel.cli.record", "record a LeRobot dataset with tactile sensors beside a robot or cameras"),
+    "doctor": ("taxel.cli.doctor", "check a recorded dataset and write tactile/health.json"),
 }
 
 

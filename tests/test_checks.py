@@ -243,7 +243,13 @@ class TestDrift:
         assert report.no_contact_level[0] == pytest.approx(float(REST.mean()), abs=0.02)  # sample 0
         assert report.level_change[0] == pytest.approx(0.5 * 9.5, abs=0.05)  # sample 950 less sample 0
         assert report.rebaselines == [] and not report.first_frame_zero and report.flag
+        assert report.confidence == "normal"
         assert not drift_check(stored, RATE, inputs, LIMITS, "sidecar", None, Thresholds(drift=0.6)).flag
+        # Without a range the fraction has no meaning: only a caller's native-unit threshold flags.
+        native = drift_check(stored, RATE, inputs, None, "sidecar", None, Thresholds())
+        assert native.offset_pct_range is None and native.confidence == "normal" and not native.flag
+        assert drift_check(stored, RATE, inputs, None, "sidecar", None, Thresholds(drift_units=1.0)).flag
+        assert not drift_check(stored, RATE, inputs, None, "sidecar", None, Thresholds(drift_units=10.0)).flag
 
     def test_windows_without_a_sample_row_fall_back_to_raw_frames(self) -> None:
         stored, inputs = applied_inputs(drifting_raw(), every=100)
@@ -287,14 +293,16 @@ class TestDrift:
         assert report.baseline == "none" and report.source == "main_table"
         assert isinstance(report.offset, Skipped) and report.offset.skipped == "no session baseline"
         assert report.offset_pct_range is None and report.frame_range is None
-        assert report.level_change[0] == pytest.approx(0.5 * 9.5, abs=0.05) and report.flag
-        assert not drift_check(
-            raw, 30.0, BaselineInputs(), None, "main_table", None, Thresholds(drift=5.0)
-        ).flag
-        raw[0] = 0.0
+        assert report.level_change[0] == pytest.approx(0.5 * 9.5, abs=0.05)
+        assert report.confidence == "low" and not report.flag  # no range, no baseline: numbers only
         assert drift_check(
-            raw, 30.0, BaselineInputs(), None, "main_table", None, Thresholds()
-        ).first_frame_zero
+            raw, 30.0, BaselineInputs(), None, "main_table", None, Thresholds(drift_units=1.0)
+        ).flag
+        with_range = drift_check(raw, 30.0, BaselineInputs(), LIMITS, "main_table", None, Thresholds())
+        assert with_range.confidence == "normal" and with_range.flag  # level change over 5% of the span
+        raw[0] = 0.0
+        zero = drift_check(raw, 30.0, BaselineInputs(), None, "main_table", None, Thresholds())
+        assert zero.first_frame_zero and not zero.flag
 
     def test_frame_range_words_pass_through(self) -> None:
         stored, inputs = applied_inputs(drifting_raw())
@@ -357,6 +365,12 @@ class TestGel:
         clean = gel_check_elements(np.random.default_rng(1).normal(size=(100, 8, 2)), Thresholds())
         assert clean.dead_elements == [] and clean.dead_pct == 0.0 and not clean.flag
         assert isinstance(gel_check_elements(np.zeros((100, 8, 2)), Thresholds()), Skipped)
+        # Elements of different scales are all alive: the rule is each element against itself.
+        mixed = np.random.default_rng(2).normal(size=(100, 3, 1)) * np.array([[100.0], [0.01], [1e-4]])[None]
+        assert gel_check_elements(mixed, Thresholds()).dead_elements == []
+        # An element that is almost constant, within one part in a thousand of its level, is dead.
+        mixed[:, 2, 0] = 5.0 + np.random.default_rng(3).normal(0.0, 1e-4, 100)
+        assert gel_check_elements(mixed, Thresholds()).dead_elements == [2]
 
 
 def step_signal(times: np.ndarray, onsets: list[tuple[float, float]], level: float = 1.0) -> np.ndarray:

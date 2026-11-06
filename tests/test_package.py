@@ -32,3 +32,16 @@ def test_record_without_the_extra_names_it(capsys) -> None:
     assert main(["record", "--robot.type=cameras_only"]) == 2
     err = capsys.readouterr().err
     assert err.startswith("taxel record: LeRobot is not installed") and "pip install 'taxel[lerobot]'" in err
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pyarrow") is not None, reason="pyarrow is installed")
+def test_doctor_without_the_extra_names_it(tmp_path, capsys) -> None:
+    from taxel.cli.main import main
+
+    (tmp_path / "meta" / "episodes" / "chunk-000").mkdir(parents=True)
+    (tmp_path / "meta" / "info.json").write_text('{"fps": 30, "features": {}}')
+    (tmp_path / "meta" / "episodes" / "chunk-000" / "file-000.parquet").write_bytes(b"")
+    assert main(["doctor", str(tmp_path), "--no-write"]) == 2
+    err = capsys.readouterr().err
+    assert err.startswith("taxel doctor: pyarrow is not installed") and "pip install 'taxel[doctor]'" in err
+    assert "taxel[lerobot]" in err

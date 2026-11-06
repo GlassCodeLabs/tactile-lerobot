@@ -261,12 +261,12 @@ def cross_correlate(
     if norm == 0.0:
         return 0.0, 0.0, onsets
     limit = min(int(round(max_lag_s / grid_s)), n - 1)
-    best_lag, best = 0, -np.inf
-    for lag in range(-limit, limit + 1):
-        score = float(ga[lag:] @ gb[: n - lag]) if lag >= 0 else float(ga[: n + lag] @ gb[-lag:])
-        if score > best:
-            best, best_lag = score, lag
-    return best_lag * grid_s, max(best / norm, 0.0), onsets
+    # full[k] is sum over m of ga[m + k - (n - 1)] * gb[m]: the score of lag k - (n - 1).
+    full = np.correlate(ga, gb, mode="full")
+    lags = np.arange(-limit, limit + 1)
+    scores = full[lags + n - 1]
+    best = int(np.argmax(scores))
+    return float(lags[best] * grid_s), max(float(scores[best]) / norm, 0.0), onsets
 
 
 # --- Clusters for the gel check ---------------------------------------------------------------------------

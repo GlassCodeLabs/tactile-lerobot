@@ -867,7 +867,12 @@ class DriftReport(Block):
     is the session baseline's, ``"not recorded"`` for a record without the key, ``"no seq"``
     for a sensor without one. ``candidates`` is how many pairs of quiet windows were tried
     as drift lines (at most 300, a seeded sample beyond that). ``first_frame_zero`` names
-    the case where the level at frame 0 is exactly zero on every channel.
+    the case where the level at frame 0 is exactly zero on every channel; it is an
+    observation, never a flag. ``confidence`` is ``low`` when there is neither a range nor
+    a baseline, so the numbers are a level change in unknown units. The flag compares
+    ``offset_pct_range`` with the ``drift`` threshold when the range is known, and the
+    native offset (or level change) with ``drift_units`` when the caller set one; without
+    either, drift never flags.
     """
 
     no_contact_level: list[float]
@@ -884,11 +889,13 @@ class DriftReport(Block):
     candidates: int
     first_frame_zero: bool
     rebaselines: list[RebaselineEvent]
+    confidence: str
     flag: bool
 
     def __post_init__(self) -> None:
         _require_one_of(self.baseline, ("capture", "session", "none"), "drift.baseline")
         _require_one_of(self.source, ("samples", "raw_frames", "main_table"), "drift.source")
+        _require_one_of(self.confidence, ("normal", "low"), "drift.confidence")
 
 
 @dataclass
@@ -1014,17 +1021,20 @@ class InstanceReport(Block):
 
 @dataclass
 class Thresholds(Block):
-    """The thresholds a run flagged against. The defaults are conservative. ``max_gap_ms`` ``None``
-    means ten declared periods, resolved per instance and recorded in the framerate block;
-    ``confidence`` is the cross-correlation peak a skew lag needs before it can be flagged."""
+    """The thresholds a run flagged against. The defaults are conservative. ``drift`` is a fraction of
+    the declared range; ``drift_units`` is in the stream's native units, for a stream without a
+    range, and ``None`` means drift does not flag there. ``max_gap_ms`` ``None`` means ten declared
+    periods, resolved per instance and recorded in the framerate block. ``confidence`` is the
+    cross-correlation peak a skew lag needs before it can be flagged."""
 
     drift: float = 0.05
+    drift_units: float | None = None
     dropped: float = 0.02
     max_gap_ms: float | None = None
     gel: float = 0.05
     cluster_px: int = 25
     skew: float = 50.0
-    confidence: float = 0.5
+    confidence: float = 0.6
     saturated: float = 0.01
     integrity: bool = True
 

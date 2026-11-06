@@ -66,8 +66,8 @@ class TestUsage:
         assert "record" in capsys.readouterr().out
         assert main(["--version"]) == 0
         assert capsys.readouterr().out.startswith("taxel ")
-        assert main(["doctor"]) == 2
-        assert "unknown command 'doctor'" in capsys.readouterr().err
+        assert main(["export"]) == 2
+        assert "unknown command 'export'" in capsys.readouterr().err
 
     def test_record_help_is_scoped_to_the_robot_type(self, capsys) -> None:
         with pytest.raises(SystemExit) as exit_info:

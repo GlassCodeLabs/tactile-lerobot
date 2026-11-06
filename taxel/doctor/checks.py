@@ -50,11 +50,15 @@ __all__ = [
 ]
 
 DEAD_FRACTION = 0.2
-"""A pixel or element is dead when its variance over the episode is below this fraction of the median.
+"""A pixel is dead when its variance over the episode is below this fraction of the median pixel variance.
 
 A fifth, not a hundredth: a constant region in a video flickers after encoding (LeRobot's default
 AV1 at CRF 30 leaves it a few tenths of a count of variance), and real gel images vary by tens.
 """
+
+CONSTANT_FRACTION = 1e-3
+"""An element is dead when its standard deviation over the episode is within this fraction of its
+largest magnitude: constant to one part in a thousand, on every channel."""
 
 GAP_EDGES_PERIODS = (1.5, 2.5, 3.5)
 """Bin edges of the gap histogram, in declared periods; the last bin is open."""
@@ -369,6 +373,7 @@ def drift_check(
         offset: list[float] | Skipped = Skipped("no session baseline")
         pct = None
         measure = np.abs(level_last - level_first)
+        confidence = "low" if limits is None else "normal"
     else:
         end = (
             slope * t[last] + intercept
@@ -376,15 +381,18 @@ def drift_check(
         offset = _extreme_per_channel(end)
         measure = np.abs(end)
         pct = None
+        confidence = "normal"
+    # The flag: a fraction of the declared range, or the caller's native-unit threshold; else never.
     if limits is not None:
         lo, hi = (np.asarray(v, dtype=np.float64) for v in limits)
-        span = hi - lo
-        scaled = measure / span
+        scaled = measure / (hi - lo)
         if not isinstance(offset, Skipped):
             pct = [float(v) for v in scaled.max(axis=0)]
         flag = bool(np.any(scaled.max(axis=0) > thresholds.drift))
+    elif thresholds.drift_units is not None:
+        flag = bool(np.any(measure.max(axis=0) > thresholds.drift_units))
     else:
-        flag = bool(np.any(measure.max(axis=0) > thresholds.drift))
+        flag = False
 
     events: list[RebaselineEvent] = []
     if captures is not None:
@@ -415,6 +423,7 @@ def drift_check(
         candidates=candidates,
         first_frame_zero=bool(np.all(data[0] == 0.0)),
         rebaselines=events,
+        confidence=confidence,
         flag=flag,
     )
 
@@ -453,17 +462,24 @@ def gel_check_pixels(frames: NDArray[np.uint8], thresholds: Thresholds) -> GelRe
 
 
 def gel_check_elements(data: NDArray[np.floating], thresholds: Thresholds) -> GelReport | Skipped:
-    """Dead elements of an array stream ``(n, E, C)``: elements whose variance over the episode is near
-    zero while the others vary, listed by index. Flagged on the dead fraction."""
+    """Dead elements of an array stream ``(n, E, C)``: elements constant over the episode, listed by index.
+
+    An element is dead when, on every channel, its standard deviation over the episode is within
+    :data:`CONSTANT_FRACTION` of its largest magnitude, while the stream as a whole varies. The
+    rule is per element, not relative to the other elements: a taxel array's elements share a
+    unit but not a level of activity, and a plain dataset's "tactile" vector may hold quantities
+    of different scales. Flagged on the dead fraction.
+    """
     n = len(data)
     if n < 2:
         return Skipped(f"{n} frame(s): variance needs at least two")
-    variance = np.asarray(data, dtype=np.float64).var(axis=0).mean(axis=1)
-    median = float(np.median(variance))
-    if median <= 1e-12:
+    values = np.asarray(data, dtype=np.float64)
+    spread = values.std(axis=0)
+    scale = np.maximum(np.abs(values).max(axis=0), np.finfo(np.float32).tiny)
+    if float(np.median(spread)) <= 1e-12:
         return Skipped("stream does not vary: a dead element cannot be told from a constant reading")
-    dead = np.flatnonzero(variance <= DEAD_FRACTION * median)
-    dead_pct = float(dead.size / variance.size)
+    dead = np.flatnonzero(np.all(spread <= CONSTANT_FRACTION * scale, axis=1))
+    dead_pct = float(dead.size / values.shape[1])
     return GelReport("elements", dead_pct, None, [int(i) for i in dead], n, dead_pct > thresholds.gel)
 
 
