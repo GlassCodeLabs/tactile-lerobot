@@ -348,7 +348,9 @@ class SimulatedVisuotactileConfig(TactileSensorConfig):
         width: Image width.
         marker_grid: Rows and columns of the dark marker dots drawn on the gel.
         seed: Seed for the per-frame noise.
-        noise_std: Spread of the Gaussian noise added to every pixel, in 8-bit counts.
+        noise_std: Spread of the Gaussian noise added to every pixel, in 8-bit counts. The default
+            is the order of a real camera's noise plus lighting jitter, and well above what video
+            encoding leaves on a constant region, so a dead pixel stays detectable after encoding.
         contact_schedule: Stimulus. Presses as ``(start_s, duration_s, amplitude)`` in sensor time
             from ``connect()``; a press brightens a round patch at ``contact_center`` by
             ``amplitude`` counts at its peak.
@@ -369,7 +371,7 @@ class SimulatedVisuotactileConfig(TactileSensorConfig):
     width: int = 64
     marker_grid: tuple[int, int] = (4, 6)
     seed: int = 0
-    noise_std: float = 2.0
+    noise_std: float = 6.0
     contact_schedule: list[Press] | None = None
     contact_center: tuple[float, float] = (0.5, 0.5)
     contact_radius: float = 0.2

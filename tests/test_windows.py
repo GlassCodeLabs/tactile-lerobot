@@ -3,7 +3,16 @@
 import numpy as np
 import pytest
 
-from taxel.doctor.windows import no_contact, window_edges, window_stats
+from taxel.doctor.windows import (
+    MAX_CANDIDATES,
+    contact_signal,
+    cross_correlate,
+    largest_cluster,
+    motion_energy,
+    no_contact,
+    window_edges,
+    window_stats,
+)
 
 RATE = 100.0
 
@@ -67,10 +76,10 @@ class TestNoContact:
         y = 0.5 * t[:, None, None] + np.array([[0.1], [-0.2]])[None]
         y[4, 0, 0] += 2.0  # a held press on element 0 in the fifth window
         noise = np.full((2, 1), 0.01)
-        mask, slope, intercept = no_contact(y, t, np.ones(6, bool), noise)
-        assert mask.tolist() == [True, True, True, True, False, True]
-        np.testing.assert_allclose(slope, 0.5, atol=1e-9)
-        np.testing.assert_allclose(intercept[:, 0], [0.1, -0.2], atol=1e-9)
+        fit = no_contact(y, t, np.ones(6, bool), noise)
+        assert fit.mask.tolist() == [True, True, True, True, False, True] and fit.candidates == 15
+        np.testing.assert_allclose(fit.slope, 0.5, atol=1e-9)
+        np.testing.assert_allclose(fit.intercept[:, 0], [0.1, -0.2], atol=1e-9)
 
     def test_non_quiet_windows_stay_out_and_do_not_bias_the_line(self) -> None:
         t = np.arange(8) * 0.5 + 0.25
@@ -78,39 +87,74 @@ class TestNoContact:
         y[2] = 50.0  # an onset window: not quiet, whatever its level
         quiet = np.ones(8, bool)
         quiet[2] = False
-        mask, slope, _ = no_contact(y, t, quiet, np.full((1, 1), 0.01))
-        assert mask.tolist() == [True, True, False, True, True, True, True, True]
-        np.testing.assert_allclose(slope, 0.5, atol=1e-9)
+        fit = no_contact(y, t, quiet, np.full((1, 1), 0.01))
+        assert fit.mask.tolist() == [True, True, False, True, True, True, True, True] and fit.candidates == 21
+        np.testing.assert_allclose(fit.slope, 0.5, atol=1e-9)
 
     def test_fewer_than_two_quiet_windows(self) -> None:
         y = np.arange(3, dtype=float)[:, None, None]
         t = np.arange(3, dtype=float)
-        mask, slope, intercept = no_contact(y, t, np.zeros(3, bool), np.zeros((1, 1)))
-        assert not mask.any() and slope.tolist() == [[0.0]] and np.isnan(intercept).all()
+        fit = no_contact(y, t, np.zeros(3, bool), np.zeros((1, 1)))
+        assert not fit.mask.any() and fit.slope.tolist() == [[0.0]] and np.isnan(fit.intercept).all()
+        assert fit.candidates == 0
         quiet = np.array([False, True, False])
-        mask, slope, intercept = no_contact(y, t, quiet, np.zeros((1, 1)))
-        assert (
-            mask.tolist() == [False, True, False]
-            and slope.tolist() == [[0.0]]
-            and intercept.tolist() == [[1.0]]
-        )
+        fit = no_contact(y, t, quiet, np.zeros((1, 1)))
+        assert fit.mask.tolist() == [False, True, False] and fit.slope.tolist() == [[0.0]]
+        assert fit.intercept.tolist() == [[1.0]] and fit.candidates == 0
 
     def test_many_windows_subsample_pairs_deterministically(self) -> None:
         t = np.arange(400) * 0.5
         y = 0.5 * t[:, None, None] + np.zeros((1, 1))[None]
         first = no_contact(y, t, np.ones(400, bool), np.full((1, 1), 0.01))
         second = no_contact(y, t, np.ones(400, bool), np.full((1, 1), 0.01))
-        assert first[0].all() and np.array_equal(first[1], second[1])
-        np.testing.assert_allclose(first[1], 0.5, atol=1e-9)
+        assert first.mask.all() and np.array_equal(first.slope, second.slope)
+        assert first.candidates == MAX_CANDIDATES == 300  # 79,800 pairs exist; a seeded sample is tried
+        np.testing.assert_allclose(first.slope, 0.5, atol=1e-9)
 
     def test_half_the_windows_pressed_still_picks_the_rest_level(self) -> None:
         t = np.arange(6) * 0.5 + 0.25
         y = 0.5 * t[:, None, None] + np.zeros((2, 1))[None]
         y[3:, 0] += 2.0  # a press held through the second half of the episode
-        mask, slope, intercept = no_contact(y, t, np.ones(6, bool), np.full((2, 1), 0.01))
-        assert mask.tolist() == [True, True, True, False, False, False]
-        np.testing.assert_allclose(slope, 0.5, atol=1e-9)
-        np.testing.assert_allclose(intercept, 0.0, atol=1e-9)
+        fit = no_contact(y, t, np.ones(6, bool), np.full((2, 1), 0.01))
+        assert fit.mask.tolist() == [True, True, True, False, False, False]
+        np.testing.assert_allclose(fit.slope, 0.5, atol=1e-9)
+        np.testing.assert_allclose(fit.intercept, 0.0, atol=1e-9)
         y[:3, 0] += 4.0  # the other way round: the lower level is the rest, whichever half holds it
-        mask, _, _ = no_contact(y, t, np.ones(6, bool), np.full((2, 1), 0.01))
-        assert mask.tolist() == [False, False, False, True, True, True]
+        fit = no_contact(y, t, np.ones(6, bool), np.full((2, 1), 0.01))
+        assert fit.mask.tolist() == [False, False, False, True, True, True]
+
+
+class TestSignals:
+    def test_contact_signal_is_the_l1_distance_from_the_median_frame(self) -> None:
+        data = np.zeros((10, 2, 1))
+        data[4:7, 0, 0] = 2.0  # a press on element 0 in frames 4 to 6
+        np.testing.assert_allclose(contact_signal(data), [0, 0, 0, 0, 2, 2, 2, 0, 0, 0])
+
+    def test_motion_energy_is_the_mean_absolute_frame_difference(self) -> None:
+        frames = np.zeros((3, 4, 5, 3), np.uint8)
+        frames[1] = 10
+        frames[2] = 10
+        np.testing.assert_allclose(motion_energy(frames), [10.0, 0.0])
+        assert motion_energy(frames[:1]).size == 0
+
+    def test_cross_correlate_finds_a_known_lag(self) -> None:
+        times = np.arange(0.0, 3.0, 0.001)
+        a = np.zeros(len(times))
+        a[1000] = a[2000] = 1.0  # events at 1.0 s and 2.0 s
+        b = np.zeros(len(times))
+        b[1000 - 35] = b[2000 - 35] = 1.0  # the same events 35 ms earlier in the reference
+        lag, confidence, onsets = cross_correlate(times, a, times, b)
+        assert lag == pytest.approx(0.035, abs=0.0051) and confidence > 0.99 and onsets == 2
+        lag, _, _ = cross_correlate(times, b, times, a)
+        assert lag == pytest.approx(-0.035, abs=0.0051)
+        assert cross_correlate(times, np.zeros(len(times)), times, b)[1] == 0.0
+
+    def test_largest_cluster_is_four_connected(self) -> None:
+        mask = np.zeros((6, 6), bool)
+        mask[0, 0:5] = True  # five in a row
+        mask[2, 2] = mask[3, 3] = mask[4, 4] = True  # three on a diagonal: not connected
+        mask[5, 0] = mask[5, 1] = True
+        assert largest_cluster(mask) == 5
+        mask[1, 4] = True  # joins the row from below
+        assert largest_cluster(mask) == 6
+        assert largest_cluster(np.zeros((3, 3), bool)) == 0 and largest_cluster(np.ones((3, 3), bool)) == 9

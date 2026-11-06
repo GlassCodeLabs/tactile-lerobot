@@ -298,7 +298,7 @@ This project therefore records through the public API with its own `taxel record
   "doctor_version": "0.1.0",
   "generated_at": "2026-11-05T14:03:05Z",
   "thresholds": {"drift": 0.05, "dropped": 0.02, "max_gap_ms": null, "gel": 0.05,
-                 "cluster_px": 25, "skew": 50.0, "saturated": 0.01, "integrity": true},
+                 "cluster_px": 25, "skew": 50.0, "confidence": 0.5, "saturated": 0.01, "integrity": true},
   "instances": {
     "left_fingertip": {"key": "observation.tactile.left_fingertip", "family": "taxel_array", "metadata": "info",
                        "sidecar": true, "declared_rate_hz": 91, "range": null,
@@ -314,7 +314,7 @@ This project therefore records through the public API with its own `taxel record
         "drift": {"no_contact_level": [0.011, 0.008, 0.029], "level_change": [0.001, 0.001, 0.002],
                   "offset": [0.012, 0.009, 0.031], "offset_pct_range": null, "slope_per_s": [0.001, 0.0, 0.002],
                   "baseline": "capture", "source": "samples", "baseline_age_s": 3.2, "frame_range": "not recorded",
-                  "windows": 20, "no_contact_windows": 14, "first_frame_zero": false,
+                  "windows": 20, "no_contact_windows": 14, "candidates": 91, "first_frame_zero": false,
                   "rebaselines": [{"sample_index": 1200, "host_ts": 10301.1, "delta": [0.0, 0.0, 0.03]}],
                   "flag": false},
         "framerate": {"effective_hz": 89.4, "declared_hz": 91, "dropped_pct": 0.018, "max_gap_ms": 31.0,
@@ -333,7 +333,7 @@ This project therefore records through the public API with its own `taxel record
 }
 ```
 
-A check that cannot run because its input is missing is `{"skipped": "<reason>"}` and nothing else, so an absent `flag` means "not evaluated", never "passed". The `integrity` check has three parts, `copy`, `raw` and `files`, each run or skipped on its own; on a dataset without a sidecar all three are skipped. `thresholds` records the values used, not a name; `max_gap_ms` `null` means ten declared periods, resolved per instance into the framerate block's `max_gap_threshold_ms`. `instances` records how each instance's metadata was read (`info`, `none` for a plain LeRobot dataset, `invalid` with an `error`) and the lenient readers' unknown and missing keys. `gel` on an array instance reports `"kind": "elements"` and the zero-variance elements instead of pixel clusters. A flag is an annotation (principle 6); the exit code follows the thresholds the caller names.
+A check that cannot run because its input is missing is `{"skipped": "<reason>"}` and nothing else, so an absent `flag` means "not evaluated", never "passed". The `integrity` check has three parts, `copy`, `raw` and `files`, each run or skipped on its own; on a dataset without a sidecar all three are skipped. `thresholds` records the values used, not a name; `max_gap_ms` `null` means ten declared periods, resolved per instance into the framerate block's `max_gap_threshold_ms`, and `confidence` is the cross-correlation peak a skew lag needs before it can be flagged. `instances` records how each instance's metadata was read (`info`, `none` for a plain LeRobot dataset, `invalid` with an `error`) and the lenient readers' unknown and missing keys. `gel` on an array instance reports `"kind": "elements"` and the zero-variance elements instead of pixel clusters. A flag is an annotation (principle 6); the exit code follows the thresholds the caller names.
 
 For a video feature with `reduction`, `framerate` is measured against the dataset fps; the native rate is checked from the suffixed streams when present. For array families `drift` is read from the baseline stream: the raw samples against the baseline in force, which separates sensor drift from a sustained press, and a capture row inside an episode is reported as a `rebaseline` event rather than scored. On a dataset without a sidecar the checks degrade to what the main table allows and say so in `source`.
 

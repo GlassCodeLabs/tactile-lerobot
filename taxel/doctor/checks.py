@@ -14,7 +14,7 @@ from numpy.typing import NDArray
 
 from taxel.dataset.reduce import reduce_episode
 from taxel.dataset.sidecar import BaselineRows, EpisodeStream, frame_times, raw_frames
-from taxel.doctor.windows import no_contact, window_edges, window_stats
+from taxel.doctor.windows import cross_correlate, largest_cluster, no_contact, window_edges, window_stats
 from taxel.schema import (
     CopyCheck,
     DriftReport,
@@ -22,11 +22,13 @@ from taxel.schema import (
     FrameCounts,
     FramerateReport,
     GapHistogram,
+    GelReport,
     RawCheck,
     RebaselineEvent,
     Reduction,
     SaturationReport,
     SessionRecord,
+    SkewReport,
     Skipped,
     Thresholds,
 )
@@ -37,12 +39,22 @@ __all__ = [
     "drift_check",
     "framerate_main_table",
     "framerate_sidecar",
+    "gel_check_elements",
+    "gel_check_pixels",
     "integrity_copy",
     "integrity_files",
     "integrity_raw",
     "max_gap_threshold_ms",
     "saturation_check",
+    "skew_check",
 ]
+
+DEAD_FRACTION = 0.2
+"""A pixel or element is dead when its variance over the episode is below this fraction of the median.
+
+A fifth, not a hundredth: a constant region in a video flickers after encoding (LeRobot's default
+AV1 at CRF 30 leaves it a few tenths of a count of variance), and real gel images vary by tens.
+"""
 
 GAP_EDGES_PERIODS = (1.5, 2.5, 3.5)
 """Bin edges of the gap histogram, in declared periods; the last bin is open."""
@@ -337,12 +349,13 @@ def drift_check(
     mask = np.zeros(len(starts), bool)
     slope = np.zeros((n_elements, n_channels))
     intercept = np.zeros((n_elements, n_channels))
+    candidates = 0
     for a, b in zip(segment_starts, [*segment_starts[1:], n], strict=True):
         part = (starts >= a) & (starts < b)
         if not part.any():
             continue
-        m, slope, intercept = no_contact(y[part], t[part], stats.quiet[part], stats.noise)
-        mask[part] = m
+        fit = no_contact(y[part], t[part], stats.quiet[part], stats.noise)
+        mask[part], slope, intercept, candidates = fit.mask, fit.slope, fit.intercept, fit.candidates
     no_contact_idx = np.flatnonzero(mask)
     if no_contact_idx.size == 0:
         return Skipped("no no-contact window in the episode: contact throughout")
@@ -399,6 +412,7 @@ def drift_check(
         frame_range=baseline.frame_range,
         windows=int(len(starts)),
         no_contact_windows=int(no_contact_idx.size),
+        candidates=candidates,
         first_frame_zero=bool(np.all(data[0] == 0.0)),
         rebaselines=events,
         flag=flag,
@@ -409,3 +423,93 @@ def _extreme_per_channel(values: NDArray[np.float64]) -> list[float]:
     """Per channel, the element with the largest magnitude, signed."""
     picked = np.take_along_axis(values, np.abs(values).argmax(axis=0)[None, :], axis=0)[0]
     return [float(v) for v in picked]
+
+
+# --- Gel -------------------------------------------------------------------------------------------------
+
+
+def gel_check_pixels(frames: NDArray[np.uint8], thresholds: Thresholds) -> GelReport | Skipped:
+    """Dead pixels of an image stream: pixels whose variance over the frames is near zero while the rest
+    varies.
+
+    ``frames`` is ``(k, H, W, 3)`` uint8, a sample of the episode's frames. A pixel is dead when
+    its grayscale variance is below :data:`DEAD_FRACTION` of the median pixel variance, a rule
+    that holds through video encoding; the
+    largest 4-connected cluster of dead pixels is reported too. Flagged on the dead fraction or
+    the cluster size.
+    """
+    k = len(frames)
+    if k < 2:
+        return Skipped(f"{k} frame(s) decoded: variance needs at least two")
+    variance = np.asarray(frames, dtype=np.float32).mean(axis=-1).var(axis=0)
+    median = float(np.median(variance))
+    if median <= 1e-9:
+        return Skipped("frames do not vary: a dead pixel cannot be told from a static scene")
+    dead = variance <= DEAD_FRACTION * median
+    cluster = largest_cluster(dead)
+    dead_pct = float(dead.mean())
+    flag = dead_pct > thresholds.gel or cluster > thresholds.cluster_px
+    return GelReport("pixels", dead_pct, cluster, None, k, flag)
+
+
+def gel_check_elements(data: NDArray[np.floating], thresholds: Thresholds) -> GelReport | Skipped:
+    """Dead elements of an array stream ``(n, E, C)``: elements whose variance over the episode is near
+    zero while the others vary, listed by index. Flagged on the dead fraction."""
+    n = len(data)
+    if n < 2:
+        return Skipped(f"{n} frame(s): variance needs at least two")
+    variance = np.asarray(data, dtype=np.float64).var(axis=0).mean(axis=1)
+    median = float(np.median(variance))
+    if median <= 1e-12:
+        return Skipped("stream does not vary: a dead element cannot be told from a constant reading")
+    dead = np.flatnonzero(variance <= DEAD_FRACTION * median)
+    dead_pct = float(dead.size / variance.size)
+    return GelReport("elements", dead_pct, None, [int(i) for i in dead], n, dead_pct > thresholds.gel)
+
+
+# --- Skew ------------------------------------------------------------------------------------------------
+
+
+def skew_check(
+    tactile_times: NDArray[np.floating],
+    tactile_events: NDArray[np.floating],
+    reference_times: NDArray[np.floating],
+    reference_events: NDArray[np.floating],
+    reference_key: str,
+    thresholds: Thresholds,
+    max_lag_s: float = 0.5,
+    grid_s: float = 0.005,
+) -> SkewReport | Skipped:
+    """Lag between contact onsets in a tactile stream and the same onsets in a reference.
+
+    Both inputs are event signals on one clock: large at an onset or a release, near zero
+    otherwise. For an array stream that is the absolute first difference of
+    :func:`~taxel.doctor.windows.contact_signal`; for an image stream it is
+    :func:`~taxel.doctor.windows.motion_energy`, which is a difference already. They are
+    cross-correlated on a ``grid_s`` grid over ``[-max_lag_s, max_lag_s]``, smoothed to the
+    coarser series' spacing; ``lag_ms`` is positive when the tactile stream lags the reference.
+    Skipped when either signal has no onset, or when the cross-correlation peak is below
+    ``thresholds.confidence``. ``resolution_ms`` is the coarser of the grid and the two series'
+    spacing.
+    """
+    events_a = np.asarray(tactile_events, dtype=np.float64)
+    events_b = np.asarray(reference_events, dtype=np.float64)
+    times_a = np.asarray(tactile_times, dtype=np.float64)
+    times_b = np.asarray(reference_times, dtype=np.float64)
+    if len(events_a) < 2 or len(events_b) < 2:
+        return Skipped("too few frames to find an onset")
+    if not np.any(events_a > np.median(events_a)) or not np.any(events_b > np.median(events_b)):
+        return Skipped("no contact onset in the tactile stream or in the reference")
+    spacing = max(float(np.median(np.diff(times_a))), float(np.median(np.diff(times_b))))
+    lag_s, confidence, onsets = cross_correlate(
+        times_a, events_a, times_b, events_b, max_lag_s, grid_s, smooth_s=spacing
+    )
+    if confidence < thresholds.confidence:
+        return Skipped(
+            f"no onset matched in both signals: confidence {confidence:.2f} below {thresholds.confidence}"
+        )
+    resolution_ms = max(grid_s, spacing) * 1000.0
+    lag_ms = lag_s * 1000.0
+    return SkewReport(
+        lag_ms, confidence, reference_key, onsets, resolution_ms, bool(abs(lag_ms) > thresholds.skew)
+    )

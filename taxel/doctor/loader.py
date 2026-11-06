@@ -408,12 +408,18 @@ class DoctorDataset:
 
     # --- Video ------------------------------------------------------------------------------------
 
-    def frames(self, key: str, episode_index: int, max_frames: int | None = None) -> NDArray[np.uint8]:
+    def frames(
+        self,
+        key: str,
+        episode_index: int,
+        max_frames: int | None = None,
+        indices: Iterable[int] | None = None,
+    ) -> NDArray[np.uint8]:
         """Decoded frames of a video or image feature for the episode, uint8 ``(k, height, width, 3)``.
 
-        With ``max_frames``, that many frames evenly spread over the episode; otherwise all.
-        Video needs LeRobot's decoder (``taxel[lerobot]``); an image feature is decoded
-        from the PNG bytes in the data parquet.
+        With ``max_frames``, that many frames evenly spread over the episode; with ``indices``,
+        exactly those frame indices in order; otherwise all. Video needs LeRobot's decoder
+        (``taxel[lerobot]``); an image feature is decoded from the PNG bytes in the data parquet.
 
         Raises:
             ImportError: Naming the extra when the decoder is not installed.
@@ -422,9 +428,14 @@ class DoctorDataset:
         dtype = self.features[key].get("dtype")
         if dtype not in _IMAGE_DTYPES:
             raise SchemaError(f"{key} is {dtype!r}, not a video or image feature")
-        indices = np.arange(row.length)
-        if max_frames is not None and max_frames < row.length:
-            indices = np.unique(np.linspace(0, row.length - 1, max_frames).round().astype(int))
+        if indices is not None:
+            indices = np.asarray(sorted(set(int(i) for i in indices)), dtype=np.int64)
+            if indices.size and (indices[0] < 0 or indices[-1] >= row.length):
+                raise IndexError(f"frame indices must lie in range({row.length})")
+        else:
+            indices = np.arange(row.length)
+            if max_frames is not None and max_frames < row.length:
+                indices = np.unique(np.linspace(0, row.length - 1, max_frames).round().astype(int))
         if dtype == "image":
             return self._png_frames(key, episode_index, indices)
         try:

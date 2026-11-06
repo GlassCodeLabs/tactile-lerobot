@@ -10,11 +10,14 @@ from taxel.doctor.checks import (
     drift_check,
     framerate_main_table,
     framerate_sidecar,
+    gel_check_elements,
+    gel_check_pixels,
     integrity_copy,
     integrity_files,
     integrity_raw,
     max_gap_threshold_ms,
     saturation_check,
+    skew_check,
 )
 from taxel.schema import (
     Baseline,
@@ -312,4 +315,89 @@ class TestDrift:
         short = drift_check(stored, RATE, inputs, LIMITS, "sidecar", None, Thresholds())
         assert isinstance(short, Skipped) and short.skipped.startswith(
             "episode shorter than two drift windows"
+        )
+
+
+def noisy_frames(k: int = 20, h: int = 16, w: int = 20, seed: int = 0) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    base = rng.integers(60, 200, size=(h, w, 3), dtype=np.uint8).astype(np.int16)
+    frames = base[None] + rng.integers(-4, 5, size=(k, h, w, 3), dtype=np.int16)
+    return np.clip(frames, 0, 255).astype(np.uint8)
+
+
+class TestGel:
+    def test_dead_pixels_and_the_largest_cluster(self) -> None:
+        frames = noisy_frames()
+        frames[:, 2:5, 5:9, :] = 0  # a 3x4 dead block
+        frames[:, 12:14, 1:3, :] = 255  # a 2x2 dead block elsewhere
+        report = gel_check_pixels(frames, Thresholds())
+        assert report.kind == "pixels" and report.frames_used == 20
+        assert report.dead_pct == pytest.approx(16 / 320) and report.largest_cluster_px == 12
+        assert (
+            report.dead_elements is None and not report.flag
+        )  # 5% dead and 12 pixels are under the defaults
+        assert gel_check_pixels(frames, Thresholds(cluster_px=10)).flag
+        assert gel_check_pixels(frames, Thresholds(gel=0.04)).flag
+        assert gel_check_pixels(noisy_frames(), Thresholds()).dead_pct == 0.0
+
+    def test_pixels_skipped_without_variation(self) -> None:
+        frames = np.repeat(noisy_frames(1), 5, axis=0)
+        skipped = gel_check_pixels(frames, Thresholds())
+        assert isinstance(skipped, Skipped) and "do not vary" in skipped.skipped
+        assert isinstance(gel_check_pixels(noisy_frames(1), Thresholds()), Skipped)
+
+    def test_dead_elements_are_listed(self) -> None:
+        data = np.random.default_rng(0).normal(0.0, 0.01, (100, 8, 2)).astype(np.float32)
+        data[:, 3, :] = 0.0
+        data[:, 6, :] = -1.0
+        report = gel_check_elements(data, Thresholds())
+        assert report.kind == "elements" and report.dead_elements == [3, 6]
+        assert report.dead_pct == 0.25 and report.largest_cluster_px is None and report.frames_used == 100
+        assert report.flag
+        clean = gel_check_elements(np.random.default_rng(1).normal(size=(100, 8, 2)), Thresholds())
+        assert clean.dead_elements == [] and clean.dead_pct == 0.0 and not clean.flag
+        assert isinstance(gel_check_elements(np.zeros((100, 8, 2)), Thresholds()), Skipped)
+
+
+def step_signal(times: np.ndarray, onsets: list[tuple[float, float]], level: float = 1.0) -> np.ndarray:
+    signal = np.zeros(len(times))
+    for start, duration in onsets:
+        signal[(times >= start) & (times < start + duration)] = level
+    return signal
+
+
+class TestSkew:
+    def test_lag_is_recovered_to_a_frame(self) -> None:
+        tactile_times = np.arange(0.0, 4.0, 1 / 500)  # 500 Hz
+        tactile_events = np.abs(np.diff(step_signal(tactile_times, [(1.0, 0.4), (2.5, 0.3)])))
+        ref_times = np.arange(0.0, 4.0, 1 / 30)  # a camera at 30 fps, seeing the presses 40 ms later
+        motion = np.abs(np.diff(step_signal(ref_times, [(1.04, 0.4), (2.54, 0.3)]), prepend=0.0))
+        report = skew_check(
+            tactile_times[1:], tactile_events, ref_times, motion, "observation.images.cam", Thresholds()
+        )
+        assert report.reference == "observation.images.cam" and report.onsets == 4  # two onsets, two releases
+        assert report.lag_ms == pytest.approx(
+            -1000 / 15, abs=5.0
+        )  # the camera's first frame past 1.04 s is 1.067 s
+        assert report.lag_ms == pytest.approx(-40.0, abs=1000 / 30)  # within one frame of the truth
+        assert report.confidence > 0.5 and report.resolution_ms == pytest.approx(1000 / 30)
+        assert report.flag  # 67 ms is over the 50 ms default
+        assert not skew_check(
+            tactile_times[1:], tactile_events, ref_times, motion, "cam", Thresholds(skew=80.0)
+        ).flag
+
+    def test_unrelated_events_are_skipped_for_low_confidence(self) -> None:
+        tactile_times = np.arange(0.0, 4.0, 1 / 500)
+        tactile_events = np.abs(np.diff(step_signal(tactile_times, [(1.0, 0.4)])))
+        ref_times = np.arange(0.0, 4.0, 1 / 30)
+        motion = np.abs(np.diff(step_signal(ref_times, [(3.0, 0.4)]), prepend=0.0))  # two seconds away
+        skipped = skew_check(tactile_times[1:], tactile_events, ref_times, motion, "cam", Thresholds())
+        assert isinstance(skipped, Skipped) and skipped.skipped.startswith("no onset matched")
+        flat = skew_check(
+            tactile_times[1:], np.zeros(len(tactile_events)), ref_times, motion, "cam", Thresholds()
+        )
+        assert isinstance(flat, Skipped) and "no contact onset" in flat.skipped
+        assert isinstance(
+            skew_check(tactile_times[1:2], tactile_events[:1], ref_times, motion, "cam", Thresholds()),
+            Skipped,
         )

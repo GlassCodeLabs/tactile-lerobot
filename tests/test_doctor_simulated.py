@@ -10,14 +10,23 @@ import pytest
 
 pytest.importorskip("lerobot")
 
+from lerobot.datasets import LeRobotDataset  # noqa: E402
 from test_loader import plain_dataset  # noqa: E402
 
 from taxel.cli.main import main  # noqa: E402
+from taxel.dataset.features import feature_entry  # noqa: E402
 from taxel.dataset.sidecar import episode_path, read_episode, write_episode  # noqa: E402
+from taxel.dataset.writer import TactileDatasetWriter, tactile_features  # noqa: E402
 from taxel.doctor.loader import DoctorDataset  # noqa: E402
 from taxel.doctor.report import run_doctor, write_report  # noqa: E402
-from taxel.schema import DriftReport, HealthReport, IntegrityReport, Skipped, Thresholds  # noqa: E402
-from taxel.sensors import TactileReading  # noqa: E402
+from taxel.schema import DriftReport, HealthReport, IntegrityReport, Skipped, Thresholds, feature_key  # noqa: E402
+from taxel.sensors import (  # noqa: E402
+    SimulatedTactile,
+    SimulatedTactileConfig,
+    SimulatedVisuotactile,
+    SimulatedVisuotactileConfig,
+    TactileReading,
+)
 
 INSTANCE = "left_fingertip"
 BASE = {
@@ -151,7 +160,7 @@ class TestCleanRecording:
             assert isinstance(ep.drift, DriftReport) and not ep.drift.flag
             assert all(abs(s) < 0.05 for s in ep.drift.slope_per_s)
             assert all(abs(o) < 0.05 for o in ep.drift.offset) and ep.drift.rebaselines == []
-            assert isinstance(ep.gel, Skipped) and isinstance(ep.skew, Skipped)
+            assert ep.gel.kind == "elements" and isinstance(ep.skew, Skipped)
         first = episodes[0].drift
         assert first.no_contact_windows < first.windows  # the press is there, and is not drift
 
@@ -216,3 +225,149 @@ class TestPlainDataset:
         plain_dataset(root, use_videos=False)
         with pytest.raises(KeyError, match="no episodes \\[5\\]"):
             run_doctor(DoctorDataset(root), episodes=[5])
+
+
+# --- Two sensors sharing a press schedule: gel and skew ------------------------------------------------
+
+GEL_KEY = feature_key("gel")
+ARRAY_KEY = feature_key(INSTANCE)
+PRESSES = [(1.0, 0.5), (3.0, 0.5)]  # one press in each 2 s episode
+IMAGE_RATE = 60.0
+DELAY_FRAMES = 2  # the image sensor shows the press two of its frames late: 33 ms at 60 Hz
+DEAD_BLOCK = (10, 20, 6, 6)  # 36 pixels, over the 25-pixel cluster default
+
+
+def two_sensor_dataset(root: Path, *, faults: bool) -> Path:
+    """An array sensor through the writer and an image sensor fed to ``add_frame`` by hand, two episodes."""
+    array = SimulatedTactile(
+        SimulatedTactileConfig(
+            instance_id=INSTANCE,
+            declared_rate_hz=500,
+            n_elements=16,
+            seed=1,
+            contact_schedule=[(s, d, 4.0) for s, d in PRESSES],
+            dead_elements=[2, 5] if faults else None,
+        )
+    )
+    image = SimulatedVisuotactile(
+        SimulatedVisuotactileConfig(
+            instance_id="gel",
+            declared_rate_hz=IMAGE_RATE,
+            seed=2,
+            noise_std=6.0,  # camera noise well above the codec's flicker, as on a real gel image
+            contact_schedule=[(s, d, 80.0) for s, d in PRESSES],
+            dead_pixels=DEAD_BLOCK if faults else None,
+            transport_delay_s=DELAY_FRAMES / IMAGE_RATE if faults else 0.0,
+        )
+    )
+    array.connect()
+    image.connect()
+    features = {
+        **tactile_features([array], fps=30),
+        GEL_KEY: feature_entry(image.metadata(), image.config.shape, use_videos=True),
+    }
+    dataset = LeRobotDataset.create(
+        "taxel/two_sensors", fps=30, features=features, root=root, use_videos=True
+    )
+    writer = TactileDatasetWriter(
+        dataset, [array], baseline_s=0.2, apply_baseline=True, baseline_sample_every=50
+    )
+    writer.start_session("two")
+    for _ in range(2):
+        writer.start_episode()
+        for _ in range(60):
+            values = writer.frame()  # at the frame's nominal time
+            frame = image.read()  # the next image after it: fresh to within one image period
+            dataset.add_frame({**values, GEL_KEY: frame.data, "task": "press"})
+        writer.end_episode()
+        dataset.save_episode()
+        writer.idle()
+    array.disconnect()
+    image.disconnect()
+    writer.finalize()
+    dataset.finalize()
+    return root
+
+
+@pytest.fixture(scope="module")
+def two_faulty(tmp_path_factory) -> Path:
+    return two_sensor_dataset(tmp_path_factory.mktemp("two_faulty") / "ds", faults=True)
+
+
+@pytest.fixture(scope="module")
+def two_clean(tmp_path_factory) -> Path:
+    return two_sensor_dataset(tmp_path_factory.mktemp("two_clean") / "ds", faults=False)
+
+
+PERIOD_MS = 1000 / 30
+
+
+class TestTwoSensors:
+    def test_instances_and_references(self, two_faulty) -> None:
+        report = run_doctor(DoctorDataset(two_faulty), window_s=WINDOW_S)
+        assert sorted(report.instances) == ["gel", INSTANCE]
+        gel = report.instances["gel"]
+        assert gel.family == "visuotactile" and gel.metadata == "info" and not gel.sidecar
+        for e in (0, 1):
+            block = report.episodes[f"episode_{e:06d}"]
+            assert block[INSTANCE].skew.reference == GEL_KEY and block["gel"].skew.reference == ARRAY_KEY
+            assert isinstance(block["gel"].integrity, Skipped) and isinstance(block["gel"].drift, Skipped)
+
+    def test_gel_finds_the_dead_cluster_and_the_dead_elements(self, two_faulty) -> None:
+        report = run_doctor(DoctorDataset(two_faulty), window_s=WINDOW_S)
+        for e in (0, 1):
+            block = report.episodes[f"episode_{e:06d}"]
+            pixels = block["gel"].gel
+            assert pixels.kind == "pixels" and pixels.frames_used == 60
+            assert abs(pixels.largest_cluster_px - 36) <= 2 and pixels.flag
+            assert pixels.dead_pct == pytest.approx(36 / (48 * 64), abs=0.002)
+            elements = block[INSTANCE].gel
+            assert elements.kind == "elements" and elements.dead_elements == [2, 5]
+            assert elements.dead_pct == 0.125 and elements.flag
+
+    def test_skew_recovers_the_transport_delay_within_a_frame_period(self, two_faulty) -> None:
+        report = run_doctor(DoctorDataset(two_faulty), window_s=WINDOW_S)
+        delay_ms = DELAY_FRAMES / IMAGE_RATE * 1000
+        for e in (0, 1):
+            block = report.episodes[f"episode_{e:06d}"]
+            skew = block[INSTANCE].skew
+            assert skew.confidence > Thresholds().confidence and skew.onsets >= 1
+            assert skew.lag_ms == pytest.approx(-delay_ms, abs=PERIOD_MS + 5)  # the tactile stream leads
+            assert skew.resolution_ms == pytest.approx(PERIOD_MS, abs=1.0)
+            assert skew.flag == (abs(skew.lag_ms) > Thresholds().skew)
+            # The image instance has no sidecar, so its own check runs on the nominal timeline against the
+            # main table's mean-reduced copy of the array stream: both sides quantized, two frames of slack.
+            mirrored = block["gel"].skew
+            assert mirrored.lag_ms == pytest.approx(delay_ms, abs=2 * PERIOD_MS + 5)
+
+    def test_explicit_reference(self, two_faulty) -> None:
+        report = run_doctor(DoctorDataset(two_faulty), reference=GEL_KEY, episodes=[0], window_s=WINDOW_S)
+        block = report.episodes["episode_000000"]
+        assert block[INSTANCE].skew.reference == GEL_KEY
+        assert isinstance(block["gel"].skew, Skipped) and "itself" in block["gel"].skew.skipped
+        with pytest.raises(KeyError, match="not a feature"):
+            run_doctor(DoctorDataset(two_faulty), reference="observation.images.none")
+
+    def test_clean_pair_raises_nothing(self, two_clean) -> None:
+        report = run_doctor(DoctorDataset(two_clean), window_s=WINDOW_S)
+        for e in (0, 1):
+            block = report.episodes[f"episode_{e:06d}"]
+            pixels = block["gel"].gel
+            assert pixels.dead_pct < 0.005 and pixels.largest_cluster_px <= 4 and not pixels.flag
+            elements = block[INSTANCE].gel
+            assert elements.dead_elements == [] and not elements.flag
+            for name, slack in ((INSTANCE, PERIOD_MS + 5), ("gel", 2 * PERIOD_MS + 5)):
+                skew = block[name].skew
+                assert skew.confidence > Thresholds().confidence and abs(skew.lag_ms) <= slack
+                assert not skew.flag
+            array = block[INSTANCE]
+            assert not array.integrity.flag and not array.drift.flag and not array.saturation.flag
+
+
+class TestNoVideo:
+    def test_gel_reports_elements_and_skew_is_skipped(self, faulty) -> None:
+        _, episodes = checks(faulty)
+        for ep in episodes:
+            assert ep.gel.kind == "elements" and ep.gel.dead_elements == [] and not ep.gel.flag
+            assert isinstance(ep.skew, Skipped)
+            assert ep.skew.skipped == "no reference: the dataset has no camera and no other tactile instance"

@@ -865,8 +865,9 @@ class DriftReport(Block):
     where the baseline came from (``capture``, ``session``, ``none``), ``source`` what the
     raw level was read from (``samples``, ``raw_frames``, ``main_table``). ``frame_range``
     is the session baseline's, ``"not recorded"`` for a record without the key, ``"no seq"``
-    for a sensor without one. ``first_frame_zero`` names the case where the level at frame
-    0 is exactly zero on every channel.
+    for a sensor without one. ``candidates`` is how many pairs of quiet windows were tried
+    as drift lines (at most 300, a seeded sample beyond that). ``first_frame_zero`` names
+    the case where the level at frame 0 is exactly zero on every channel.
     """
 
     no_contact_level: list[float]
@@ -880,6 +881,7 @@ class DriftReport(Block):
     frame_range: list[int] | str | None
     windows: int
     no_contact_windows: int
+    candidates: int
     first_frame_zero: bool
     rebaselines: list[RebaselineEvent]
     flag: bool
@@ -1013,7 +1015,8 @@ class InstanceReport(Block):
 @dataclass
 class Thresholds(Block):
     """The thresholds a run flagged against. The defaults are conservative. ``max_gap_ms`` ``None``
-    means ten declared periods, resolved per instance and recorded in the framerate block."""
+    means ten declared periods, resolved per instance and recorded in the framerate block;
+    ``confidence`` is the cross-correlation peak a skew lag needs before it can be flagged."""
 
     drift: float = 0.05
     dropped: float = 0.02
@@ -1021,6 +1024,7 @@ class Thresholds(Block):
     gel: float = 0.05
     cluster_px: int = 25
     skew: float = 50.0
+    confidence: float = 0.5
     saturated: float = 0.01
     integrity: bool = True
 
