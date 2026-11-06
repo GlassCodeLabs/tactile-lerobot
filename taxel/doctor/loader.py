@@ -263,6 +263,7 @@ class DoctorDataset:
         )
         self._episodes = self._read_episodes()
         self._tables: dict[Path, Any] = {}
+        self._stamps: dict[int, NDArray[np.float64]] = {}
 
     # --- Episodes and features ------------------------------------------------------------------
 
@@ -362,6 +363,19 @@ class DoctorDataset:
         """LeRobot's ``timestamp`` column for the episode, as float64 seconds."""
         return np.asarray(self.column("timestamp", episode_index), dtype=np.float64).reshape(-1)
 
+    def frame_stamps(self, episode_index: int) -> NDArray[np.float64]:
+        """The times the episode's video frames are queried at: the ``timestamp`` column, cached.
+
+        LeRobot's writer puts ``frame_index / fps`` there and encodes the video to match. A
+        dataset that keeps the camera's real presentation times instead (a 29.97 Hz video under
+        a declared 30 fps, for one) stores them in the same column, and its video can only be
+        read at those times. The column plus the episode's ``from_timestamp`` is what LeRobot
+        itself asks the decoder for, so it is what :meth:`frames` asks for too.
+        """
+        if episode_index not in self._stamps:
+            self._stamps[episode_index] = self.timestamps(episode_index)
+        return self._stamps[episode_index]
+
     def episode_inputs(self, instance: InstanceSource, episode_index: int) -> EpisodeInputs:
         """Collect the checks' inputs for one instance in one episode; what is absent goes in ``missing``."""
         missing: list[str] = []
@@ -443,7 +457,7 @@ class DoctorDataset:
         except ImportError as e:
             raise missing_dependency("LeRobot", e, LEROBOT_EXTRA) from None
         path, from_ts = row.videos[key]
-        stamps = [from_ts + int(i) / self.fps for i in indices]
+        stamps = (from_ts + self.frame_stamps(episode_index)[indices]).tolist()
         tensor = decode_video_frames(path, stamps, tolerance_s=1e-4, backend="pyav", return_uint8=True)
         return np.ascontiguousarray(tensor.numpy().transpose(0, 2, 3, 1))
 

@@ -263,6 +263,43 @@ class TestPlainDataset:
             theirs = reloaded[12 + k]["observation.tactile.gel"].permute(1, 2, 0).numpy()
             np.testing.assert_array_equal(frames[i], np.rint(theirs * 255).astype(np.uint8))
 
+    def test_video_frames_are_queried_at_the_stored_timestamps(
+        self, plain_video, tmp_path, monkeypatch
+    ) -> None:
+        """A dataset whose ``timestamp`` column holds the video's real presentation times, a 29.97 Hz
+        video under a declared 30 fps, is read at those times, as LeRobot itself reads it, not at
+        ``frame_index / fps``: by frame three the two differ by more than the decoder's tolerance."""
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        import torch
+        from lerobot.datasets import video_utils
+
+        root, _ = plain_video
+        copy = tmp_path / "pts"
+        shutil.copytree(root, copy)
+        path = copy / "data" / "chunk-000" / "file-000.parquet"
+        table = pq.read_table(path)
+        frame_index = np.asarray(table.column("frame_index").to_numpy(), dtype=np.float64)
+        real = (frame_index * 1001 / 30000).astype(np.float32)
+        table = table.set_column(table.column_names.index("timestamp"), "timestamp", pa.array(real))
+        pq.write_table(table, path)
+
+        ds = DoctorDataset(copy)
+        np.testing.assert_allclose(ds.frame_stamps(1), real[12:], rtol=0, atol=1e-7)
+        assert ds.frame_stamps(1) is ds.frame_stamps(1)  # read once
+        asked: list[list[float]] = []
+
+        def fake_decode(video_path, timestamps, tolerance_s, backend, return_uint8):
+            asked.append(list(timestamps))
+            return torch.zeros((len(timestamps), 3, 32, 40), dtype=torch.uint8)
+
+        monkeypatch.setattr(video_utils, "decode_video_frames", fake_decode)
+        frames = ds.frames("observation.images.cam", 1, indices=[11, 0, 5])
+        assert frames.shape == (3, 32, 40, 3)
+        from_ts = ds.episode(1).videos["observation.images.cam"][1]
+        np.testing.assert_allclose(asked, [from_ts + real[12:][[0, 5, 11]]], rtol=0, atol=1e-6)
+        assert abs(asked[0][2] - (from_ts + 11 / 30)) > 1e-4  # the nominal time would miss the frame
+
     def test_image_dtype_frames_decode_exactly(self, plain_image) -> None:
         root, fed = plain_image
         ds = DoctorDataset(root)
