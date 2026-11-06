@@ -817,14 +817,15 @@ class FilesCheck(Block):
 
     ``capture_at_zero`` is ``None`` when no baseline is applied. ``counters`` holds when the
     session's ``frames.received`` is at least the native rows and ``frames.dropped`` at least
-    the ``seq`` gaps inside the session's files.
+    the ``seq`` gaps inside the session's files; ``None`` when the record has no counters or a
+    file is missing.
     """
 
     native: bool
     baseline: bool
     capture_at_zero: bool | None
     origins: bool
-    counters: bool
+    counters: bool | None
     flag: bool
 
 
@@ -856,9 +857,11 @@ class DriftReport(Block):
     """The drift check: the no-contact level against the baseline in force, per channel.
 
     ``no_contact_level`` and ``level_change`` come from the episode alone (the quiet-window
-    level at the start, and its change over the episode). ``offset`` is that level against
-    the baseline in force at the end of the episode, or ``skipped`` when there is no
-    baseline; ``offset_pct_range`` scales it by ``range`` when known. ``baseline`` says
+    level at the start, mean over elements, and its change over the episode, the element of
+    largest change). ``offset`` is that level against the baseline in force at the last
+    no-contact window, per channel the element of largest magnitude, or ``skipped`` when there is
+    no baseline; ``offset_pct_range`` scales it by ``range`` when known; ``slope_per_s`` is
+    the median element's drift rate. ``baseline`` says
     where the baseline came from (``capture``, ``session``, ``none``), ``source`` what the
     raw level was read from (``samples``, ``raw_frames``, ``main_table``). ``frame_range``
     is the session baseline's, ``"not recorded"`` for a record without the key, ``"no seq"``
@@ -902,9 +905,9 @@ class GapHistogram(Block):
 @dataclass
 class FramerateReport(Block):
     """The framerate check. ``source`` is ``sidecar`` (native ``host_ts`` and ``seq``) or
-    ``main_table``; ``timestamps`` says whether they were measured (``host_ts``) or are LeRobot's
-    nominal ``frame_index / fps`` (``nominal``), which says nothing about the sensor. ``frames``
-    is the session's counters when known."""
+    ``main_table``; ``timestamps`` says whether they were ``measured`` or are LeRobot's nominal
+    ``frame_index / fps`` (``nominal``), which says nothing about the sensor. ``frames`` is the
+    session's counters when known."""
 
     effective_hz: float
     declared_hz: float | None
@@ -919,7 +922,7 @@ class FramerateReport(Block):
 
     def __post_init__(self) -> None:
         _require_one_of(self.source, ("sidecar", "main_table"), "framerate.source")
-        _require_one_of(self.timestamps, ("host_ts", "nominal"), "framerate.timestamps")
+        _require_one_of(self.timestamps, ("measured", "nominal"), "framerate.timestamps")
 
 
 @dataclass

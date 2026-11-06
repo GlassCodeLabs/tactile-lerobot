@@ -321,7 +321,7 @@ This project therefore records through the public API with its own `taxel record
                       "max_gap_threshold_ms": 109.9,
                       "gap_histogram": {"edges_periods": [1.5, 2.5, 3.5], "counts": [600, 9, 2, 0]},
                       "frames": {"received": 30412, "dropped": 7, "overflowed": 0},
-                      "source": "sidecar", "timestamps": "host_ts", "flag": false},
+                      "source": "sidecar", "timestamps": "measured", "flag": false},
         "saturation": {"saturated_pct": [0.0, 0.0, 0.0], "limit": "observed", "min": [-0.4, -0.5, -0.1],
                        "max": [3.1, 2.9, 24.8], "confidence": "low", "source": "sidecar", "flag": false},
         "gel": {"skipped": "no visuotactile feature"},

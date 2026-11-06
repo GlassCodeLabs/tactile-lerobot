@@ -637,7 +637,7 @@ HEALTH = {
                     "gap_histogram": {"edges_periods": [1.5, 2.5, 3.5], "counts": [600, 9, 2, 0]},
                     "frames": {"received": 30412, "dropped": 7, "overflowed": 0},
                     "source": "sidecar",
-                    "timestamps": "host_ts",
+                    "timestamps": "measured",
                     "flag": False,
                 },
                 "saturation": {
