@@ -12,7 +12,7 @@ An open-source LeRobot plugin for tactile sensors, plus a health-check CLI for t
 - `taxel doctor`: scores every episode for baseline drift, dead pixels and gel condition, dropped frames, saturation and clock skew against the video stream, and writes a JSON report you can diff across sessions
 - MCAP export so Foxglove and Rerun open tactile data alongside video and joints
 
-**Status:** the `taxel` package contains the schema dataclasses ([SCHEMA.md](SCHEMA.md)), the `TactileSensor` base class and a simulated backend with injectable faults ([docs/sensors.md](docs/sensors.md)), the dataset writer and the `taxel record` command ([docs/recording.md](docs/recording.md)); the health checks are the next component.
+**Status:** the `taxel` package contains the schema dataclasses ([SCHEMA.md](SCHEMA.md)), the `TactileSensor` base class and simulated backends with injectable faults ([docs/sensors.md](docs/sensors.md)), the dataset writer and the `taxel record` command ([docs/recording.md](docs/recording.md)), and the `taxel doctor` integrity and health checks ([docs/doctor.md](docs/doctor.md)); MCAP export is the next component.
 
 [docs/datasets.md](docs/datasets.md) lists public tactile datasets and how each maps onto the schema.
 
