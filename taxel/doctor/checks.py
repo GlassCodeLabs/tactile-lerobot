@@ -237,12 +237,16 @@ def saturation_check(
     source: str,
     thresholds: Thresholds,
 ) -> SaturationReport:
-    """Per channel, the fraction of samples at or beyond the limit.
+    """Per channel, the fraction of samples at or beyond the limit, and at each limit separately.
 
     ``data`` is ``(n, E, C)``, the raw readings (reconstructed when a baseline was
     subtracted, since a limit applies to what the sensor read). With ``limits``
-    (``(min, max)`` per channel from ``range``) the result is ``declared``; without, the
-    observed extremes stand in, with ``confidence`` ``low``.
+    (``(min, max)`` per channel from ``range``) the result is ``declared`` and flagged on
+    ``saturated_pct``. Without, the observed extremes stand in with ``confidence`` ``low``
+    and the check never flags: a stream rests at an extreme as readily as it clips there
+    (zero with nothing touching, a 0/1 contact flag, an ADC floor), so ``at_min_pct`` and
+    ``at_max_pct`` are what a reader looks at, and a declared ``range`` is what makes the
+    fraction a saturation.
     """
     values = np.asarray(data, dtype=np.float64).reshape(len(data), -1, data.shape[-1])
     if limits is not None:
@@ -254,16 +258,21 @@ def saturation_check(
         lo, hi = values.min(axis=(0, 1)), values.max(axis=(0, 1))
         limit, confidence = "observed", "low"
         slack = np.zeros_like(lo)
-    at_limit = (values <= lo + slack) | (values >= hi - slack)
-    pct = at_limit.mean(axis=(0, 1)) if values.size else np.zeros(values.shape[-1])
+    at_min, at_max = values <= lo + slack, values >= hi - slack
+    none = np.zeros(values.shape[-1])
+    pct = (at_min | at_max).mean(axis=(0, 1)) if values.size else none
+    min_pct = at_min.mean(axis=(0, 1)) if values.size else none
+    max_pct = at_max.mean(axis=(0, 1)) if values.size else none
     return SaturationReport(
         saturated_pct=[float(p) for p in pct],
+        at_min_pct=[float(p) for p in min_pct],
+        at_max_pct=[float(p) for p in max_pct],
         limit=limit,
         min=[float(v) for v in lo],
         max=[float(v) for v in hi],
         confidence=confidence,
         source=source,
-        flag=bool(np.any(pct > thresholds.saturated)),
+        flag=limits is not None and bool(np.any(pct > thresholds.saturated)),
     )
 
 

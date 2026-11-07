@@ -646,6 +646,8 @@ HEALTH = {
                 },
                 "saturation": {
                     "saturated_pct": [0.0, 0.0, 0.0],
+                    "at_min_pct": [0.0, 0.0, 0.0],
+                    "at_max_pct": [0.0, 0.0, 0.0],
                     "limit": "observed",
                     "min": [-0.4, -0.5, -0.1],
                     "max": [3.1, 2.9, 24.8],

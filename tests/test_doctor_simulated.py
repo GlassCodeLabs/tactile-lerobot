@@ -226,6 +226,56 @@ class TestPlainDataset:
         plain_dataset(root, use_videos=False)
         with pytest.raises(KeyError, match="no episodes \\[5\\]"):
             run_doctor(DoctorDataset(root), episodes=[5])
+        with pytest.raises(KeyError, match="unknown checks \\['noise'\\]"):
+            run_doctor(DoctorDataset(root), checks=["drift", "noise"])
+
+    def test_no_instance_is_an_error(self, tmp_path) -> None:
+        from lerobot.datasets import LeRobotDataset
+
+        root = tmp_path / "none"
+        features = {"observation.state": {"dtype": "float32", "shape": [3], "names": None}}
+        dataset = LeRobotDataset.create("taxel/none", fps=30, features=features, root=root, use_videos=False)
+        for _ in range(6):
+            dataset.add_frame({"observation.state": np.zeros(3, np.float32), "task": "t"})
+        dataset.save_episode()
+        dataset.finalize()
+        with pytest.raises(KeyError, match="no tactile instance.*--guess"):
+            run_doctor(DoctorDataset(root))
+
+    def test_skew_reference_is_the_scene_camera_unless_asked_for_all(self, tmp_path, monkeypatch) -> None:
+        """With a camera in the dataset every instance correlates against it, so one stream serves them
+        all; ``all`` searches every video stream for the most motion, which the two-sensor case needs."""
+        from taxel.doctor import report as report_module
+
+        root = tmp_path / "plain"
+        plain_dataset(root, use_videos=False)
+        asked: list[str] = []
+        real = report_module.skew_check
+
+        def spy(tactile_times, tactile_events, reference_times, reference_events, reference_key, *rest):
+            asked.append(reference_key)
+            return real(
+                tactile_times, tactile_events, reference_times, reference_events, reference_key, *rest
+            )
+
+        monkeypatch.setattr(report_module, "skew_check", spy)
+        run_doctor(DoctorDataset(root), window_s=0.1, checks=["skew"])
+        assert asked == ["observation.images.cam"] * 4  # two instances, two episodes
+        asked.clear()
+        run_doctor(DoctorDataset(root), window_s=0.1, checks=["skew"], reference="all")
+        assert len(asked) == 4 and set(asked) <= {"observation.images.cam", "observation.tactile.gel"}
+        assert asked[1] == "observation.images.cam"  # the gel instance's only other image feature
+
+    def test_checks_selects_what_runs(self, tmp_path) -> None:
+        root = tmp_path / "plain"
+        plain_dataset(root, use_videos=False)
+        report = run_doctor(DoctorDataset(root), window_s=0.1, checks=["framerate", "gel"])
+        probe = report.episodes["episode_000001"]["probe"]
+        assert probe.framerate.source == "main_table" and probe.gel.kind == "elements"
+        for name in ("integrity", "drift", "saturation", "skew"):
+            assert getattr(probe, name) == Skipped("not selected")
+        gel = report.episodes["episode_000001"]["gel"]
+        assert gel.gel.kind == "pixels" and gel.skew == Skipped("not selected")
 
 
 # --- Two sensors sharing a press schedule: gel and skew ------------------------------------------------

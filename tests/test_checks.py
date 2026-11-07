@@ -112,15 +112,29 @@ class TestSaturation:
         assert report.limit == "declared" and report.confidence == "declared" and report.source == "sidecar"
         assert report.min == [-3.0, -3.0] and report.max == [3.0, 3.0]
         assert report.saturated_pct == [0.025, 0.01] and report.flag
+        assert report.at_min_pct == [0.0, 0.01] and report.at_max_pct == [0.025, 0.0]
         assert not saturation_check(data, (lo, hi), "sidecar", Thresholds(saturated=0.03)).flag
+        pinned = np.full((50, 4, 1), 3.0, dtype=np.float32)  # every sample at a declared ceiling
+        pinned[:25] = 0.0
+        report = saturation_check(pinned, (np.array([-3.0]), np.array([3.0])), "sidecar", Thresholds())
+        assert report.saturated_pct == [0.5] and report.at_max_pct == [0.5] and report.flag
 
-    def test_observed_extremes_with_low_confidence(self) -> None:
+    def test_observed_extremes_are_reported_and_never_flagged(self) -> None:
         data = np.random.default_rng(0).normal(0.0, 0.5, (100, 4, 2)).astype(np.float32)
         report = saturation_check(data, None, "main_table", Thresholds())
         assert report.limit == "observed" and report.confidence == "low" and report.source == "main_table"
         assert report.min == [float(data[:, :, c].min()) for c in range(2)]
         assert report.max == [float(data[:, :, c].max()) for c in range(2)]
         assert report.saturated_pct == [2 / 400, 2 / 400] and not report.flag
+        assert report.at_min_pct == [1 / 400, 1 / 400] and report.at_max_pct == [1 / 400, 1 / 400]
+        # A 0/1 contact flag, or a stream that rests at zero: at an observed extreme in nearly every
+        # sample, which says where the data rests, not that the sensor clips.
+        contact = np.random.default_rng(1).integers(0, 2, (100, 17, 1)).astype(np.float32)
+        contact[:90] = 0.0
+        report = saturation_check(contact, None, "main_table", Thresholds())
+        assert report.saturated_pct == [1.0] and report.at_min_pct[0] > 0.9 and not report.flag
+        # The same values against a declared range still flag.
+        assert saturation_check(contact, (np.array([0.0]), np.array([1.0])), "main_table", Thresholds()).flag
 
 
 class TestIntegrity:

@@ -9,13 +9,15 @@ import pytest
 
 from taxel.cli.doctor import (
     UsageError,
+    format_guess,
     format_report,
     main,
+    parse_checks,
     parse_episodes,
     parse_fail_on,
     read_thresholds,
 )
-from taxel.schema import HealthReport, Thresholds
+from taxel.schema import CHECK_NAMES, HealthReport, Skipped, Thresholds
 
 needs_lerobot = pytest.mark.skipif(importlib.util.find_spec("lerobot") is None, reason="needs taxel[lerobot]")
 
@@ -42,6 +44,27 @@ class TestParsing:
             parse_fail_on("drift=high", Thresholds())
         with pytest.raises(UsageError, match="takes no value"):
             parse_fail_on("integrity=1", Thresholds())
+
+    def test_checks(self) -> None:
+        assert parse_checks("skew, drift") == ["drift", "skew"]  # report order
+        assert parse_checks("integrity,drift,framerate,saturation,gel,skew") == list(CHECK_NAMES)
+        with pytest.raises(UsageError, match="unknown \\['noise'\\]"):
+            parse_checks("drift,noise")
+        with pytest.raises(UsageError, match="no check given"):
+            parse_checks(" , ")
+
+    def test_guess_listing(self) -> None:
+        features = {
+            "observation.state": {"dtype": "float32", "shape": [6]},
+            "observation.wrench": {"dtype": "float32", "shape": [6]},
+            "observation.images.tactile_left": {"dtype": "video", "shape": [240, 320, 3]},
+        }
+        text = format_guess(features)
+        assert "  observation.wrench  float32  [6]" in text
+        assert "  observation.images.tactile_left  video  [240, 320, 3]" in text
+        assert text.endswith("--instances observation.wrench,observation.images.tactile_left")
+        assert "observation.state" not in text
+        assert format_guess({"observation.state": features["observation.state"]}).startswith("no feature key")
 
     def test_thresholds_file(self, tmp_path) -> None:
         path = tmp_path / "t.json"
@@ -87,6 +110,18 @@ class TestParsing:
         assert text.rstrip().endswith(
             "2 episode(s), 1 instance(s), 0 flag(s); ! marks a flag, - a skipped check"
         )
+        # The cells of a plain dataset: a measured rate to two decimals, so 29.97 Hz is not 30.0, and
+        # the observed extremes shown at each end, never flagged.
+        checks = plain["episodes"]["episode_000012"]["left_fingertip"]
+        checks["framerate"].update(dropped_pct=None, frames=None, source="main_table", effective_hz=29.97)
+        checks["saturation"].update(at_min_pct=[0.915, 0.0, 0.0], at_max_pct=[0.0, 0.001, 0.0])
+        text = format_report(HealthReport.from_dict(plain))
+        assert "29.97 Hz, gap 31 ms" in text and "min 91.5%, max 0.1% (observed)" in text
+        checks["framerate"]["timestamps"] = "nominal"
+        checks["saturation"].update(limit="declared", confidence="declared", saturated_pct=[0.02, 0, 0])
+        checks["saturation"]["flag"] = True
+        text = format_report(HealthReport.from_dict(plain))
+        assert "nominal, gap 31 ms" in text and "2.00% (declared) !" in text
 
     def test_usage(self, capsys) -> None:
         assert main([]) == 2
@@ -164,3 +199,33 @@ class TestRun:
         assert "no episodes [7]" in capsys.readouterr().err
         assert main([str(faulty), "--no-write", "--reference", "observation.images.none"]) == 2
         assert "not a feature" in capsys.readouterr().err
+        assert main([str(faulty), "--no-write", "--checks", "drift,noise"]) == 2
+        assert "--checks: unknown ['noise']" in capsys.readouterr().err
+
+    def test_checks_selects_what_runs(self, faulty, tmp_path, capsys) -> None:
+        out_path = tmp_path / "report.json"
+        assert (
+            main([str(faulty), "--no-write", "--checks", "framerate,saturation", "--json", str(out_path)])
+            == 0
+        )
+        out = capsys.readouterr().out
+        assert "skipped drift: not selected (2 episodes)" in out and "skipped gel: not selected" in out
+        report = HealthReport.from_dict(json.loads(out_path.read_text()))
+        first = report.episodes["episode_000000"]["left_fingertip"]
+        assert first.framerate.flag and first.saturation.flag
+        for name in ("integrity", "drift", "gel", "skew"):
+            assert (
+                isinstance(getattr(first, name), Skipped) and getattr(first, name).skipped == "not selected"
+            )
+        assert main([str(faulty), "--no-write", "--checks", "drift", "--fail-on", "dropped"]) == 0  # not run
+
+    def test_guess_lists_candidates_and_exits(self, faulty, capsys) -> None:
+        (faulty / "tactile" / "health.json").unlink(missing_ok=True)
+        assert main([str(faulty), "--guess"]) == 0
+        out = capsys.readouterr().out
+        assert "observation.tactile.left_fingertip  float32  [16, 3]" in out
+        assert out.rstrip().endswith("--instances observation.tactile.left_fingertip")
+        assert not (faulty / "tactile" / "health.json").exists()
+
+    def test_reference_all_is_accepted(self, faulty) -> None:
+        assert main([str(faulty), "--no-write", "--reference", "all", "--checks", "skew"]) == 0

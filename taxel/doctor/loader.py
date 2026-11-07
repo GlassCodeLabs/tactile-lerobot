@@ -15,8 +15,8 @@ import io
 import json
 import os
 import re
-from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import MISSING, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -45,12 +45,31 @@ from taxel.schema import (
     read_session_meta_lenient,
 )
 
-__all__ = ["DoctorDataset", "EpisodeInputs", "EpisodeRow", "InstanceSource", "resolve_root", "tactile_keys"]
+__all__ = [
+    "GUESS_WORDS",
+    "DoctorDataset",
+    "EpisodeInputs",
+    "EpisodeRow",
+    "InstanceSource",
+    "candidate_keys",
+    "resolve_root",
+    "sample_indices",
+    "tactile_keys",
+]
 
 BARE_TACTILE_KEY = FEATURE_KEY_PREFIX.rstrip(".")
 """``observation.tactile`` without an instance id, as some public datasets name their one feature."""
 
+GUESS_WORDS = ("tactile", "touch", "wrench", "force")
+"""Words in a feature key that make it a candidate tactile stream for :func:`candidate_keys`."""
+
 _IMAGE_DTYPES = ("video", "image")
+_ARRAY_DTYPES = ("float32", "float64")
+
+_REQUIRED_INFO_KEYS = frozenset(
+    f.name for f in fields(TactileInfo) if f.default is MISSING and f.default_factory is MISSING
+)
+"""The keys a tactile ``info`` block cannot lack; a block with none of them is not an instance's."""
 
 
 # --- Discovery -----------------------------------------------------------------------------------
@@ -94,6 +113,30 @@ def _instance_id_of(key: str) -> str:
         if key.startswith(prefix):
             return key[len(prefix) :]
     return key
+
+
+def candidate_keys(features: Mapping[str, Any]) -> list[str]:
+    """Feature keys that look like a tactile stream by name, for ``--guess``.
+
+    A float array of one or two dimensions, or a video or image feature, whose key
+    contains one of :data:`GUESS_WORDS`; in feature order. Public datasets rarely name
+    their tactile stream ``observation.tactile.*``, so this is what a first run passes to
+    ``--instances``.
+    """
+    out = []
+    for key, entry in features.items():
+        dtype, shape = entry.get("dtype"), entry.get("shape") or ()
+        array = dtype in _ARRAY_DTYPES and 1 <= len(shape) <= 2
+        if any(word in key.lower() for word in GUESS_WORDS) and (array or dtype in _IMAGE_DTYPES):
+            out.append(key)
+    return out
+
+
+def sample_indices(n: int, k: int) -> NDArray[np.int64]:
+    """``k`` distinct frame indices spread evenly over ``range(n)``, or all of them when ``k >= n``."""
+    if k >= n:
+        return np.arange(n, dtype=np.int64)
+    return np.unique(np.linspace(0, n - 1, k).round().astype(np.int64))
 
 
 def resolve_root(dataset: str | Path) -> Path:
@@ -294,7 +337,7 @@ class DoctorDataset:
         dtype, shape = str(entry.get("dtype")), tuple(int(d) for d in entry.get("shape") or ())
         if dtype in _IMAGE_DTYPES:
             kind = "image"
-        elif dtype in ("float32", "float64") and 1 <= len(shape) <= 2:
+        elif dtype in _ARRAY_DTYPES and 1 <= len(shape) <= 2:
             kind = "array"
         else:
             raise SchemaError(f"{key}: a tactile instance is a float array or an image, not {dtype} {shape}")
@@ -312,7 +355,9 @@ class DoctorDataset:
     ) -> tuple[TactileInfo | None, str, str | None, list[str]]:
         block = entry.get("info")
         own = {k: v for k, v in (block or {}).items() if not k.startswith("video.")}
-        if not own:
+        if not own.keys() & _REQUIRED_INFO_KEYS:
+            # LeRobot writes keys of its own beside ``video.*`` on every video feature (``has_audio``,
+            # ``is_depth_map``); a block with none of the tactile block's required keys is core's.
             return None, "none", None, []
         try:
             info, unknown = read_info_lenient(block)
@@ -447,9 +492,7 @@ class DoctorDataset:
             if indices.size and (indices[0] < 0 or indices[-1] >= row.length):
                 raise IndexError(f"frame indices must lie in range({row.length})")
         else:
-            indices = np.arange(row.length)
-            if max_frames is not None and max_frames < row.length:
-                indices = np.unique(np.linspace(0, row.length - 1, max_frames).round().astype(int))
+            indices = sample_indices(row.length, row.length if max_frames is None else max_frames)
         if dtype == "image":
             return self._png_frames(key, episode_index, indices)
         try:
@@ -461,14 +504,82 @@ class DoctorDataset:
         tensor = decode_video_frames(path, stamps, tolerance_s=1e-4, backend="pyav", return_uint8=True)
         return np.ascontiguousarray(tensor.numpy().transpose(0, 2, 3, 1))
 
+    def iter_frames(
+        self, key: str, episode_index: int, rgb_at: Iterable[int] = ()
+    ) -> Iterator[tuple[int, NDArray[np.float32], NDArray[np.uint8] | None]]:
+        """Decode the episode's frames once, in order, as ``(frame_index, gray, rgb)`` triples.
+
+        ``gray`` is the frame in grayscale, float32 ``(height, width)``: the decoder's own
+        gray conversion for a video, the channel mean for a PNG frame. ``rgb`` is the uint8
+        ``(height, width, 3)`` frame, the same pixels :meth:`frames` returns, given at the
+        indices in ``rgb_at`` and ``None`` elsewhere. One sequential pass is several times
+        cheaper than decoding by timestamp in chunks: the decoder opens and seeks once, and the
+        colour conversion, which costs more than the decoding, runs only where it is asked for.
+        A video frame is matched to its row by order from the episode's first frame, and its
+        presentation time is checked against the ``timestamp`` column to half a period.
+
+        Raises:
+            ImportError: Naming the extra when the decoder is not installed.
+            SchemaError: If the video's frames do not line up with the table's rows.
+        """
+        row = self.episode(episode_index)
+        dtype = self.features[key].get("dtype")
+        if dtype not in _IMAGE_DTYPES:
+            raise SchemaError(f"{key} is {dtype!r}, not a video or image feature")
+        wanted = {int(i) for i in rgb_at}
+        if dtype == "image":
+            rows = self.column(key, episode_index)
+            for k in range(row.length):
+                rgb = self._png_frame(rows[k])
+                yield k, rgb.astype(np.float32).mean(axis=-1), rgb if k in wanted else None
+            return
+        try:
+            import av
+        except ImportError as e:
+            raise missing_dependency("PyAV", e, LEROBOT_EXTRA) from None
+        path, from_ts = row.videos[key]
+        stamps = from_ts + self.frame_stamps(episode_index)
+        slack = 0.5 / self.fps
+        k = 0
+        with av.open(str(path)) as container:
+            stream = container.streams.video[0]
+            stream.thread_type = "AUTO"
+            # The nearest keyframe at or before the first frame, as LeRobot's own decoder seeks.
+            offset = round(from_ts / stream.time_base) - 1
+            container.seek(offset, backward=True, any_frame=False, stream=stream)
+            for frame in container.decode(stream):
+                if frame.pts is None:
+                    continue
+                at = float(frame.pts * stream.time_base)
+                if at < stamps[0] - slack:
+                    continue
+                if abs(at - stamps[k]) > slack:
+                    raise SchemaError(
+                        f"{key} episode {episode_index}: video frame at {at:.4f} s where the table's "
+                        f"frame {k} is at {stamps[k]:.4f} s"
+                    )
+                gray = frame.to_ndarray(format="gray").astype(np.float32)
+                rgb = frame.to_ndarray(format="rgb24") if k in wanted else None
+                yield k, gray, rgb
+                k += 1
+                if k >= row.length:
+                    break
+        if k < row.length:
+            raise SchemaError(
+                f"{key} episode {episode_index}: the video ends after {k} of {row.length} frames"
+            )
+
     def _png_frames(self, key: str, episode_index: int, indices: NDArray[np.int64]) -> NDArray[np.uint8]:
+        rows = self.column(key, episode_index)
+        return np.stack([self._png_frame(rows[int(i)]) for i in indices])
+
+    @staticmethod
+    def _png_frame(cell: Mapping[str, Any]) -> NDArray[np.uint8]:
         try:
             from PIL import Image
         except ImportError as e:
             raise missing_dependency("Pillow", e, LEROBOT_EXTRA) from None
-        rows = self.column(key, episode_index)
-        images = [np.asarray(Image.open(io.BytesIO(rows[int(i)]["bytes"])).convert("RGB")) for i in indices]
-        return np.stack(images).astype(np.uint8)
+        return np.asarray(Image.open(io.BytesIO(cell["bytes"])).convert("RGB")).astype(np.uint8)
 
     # --- Internals ----------------------------------------------------------------------------------
 

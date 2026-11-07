@@ -3,15 +3,17 @@
 ::
 
     taxel doctor <dataset_root_or_repo_id> [--episodes 0,3-5] [--instances left_fingertip]
-        [--reference observation.images.front] [--json path]
+        [--checks drift,framerate] [--reference observation.images.front | all] [--json path]
         [--fail-on drift=0.05,dropped=0.02,gel=0.05,skew=50,saturated=0.01,integrity]
-        [--thresholds file.json] [--no-write]
+        [--thresholds file.json] [--no-write] [--guess]
 
 The report goes to ``tactile/health.json`` inside the dataset unless ``--no-write`` is given,
 and to ``--json`` when given; a per-instance table is printed either way. The exit code is 0
 when no ``--fail-on`` threshold is hit, 1 when one is, 2 on a usage error. Without
 ``--fail-on`` a flag is an annotation only (SCHEMA.md, principle 6) and the exit code is 0.
-Reading the dataset needs ``taxel[doctor]``; the image checks need ``taxel[lerobot]``.
+``--guess`` lists the feature keys that look like tactile streams by name and exits, for a
+dataset whose streams are not under ``observation.tactile``. Reading the dataset needs
+``taxel[doctor]``; the image checks need ``taxel[lerobot]``.
 """
 
 from __future__ import annotations
@@ -23,9 +25,10 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from taxel.doctor.loader import DoctorDataset, resolve_root
-from taxel.doctor.report import run_doctor, write_report
+from taxel.doctor.loader import DoctorDataset, candidate_keys, resolve_root
+from taxel.doctor.report import REFERENCE_ALL, run_doctor, write_report
 from taxel.schema import (
+    CHECK_NAMES,
     HealthReport,
     InstanceChecks,
     SchemaError,
@@ -33,7 +36,15 @@ from taxel.schema import (
     Thresholds,
 )
 
-__all__ = ["FAIL_ON_CHECKS", "format_report", "main", "parse_episodes", "parse_fail_on"]
+__all__ = [
+    "FAIL_ON_CHECKS",
+    "format_guess",
+    "format_report",
+    "main",
+    "parse_checks",
+    "parse_episodes",
+    "parse_fail_on",
+]
 
 FAIL_ON_CHECKS = {
     "drift": "drift",
@@ -72,6 +83,33 @@ def parse_episodes(spec: str) -> list[int]:
     if not out:
         raise UsageError("--episodes: no episode given")
     return sorted(set(out))
+
+
+def parse_checks(spec: str) -> list[str]:
+    """``"drift,framerate"`` to the checks to run, in report order."""
+    names = {s.strip() for s in spec.split(",") if s.strip()}
+    unknown = sorted(names - set(CHECK_NAMES))
+    if unknown:
+        raise UsageError(f"--checks: unknown {unknown}; the checks are {', '.join(CHECK_NAMES)}")
+    if not names:
+        raise UsageError("--checks: no check given")
+    return [c for c in CHECK_NAMES if c in names]
+
+
+def format_guess(features: dict) -> str:
+    """The ``--guess`` listing: candidate tactile feature keys and the ``--instances`` that names them."""
+    found = candidate_keys(features)
+    if not found:
+        return (
+            "no feature key contains tactile, touch, wrench or force; "
+            "name the stream with --instances <feature key>"
+        )
+    lines = ["candidate tactile features, by name:"]
+    for key in found:
+        entry = features[key]
+        lines.append(f"  {key}  {entry.get('dtype')}  {list(entry.get('shape') or ())}")
+    lines.append("run again with --instances " + ",".join(found))
+    return "\n".join(lines)
 
 
 def parse_fail_on(spec: str, thresholds: Thresholds) -> tuple[Thresholds, set[str]]:
@@ -211,9 +249,11 @@ def _cell(checks: InstanceChecks, check: str, skipped: dict[str, dict[str, int]]
     if check == "framerate":
         if value.dropped_pct is not None:
             return f"{value.dropped_pct:.1%} dropped, gap {value.max_gap_ms:.0f} ms{mark}"
-        note = "nominal" if value.timestamps == "nominal" else f"{value.effective_hz:.1f} Hz"
+        note = "nominal" if value.timestamps == "nominal" else f"{value.effective_hz:.2f} Hz"
         return f"{note}, gap {value.max_gap_ms:.0f} ms{mark}"
     if check == "saturation":
+        if value.limit == "observed":
+            return f"min {max(value.at_min_pct):.1%}, max {max(value.at_max_pct):.1%} (observed)"
         return f"{max(value.saturated_pct):.2%} ({value.limit}){mark}"
     if check == "gel":
         if value.kind == "pixels":
@@ -237,7 +277,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--instances", help="instance ids or feature keys to check, comma-separated (default all)"
     )
-    parser.add_argument("--reference", help="feature key the skew check correlates against")
+    parser.add_argument(
+        "--checks", help=f"checks to run, comma-separated from {','.join(CHECK_NAMES)} (default all)"
+    )
+    parser.add_argument(
+        "--reference",
+        help=(
+            "feature key the skew check correlates against (default: the first video feature that is not "
+            f"a checked instance), or '{REFERENCE_ALL}' to decode every video stream and take the one "
+            "with the most motion"
+        ),
+    )
+    parser.add_argument(
+        "--guess",
+        action="store_true",
+        help="list the feature keys that look like tactile streams by name, then exit",
+    )
     parser.add_argument("--json", dest="json_path", help="also write the report to this path")
     parser.add_argument(
         "--fail-on",
@@ -266,16 +321,21 @@ def run(argv: Sequence[str]) -> int:
         thresholds, checks = parse_fail_on(args.fail_on, thresholds)
     episodes = parse_episodes(args.episodes) if args.episodes else None
     instances = [s.strip() for s in args.instances.split(",") if s.strip()] if args.instances else ()
+    selected = parse_checks(args.checks) if args.checks else None
     if args.window_s <= 0:
         raise UsageError("--window-s must be positive")
     try:
         root = resolve_root(args.dataset)
         dataset = DoctorDataset(root)
+        if args.guess:
+            print(format_guess(dataset.features))
+            return 0
         report = run_doctor(
             dataset,
             episodes=episodes,
             instances=instances,
             reference=args.reference,
+            checks=selected,
             thresholds=thresholds,
             window_s=args.window_s,
         )

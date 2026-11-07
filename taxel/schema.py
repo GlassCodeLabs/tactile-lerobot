@@ -936,10 +936,14 @@ class FramerateReport(Block):
 
 @dataclass
 class SaturationReport(Block):
-    """The saturation check, per channel: the fraction of samples at or beyond the limit. ``limit`` is
-    ``declared`` (from ``range``) or ``observed`` (the extremes seen, ``confidence`` ``low``)."""
+    """The saturation check, per channel: the fraction of samples at or beyond the limit, and at the
+    lower (``at_min_pct``) and the upper (``at_max_pct``) limit separately. ``limit`` is ``declared``
+    (from ``range``) or ``observed`` (the extremes seen, ``confidence`` ``low``). Only a declared
+    limit flags: a stream rests at an observed extreme as readily as it clips there."""
 
     saturated_pct: list[float]
+    at_min_pct: list[float]
+    at_max_pct: list[float]
     limit: str
     min: list[float]
     max: list[float]

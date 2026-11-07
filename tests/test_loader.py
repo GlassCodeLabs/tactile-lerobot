@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from taxel.doctor.loader import DoctorDataset, resolve_root, tactile_keys
-from taxel.schema import Range
+from taxel.doctor.loader import DoctorDataset, candidate_keys, resolve_root, sample_indices, tactile_keys
+from taxel.schema import Range, SchemaError
 
 KEY = "observation.tactile.left_fingertip"
 SENSOR = {
@@ -53,6 +53,28 @@ class TestDiscovery:
         }
         with pytest.raises(KeyError, match="neither a tactile instance"):
             tactile_keys(self.FEATURES, ["thumb"])
+
+    def test_candidate_keys_by_name(self) -> None:
+        features = {
+            **self.FEATURES,
+            "observation.wrench": {"dtype": "float32", "shape": [6]},
+            "observation.images.front": {"dtype": "video", "shape": [480, 640, 3]},
+            "observation.Force_valid": {"dtype": "int64", "shape": [6]},
+            "touch_timestamp": {"dtype": "float64", "shape": [1, 1, 1]},
+        }
+        assert candidate_keys(features) == [
+            "observation.tactile.left_fingertip",
+            "observation.tactile.right_fingertip",
+            "observation.tactile.right_fingertip.markers",
+            "observation.images.left_tactile_left",
+            "observation.wrench",
+        ]
+        assert candidate_keys({"observation.state": {"dtype": "float32", "shape": [6]}}) == []
+
+    def test_sample_indices(self) -> None:
+        assert sample_indices(10, 4).tolist() == [0, 3, 6, 9]
+        assert sample_indices(3, 60).tolist() == [0, 1, 2] and sample_indices(1, 1).tolist() == [0]
+        assert len(sample_indices(1891, 60)) == 60
 
     def test_resolve_root(self, tmp_path) -> None:
         assert resolve_root(tmp_path) == tmp_path
@@ -246,6 +268,57 @@ class TestPlainDataset:
         assert ep.native is None and ep.baseline_rows is None and ep.session is None
         assert ep.missing == ["no sidecar: tactile/probe/meta.json not found"]
         assert ep.instance.report().to_dict()["metadata"] == "none"
+
+    def test_lerobot_video_keys_are_not_a_tactile_block(self, plain_video) -> None:
+        """LeRobot writes ``has_audio`` and ``is_depth_map`` beside a video feature's ``video.*`` keys;
+        a block with none of the tactile block's required keys is core's, not a broken instance."""
+        root, _ = plain_video
+        features = json.loads((root / "meta" / "info.json").read_text())["features"]
+        info = features["observation.tactile.gel"]["info"]
+        assert "has_audio" in info and not any(k in info for k in ("family", "declared_rate_hz"))
+        gel = DoctorDataset(root).instances()["gel"]
+        assert gel.metadata == "none" and gel.error is None and gel.info is None
+        assert gel.unknown_keys == [] and gel.report().to_dict()["metadata"] == "none"
+
+    def test_one_sequential_pass_yields_the_same_frames(self, plain_video, tmp_path) -> None:
+        root, _ = plain_video
+        ds = DoctorDataset(root)
+        key = "observation.tactile.gel"
+        triples = list(ds.iter_frames(key, 1, rgb_at=[0, 5, 11]))
+        assert [k for k, _, _ in triples] == list(range(12))
+        gray = np.stack([g for _, g, _ in triples])
+        assert (
+            gray.shape == (12, 32, 40) and gray.dtype == np.float32 and 0 <= gray.min() <= gray.max() <= 255
+        )
+        given = [k for k, _, rgb in triples if rgb is not None]
+        assert given == [0, 5, 11]
+        rgb = np.stack([rgb for _, _, rgb in triples if rgb is not None])
+        np.testing.assert_array_equal(rgb, ds.frames(key, 1, indices=[0, 5, 11]))  # the same decoder output
+        assert sum(1 for _, _, rgb in ds.iter_frames(key, 0) if rgb is not None) == 0
+        with pytest.raises(SchemaError, match="not a video or image feature"):
+            next(ds.iter_frames("observation.tactile.probe", 0))
+        # The video's frames are matched to the table's rows by order and checked against the timestamps:
+        # a column that claims twice the video's rate is caught at the second frame.
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        copy = tmp_path / "doubled"
+        shutil.copytree(root, copy)
+        path = copy / "data" / "chunk-000" / "file-000.parquet"
+        table = pq.read_table(path)
+        doubled = pa.array((table.column("timestamp").to_numpy() * 2).astype(np.float32))
+        pq.write_table(table.set_column(table.column_names.index("timestamp"), "timestamp", doubled), path)
+        with pytest.raises(SchemaError, match="video frame at 0.0333 s where the table's frame 1"):
+            list(DoctorDataset(copy).iter_frames(key, 0))
+
+    def test_png_frames_through_the_same_pass(self, plain_image) -> None:
+        root, fed = plain_image
+        ds = DoctorDataset(root)
+        key = "observation.tactile.gel"
+        triples = list(ds.iter_frames(key, 1, rgb_at=[3]))
+        assert len(triples) == 12 and triples[3][2] is not None and triples[4][2] is None
+        np.testing.assert_array_equal(triples[3][2], fed[key][12 + 3])  # PNG is lossless
+        np.testing.assert_allclose(triples[3][1], fed[key][12 + 3].astype(np.float32).mean(-1))
 
     def test_image_instance_and_video_frames(self, plain_video) -> None:
         from lerobot.datasets import LeRobotDataset
