@@ -20,14 +20,17 @@ from taxel import __version__
 from taxel.dataset.sidecar import episode_path, raw_frames, read_episode
 from taxel.doctor.checks import (
     BaselineInputs,
+    PixelStats,
     drift_check,
     framerate_main_table,
     framerate_sidecar,
     gel_check_elements,
     gel_check_pixels,
+    gel_dead_across,
     integrity_copy,
     integrity_files,
     integrity_raw,
+    pixel_stats,
     saturation_check,
     skew_check,
 )
@@ -101,13 +104,17 @@ def run_doctor(
         raise KeyError(f"unknown checks {unknown_checks}; the checks are {', '.join(CHECK_NAMES)}")
     totals = _SessionTotals(dataset)
     report_episodes: dict[str, dict[str, InstanceChecks]] = {}
+    stats: dict[tuple[str, int], PixelStats] = {}
     for e in wanted:
         signals = _Signals(dataset, e, sources, gel_frames=GEL_FRAMES if "gel" in selected else None)
         block: dict[str, InstanceChecks] = {}
         for name, source in sources.items():
             inputs = dataset.episode_inputs(source, e)
             block[name] = check_episode(inputs, thresholds, totals, window_s, signals, reference, selected)
+            if source.key in signals.pixel_stats:
+                stats[(name, e)] = signals.pixel_stats[source.key]
         report_episodes[f"episode_{e:06d}"] = block
+    _settle_gel(report_episodes, sources, wanted, stats, thresholds)
     stamp = generated_at or datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
     return HealthReport(
         doctor_version=__version__,
@@ -250,6 +257,7 @@ SkewReportOrSkipped = SkewReport | Skipped
 
 
 def _gel(inputs: EpisodeInputs, signals: _Signals, thresholds: Thresholds) -> GelReportOrSkipped:
+    """The gel check of one episode; :func:`_settle_gel` revisits it once every episode is in."""
     source = inputs.instance
     if source.kind == "array":
         data = inputs.native.data if inputs.native is not None else inputs.frames
@@ -259,7 +267,44 @@ def _gel(inputs: EpisodeInputs, signals: _Signals, thresholds: Thresholds) -> Ge
         frames = signals.gel_sample(source.key)
     except ImportError as e:
         return Skipped(str(e))
-    return gel_check_pixels(frames, thresholds)
+    stats = pixel_stats(frames)
+    signals.pixel_stats[source.key] = stats
+    return gel_check_pixels(stats, thresholds)
+
+
+def _settle_gel(
+    episodes: dict[str, dict[str, InstanceChecks]],
+    sources: dict[str, InstanceSource],
+    wanted: list[int],
+    stats: dict[tuple[str, int], PixelStats],
+    thresholds: Thresholds,
+) -> None:
+    """The gel check's cross-episode step, per instance and per session where a sidecar defines one.
+
+    An image instance is judged on its quietest episode's median pixel variance, and every episode
+    gets the same verdict; an array instance's dead elements are those constant in every episode
+    whose check ran. Without a sidecar the session is the run's episode selection.
+    """
+    for name, source in sources.items():
+        groups: dict[str | None, list[int]] = {}
+        for e in wanted:
+            session = source.session_for(e)
+            groups.setdefault(None if session is None else session.session_id, []).append(e)
+        for members in groups.values():
+            if source.kind == "image":
+                present = [(e, stats[(name, e)]) for e in members if (name, e) in stats]
+                usable = [s.median_variance for _, s in present if s.frames_used >= 2]
+                if not usable:
+                    continue
+                rest = min(usable)
+                for e, s in present:
+                    block = gel_check_pixels(s, thresholds, rest, len(usable))
+                    episodes[f"episode_{e:06d}"][name].gel = block
+            else:
+                ran = [e for e in members if isinstance(episodes[f"episode_{e:06d}"][name].gel, GelReport)]
+                blocks = [episodes[f"episode_{e:06d}"][name].gel for e in ran]
+                for e, block in zip(ran, gel_dead_across(blocks, source.shape[0], thresholds), strict=True):
+                    episodes[f"episode_{e:06d}"][name].gel = block
 
 
 def _skew(
@@ -316,6 +361,8 @@ class _Signals:
         self.episode_index = episode_index
         self.sources = {s.key: s for s in sources.values()}
         self.gel_frames = gel_frames
+        self.pixel_stats: dict[str, PixelStats] = {}
+        """Per image instance key, the statistics its gel check read this episode; see :func:`_settle_gel`."""
         self._motion: dict[str, NDArray[np.float64]] = {}
         self._samples: dict[str, NDArray[np.uint8]] = {}
         self._timestamps = dataset.timestamps(episode_index)

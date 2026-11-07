@@ -17,6 +17,7 @@ from taxel.cli.main import main  # noqa: E402
 from taxel.dataset.features import feature_entry  # noqa: E402
 from taxel.dataset.sidecar import episode_path, read_episode, write_episode  # noqa: E402
 from taxel.dataset.writer import TactileDatasetWriter, tactile_features  # noqa: E402
+from taxel.doctor.checks import ENCODER_FLOOR  # noqa: E402
 from taxel.doctor.loader import DoctorDataset  # noqa: E402
 from taxel.doctor.report import run_doctor, write_report  # noqa: E402
 from taxel.schema import DriftReport, HealthReport, IntegrityReport, Skipped, Thresholds, feature_key  # noqa: E402
@@ -266,6 +267,45 @@ class TestPlainDataset:
         assert len(asked) == 4 and set(asked) <= {"observation.images.cam", "observation.tactile.gel"}
         assert asked[1] == "observation.images.cam"  # the gel instance's only other image feature
 
+    def test_dead_elements_need_every_checked_episode(self, tmp_path) -> None:
+        """A zone nothing touched in an episode is constant there; a dead zone is constant in every episode.
+        Zones 2, 3, 4 and 15 of a 17-zone glove never move, and two live zones idle in each episode."""
+        from lerobot.datasets import LeRobotDataset
+
+        root = tmp_path / "glove"
+        features = {
+            "observation.tactile.glove": {"dtype": "float32", "shape": [17, 1], "names": None},
+            "observation.tactile.contact": {"dtype": "float32", "shape": [17], "names": None},
+        }
+        dataset = LeRobotDataset.create("taxel/glove", fps=30, features=features, root=root, use_videos=False)
+        rng = np.random.default_rng(0)
+        dead = [2, 3, 4, 15]
+        for e in range(3):
+            idle = [5 + e, 9 + e]
+            for _ in range(30):
+                frame = rng.normal(size=(17, 1)).astype(np.float32)
+                frame[dead] = 0.5
+                frame[idle] = 0.0
+                contact = (rng.random(17) > 0.7).astype(np.float32)
+                contact[dead] = 0.0
+                dataset.add_frame(
+                    {"observation.tactile.glove": frame, "observation.tactile.contact": contact, "task": "t"}
+                )
+            dataset.save_episode()
+        dataset.finalize()
+        report = run_doctor(DoctorDataset(root), window_s=0.1, checks=["gel"])
+        for e in range(3):
+            gel = report.episodes[f"episode_{e:06d}"]["glove"].gel
+            assert gel.constant_elements == sorted(dead + [5 + e, 9 + e])
+            assert gel.dead_elements == dead and gel.episodes_checked == 3
+            assert gel.dead_pct == pytest.approx(4 / 17) and gel.flag
+            contact = report.episodes[f"episode_{e:06d}"]["contact"].gel
+            assert isinstance(contact, Skipped) and contact.skipped.startswith("binary feature")
+        # One checked episode cannot tell the idle zones from the dead ones, and does not flag.
+        one = run_doctor(DoctorDataset(root), window_s=0.1, checks=["gel"], episodes=[1])
+        gel = one.episodes["episode_000001"]["glove"].gel
+        assert gel.dead_elements == sorted(dead + [6, 10]) and gel.episodes_checked == 1 and not gel.flag
+
     def test_checks_selects_what_runs(self, tmp_path) -> None:
         root = tmp_path / "plain"
         plain_dataset(root, use_videos=False)
@@ -282,7 +322,10 @@ class TestPlainDataset:
 
 GEL_KEY = feature_key("gel")
 ARRAY_KEY = feature_key(INSTANCE)
-PRESSES = [(1.0, 0.5), (3.0, 0.5)]  # one press in each 2 s episode
+PRESSES = [(0.6, 0.4), (1.4, 0.4), (2.7, 0.4), (3.5, 0.4)]
+"""Two presses in each 2 s episode (the first runs from about 0.2 s, the second from about 2.3 s of sensor
+time). One press is an onset and a release quantized to two video-frame phases, and the skew
+confidence of a clean pair then sits near the floor on an unlucky recording; two give four events."""
 IMAGE_RATE = 60.0
 DELAY_FRAMES = 2  # the image sensor shows the press two of its frames late: 33 ms at 60 Hz
 DEAD_BLOCK = (10, 20, 6, 6)  # 36 pixels, over the 25-pixel cluster default
@@ -369,11 +412,14 @@ class TestTwoSensors:
         for e in (0, 1):
             block = report.episodes[f"episode_{e:06d}"]
             pixels = block["gel"].gel
-            assert pixels.kind == "pixels" and pixels.frames_used == 60
-            assert abs(pixels.largest_cluster_px - 36) <= 2 and pixels.flag
-            assert pixels.dead_pct == pytest.approx(36 / (48 * 64), abs=0.002)
+            assert pixels.kind == "pixels" and pixels.frames_used == 60 and pixels.episodes_checked == 2
+            assert abs(pixels.largest_cluster_px - 36) <= 1 and pixels.flag
+            assert pixels.largest_cluster_pct == pytest.approx(36 / (48 * 64), abs=0.0005)
+            assert pixels.dead_pct == pytest.approx(36 / (48 * 64), abs=0.001)
+            assert ENCODER_FLOOR <= pixels.rest_variance <= pixels.median_variance
             elements = block[INSTANCE].gel
-            assert elements.kind == "elements" and elements.dead_elements == [2, 5]
+            assert elements.kind == "elements" and elements.constant_elements == [2, 5]
+            assert elements.dead_elements == [2, 5] and elements.episodes_checked == 2
             assert elements.dead_pct == 0.125 and elements.flag
 
     def test_skew_recovers_the_transport_delay_within_a_frame_period(self, two_faulty) -> None:
@@ -405,8 +451,9 @@ class TestTwoSensors:
             block = report.episodes[f"episode_{e:06d}"]
             pixels = block["gel"].gel
             assert pixels.dead_pct < 0.005 and pixels.largest_cluster_px <= 4 and not pixels.flag
+            assert pixels.episodes_checked == 2 and pixels.rest_variance >= ENCODER_FLOOR
             elements = block[INSTANCE].gel
-            assert elements.dead_elements == [] and not elements.flag
+            assert elements.constant_elements == [] and elements.dead_elements == [] and not elements.flag
             for name, slack in ((INSTANCE, PERIOD_MS + 5), ("gel", 2 * PERIOD_MS + 5)):
                 skew = block[name].skew
                 assert skew.confidence > Thresholds().confidence and abs(skew.lag_ms) <= slack

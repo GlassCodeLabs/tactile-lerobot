@@ -53,6 +53,7 @@ FAIL_ON_CHECKS = {
     "max_gap_ms": "framerate",
     "gel": "gel",
     "cluster_px": "gel",
+    "cluster_pct": "gel",
     "skew": "skew",
     "saturated": "saturation",
     "integrity": "integrity",
@@ -252,13 +253,14 @@ def _cell(checks: InstanceChecks, check: str, skipped: dict[str, dict[str, int]]
         note = "nominal" if value.timestamps == "nominal" else f"{value.effective_hz:.2f} Hz"
         return f"{note}, gap {value.max_gap_ms:.0f} ms{mark}"
     if check == "saturation":
-        if value.limit == "observed":
+        if value.limit == "observed" and value.at_min_pct is not None and value.at_max_pct is not None:
             return f"min {max(value.at_min_pct):.1%}, max {max(value.at_max_pct):.1%} (observed)"
         return f"{max(value.saturated_pct):.2%} ({value.limit}){mark}"
     if check == "gel":
         if value.kind == "pixels":
             return f"{value.dead_pct:.2%} dead, cluster {value.largest_cluster_px} px{mark}"
-        return f"{len(value.dead_elements or [])} dead element(s){mark}"
+        constant = "" if value.constant_elements is None else f", {len(value.constant_elements)} constant"
+        return f"{len(value.dead_elements or [])} dead{constant} element(s){mark}"
     return f"{value.lag_ms:+.0f} ms (conf {value.confidence:.2f}){mark}"
 
 
@@ -322,6 +324,9 @@ def run(argv: Sequence[str]) -> int:
     episodes = parse_episodes(args.episodes) if args.episodes else None
     instances = [s.strip() for s in args.instances.split(",") if s.strip()] if args.instances else ()
     selected = parse_checks(args.checks) if args.checks else None
+    if selected is not None and checks - set(selected):
+        left_out = ", ".join(sorted(checks - set(selected)))
+        raise UsageError(f"--fail-on names {left_out}, which --checks leaves out")
     if args.window_s <= 0:
         raise UsageError("--window-s must be positive")
     try:

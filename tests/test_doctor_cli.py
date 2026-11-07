@@ -34,6 +34,8 @@ class TestParsing:
         thresholds, checks = parse_fail_on("drift=0.1,integrity,cluster_px=30", Thresholds())
         assert thresholds.drift == 0.1 and thresholds.cluster_px == 30 and thresholds.dropped == 0.02
         assert checks == {"drift", "integrity", "gel"}
+        thresholds, checks = parse_fail_on("cluster_pct=0.01", Thresholds())
+        assert thresholds.cluster_pct == 0.01 and thresholds.cluster_px is None and checks == {"gel"}
         thresholds, checks = parse_fail_on("drift_units=0.2", Thresholds())
         assert thresholds.drift_units == 0.2 and checks == {"drift"}
         assert parse_fail_on("dropped,max_gap_ms=40", Thresholds())[1] == {"framerate"}
@@ -217,7 +219,10 @@ class TestRun:
             assert (
                 isinstance(getattr(first, name), Skipped) and getattr(first, name).skipped == "not selected"
             )
-        assert main([str(faulty), "--no-write", "--checks", "drift", "--fail-on", "dropped"]) == 0  # not run
+        # A check --fail-on names must run: leaving it out of --checks is a usage error, not a pass.
+        assert main([str(faulty), "--no-write", "--checks", "drift", "--fail-on", "dropped"]) == 2
+        assert "--fail-on names framerate, which --checks leaves out" in capsys.readouterr().err
+        assert main([str(faulty), "--no-write", "--checks", "drift,framerate", "--fail-on", "dropped"]) == 1
 
     def test_guess_lists_candidates_and_exits(self, faulty, capsys) -> None:
         (faulty / "tactile" / "health.json").unlink(missing_ok=True)

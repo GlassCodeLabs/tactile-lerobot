@@ -567,7 +567,8 @@ HEALTH = {
         "dropped": 0.02,
         "max_gap_ms": None,
         "gel": 0.05,
-        "cluster_px": 25,
+        "cluster_px": None,
+        "cluster_pct": 0.005,
         "skew": 50.0,
         "confidence": 0.6,
         "saturated": 0.01,
@@ -709,6 +710,44 @@ class TestHealthReport:
         drift["frame_range"] = 3.5
         with pytest.raises(SchemaError, match="fits none"):
             HealthReport.from_dict(data)
+
+    def test_a_report_from_before_the_added_keys_still_reads(self) -> None:
+        """The keys added after 0.3.1 (saturation at_min_pct and at_max_pct, the gel block's cross-episode
+        fields, thresholds.cluster_pct) have defaults, so an older health.json still loads."""
+        data = copy.deepcopy(HEALTH)
+        data["thresholds"] = {k: v for k, v in data["thresholds"].items() if k != "cluster_pct"}
+        data["thresholds"]["cluster_px"] = 25
+        block = data["episodes"]["episode_000012"]["left_fingertip"]
+        block["saturation"] = {k: v for k, v in block["saturation"].items() if not k.startswith("at_")}
+        block["gel"] = {
+            "kind": "elements",
+            "dead_pct": 0.0,
+            "largest_cluster_px": None,
+            "dead_elements": [],
+            "frames_used": 612,
+            "flag": False,
+        }
+        report = HealthReport.from_dict(data)
+        assert report.thresholds.cluster_px == 25 and report.thresholds.cluster_pct == 0.005
+        checks = report.episodes["episode_000012"]["left_fingertip"]
+        assert checks.saturation.at_min_pct is None and checks.saturation.at_max_pct is None
+        assert checks.gel.constant_elements is None and checks.gel.rest_variance is None
+        assert checks.gel.episodes_checked == 1
+        out = report.to_dict()["episodes"]["episode_000012"]["left_fingertip"]
+        assert list(out["saturation"])[:3] == ["saturated_pct", "at_min_pct", "at_max_pct"]
+        assert list(out["gel"]) == [
+            "kind",
+            "dead_pct",
+            "largest_cluster_px",
+            "largest_cluster_pct",
+            "dead_elements",
+            "constant_elements",
+            "frames_used",
+            "median_variance",
+            "rest_variance",
+            "episodes_checked",
+            "flag",
+        ]
 
     def test_thresholds_defaults_and_enums(self) -> None:
         assert Thresholds().to_dict() == HEALTH["thresholds"]

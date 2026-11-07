@@ -6,16 +6,19 @@ import pytest
 from taxel.dataset.reduce import reduce_episode
 from taxel.dataset.sidecar import BaselineRows, EpisodeStream, frame_times
 from taxel.doctor.checks import (
+    ENCODER_FLOOR,
     BaselineInputs,
     drift_check,
     framerate_main_table,
     framerate_sidecar,
     gel_check_elements,
     gel_check_pixels,
+    gel_dead_across,
     integrity_copy,
     integrity_files,
     integrity_raw,
     max_gap_threshold_ms,
+    pixel_stats,
     saturation_check,
     skew_check,
 )
@@ -340,51 +343,94 @@ class TestDrift:
         )
 
 
-def noisy_frames(k: int = 20, h: int = 16, w: int = 20, seed: int = 0) -> np.ndarray:
+def noisy_frames(k: int = 20, h: int = 16, w: int = 20, seed: int = 0, noise: int = 12) -> np.ndarray:
+    """A fixed random image plus uniform integer noise in ``[-noise, noise]`` per channel and frame. The
+    channel mean then varies by ``((2 noise + 1)² - 1) / 36`` counts²: about 17 at the default, 0.7 at 2."""
     rng = np.random.default_rng(seed)
     base = rng.integers(60, 200, size=(h, w, 3), dtype=np.uint8).astype(np.int16)
-    frames = base[None] + rng.integers(-4, 5, size=(k, h, w, 3), dtype=np.int16)
+    frames = base[None] + rng.integers(-noise, noise + 1, size=(k, h, w, 3), dtype=np.int16)
     return np.clip(frames, 0, 255).astype(np.uint8)
 
 
 class TestGel:
     def test_dead_pixels_and_the_largest_cluster(self) -> None:
-        frames = noisy_frames()
+        frames = noisy_frames(h=60, w=80)  # 4,800 pixels
         frames[:, 2:5, 5:9, :] = 0  # a 3x4 dead block
         frames[:, 12:14, 1:3, :] = 255  # a 2x2 dead block elsewhere
-        report = gel_check_pixels(frames, Thresholds())
-        assert report.kind == "pixels" and report.frames_used == 20
-        assert report.dead_pct == pytest.approx(16 / 320) and report.largest_cluster_px == 12
+        stats = pixel_stats(frames)
+        assert stats.frames_used == 20 and stats.area == 4800 and 14 < stats.median_variance < 21
+        assert stats.dead_pct == pytest.approx(16 / 4800) and stats.largest_cluster_px == 12
+        report = gel_check_pixels(stats, Thresholds())
+        assert report.kind == "pixels" and report.frames_used == 20 and report.dead_elements is None
+        assert report.dead_pct == pytest.approx(16 / 4800) and report.largest_cluster_px == 12
+        assert report.largest_cluster_pct == pytest.approx(12 / 4800)
+        assert report.median_variance == report.rest_variance == stats.median_variance
+        assert report.episodes_checked == 1 and not report.flag  # 0.33% dead, a 0.25% cluster
+        assert gel_check_pixels(stats, Thresholds(cluster_pct=0.002)).flag
+        assert gel_check_pixels(stats, Thresholds(cluster_px=10)).flag  # pixels replace the fraction
+        assert not gel_check_pixels(stats, Thresholds(cluster_px=12, cluster_pct=0.001)).flag
+        assert gel_check_pixels(stats, Thresholds(gel=0.003)).flag
+        assert gel_check_pixels(pixel_stats(noisy_frames(h=60, w=80)), Thresholds()).dead_pct == 0.0
+
+    def test_quiet_gel_is_skipped_on_the_instance_rest_level(self) -> None:
+        quiet = pixel_stats(noisy_frames(noise=2))  # the channel mean varies by about 0.7 counts²
+        assert quiet.median_variance < ENCODER_FLOOR and quiet.dead_pct > 0.9
+        skipped = gel_check_pixels(quiet, Thresholds())
+        assert isinstance(skipped, Skipped)
+        assert skipped.skipped.startswith(
+            f"quiet gel: median pixel variance {quiet.median_variance:.2f} counts² in the quietest of 1"
+        )
+        # The instance's rest level decides, not the episode's own median: a loud episode of a quiet
+        # instance is skipped too, and a quiet episode of a loud instance runs.
+        loud = pixel_stats(noisy_frames(h=60, w=80))
+        across = gel_check_pixels(loud, Thresholds(), rest_variance=0.9, episodes_checked=12)
+        assert isinstance(across, Skipped) and "0.90 counts² in the quietest of 12" in across.skipped
+        ran = gel_check_pixels(quiet, Thresholds(), rest_variance=10.0, episodes_checked=3)
+        assert ran.rest_variance == 10.0 and ran.episodes_checked == 3
+        assert ran.median_variance == quiet.median_variance and ran.dead_pct == quiet.dead_pct
+        one = gel_check_pixels(pixel_stats(noisy_frames(1)), Thresholds())
+        assert one == Skipped("1 frame(s) decoded: variance needs at least two")
+        still = pixel_stats(np.repeat(noisy_frames(1), 5, axis=0))
         assert (
-            report.dead_elements is None and not report.flag
-        )  # 5% dead and 12 pixels are under the defaults
-        assert gel_check_pixels(frames, Thresholds(cluster_px=10)).flag
-        assert gel_check_pixels(frames, Thresholds(gel=0.04)).flag
-        assert gel_check_pixels(noisy_frames(), Thresholds()).dead_pct == 0.0
+            still.median_variance == 0.0 and "0.00 counts²" in gel_check_pixels(still, Thresholds()).skipped
+        )
 
-    def test_pixels_skipped_without_variation(self) -> None:
-        frames = np.repeat(noisy_frames(1), 5, axis=0)
-        skipped = gel_check_pixels(frames, Thresholds())
-        assert isinstance(skipped, Skipped) and "do not vary" in skipped.skipped
-        assert isinstance(gel_check_pixels(noisy_frames(1), Thresholds()), Skipped)
-
-    def test_dead_elements_are_listed(self) -> None:
+    def test_constant_elements_are_listed_and_dead_needs_every_episode(self) -> None:
         data = np.random.default_rng(0).normal(0.0, 0.01, (100, 8, 2)).astype(np.float32)
         data[:, 3, :] = 0.0
         data[:, 6, :] = -1.0
-        report = gel_check_elements(data, Thresholds())
-        assert report.kind == "elements" and report.dead_elements == [3, 6]
-        assert report.dead_pct == 0.25 and report.largest_cluster_px is None and report.frames_used == 100
-        assert report.flag
+        first = gel_check_elements(data, Thresholds())
+        assert first.kind == "elements" and first.constant_elements == [3, 6]
+        assert (
+            first.dead_elements == [] and first.dead_pct == 0.0 and not first.flag
+        )  # one episode cannot tell
+        assert first.largest_cluster_px is None and first.frames_used == 100 and first.episodes_checked == 1
+        second = np.random.default_rng(1).normal(0.0, 0.01, (80, 8, 2)).astype(np.float32)
+        second[:, 3, :] = 0.0  # element 3 again; element 6 moves this time
+        second[:, 1, :] = 2.0  # element 1 idle in this episode only
+        blocks = gel_dead_across([first, gel_check_elements(second, Thresholds())], 8, Thresholds())
+        assert [b.dead_elements for b in blocks] == [[3], [3]] and [b.episodes_checked for b in blocks] == [
+            2,
+            2,
+        ]
+        assert blocks[0].constant_elements == [3, 6] and blocks[1].constant_elements == [1, 3]
+        assert all(b.dead_pct == 0.125 and b.flag for b in blocks)  # 1 of 8 is over the 5% default
+        alone = gel_dead_across([first], 8, Thresholds())[0]
+        assert alone.dead_elements == [3, 6] and alone.dead_pct == 0.25 and not alone.flag  # one episode
+        assert gel_dead_across([], 8, Thresholds()) == []
         clean = gel_check_elements(np.random.default_rng(1).normal(size=(100, 8, 2)), Thresholds())
-        assert clean.dead_elements == [] and clean.dead_pct == 0.0 and not clean.flag
+        assert clean.constant_elements == [] and not clean.flag
+        # A 0/1 feature is skipped: a constant zone of a contact flag is an untouched zone.
+        contact = np.random.default_rng(2).integers(0, 2, (100, 17, 1)).astype(np.float32)
+        assert gel_check_elements(contact, Thresholds()).skipped.startswith("binary feature")
         assert isinstance(gel_check_elements(np.zeros((100, 8, 2)), Thresholds()), Skipped)
+        assert "does not vary" in gel_check_elements(np.full((100, 8, 2), 0.5), Thresholds()).skipped
         # Elements of different scales are all alive: the rule is each element against itself.
         mixed = np.random.default_rng(2).normal(size=(100, 3, 1)) * np.array([[100.0], [0.01], [1e-4]])[None]
-        assert gel_check_elements(mixed, Thresholds()).dead_elements == []
-        # An element that is almost constant, within one part in a thousand of its level, is dead.
+        assert gel_check_elements(mixed, Thresholds()).constant_elements == []
+        # An element that is almost constant, within one part in a thousand of its level, is constant.
         mixed[:, 2, 0] = 5.0 + np.random.default_rng(3).normal(0.0, 1e-4, 100)
-        assert gel_check_elements(mixed, Thresholds()).dead_elements == [2]
+        assert gel_check_elements(mixed, Thresholds()).constant_elements == [2]
 
 
 def step_signal(times: np.ndarray, onsets: list[tuple[float, float]], level: float = 1.0) -> np.ndarray:

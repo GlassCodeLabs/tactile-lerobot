@@ -942,14 +942,26 @@ class SaturationReport(Block):
     limit flags: a stream rests at an observed extreme as readily as it clips there."""
 
     saturated_pct: list[float]
-    at_min_pct: list[float]
-    at_max_pct: list[float]
     limit: str
     min: list[float]
     max: list[float]
     confidence: str
     source: str
     flag: bool
+    at_min_pct: list[float] | None = None
+    at_max_pct: list[float] | None = None
+
+    _key_order: ClassVar[tuple[str, ...] | None] = (
+        "saturated_pct",
+        "at_min_pct",
+        "at_max_pct",
+        "limit",
+        "min",
+        "max",
+        "confidence",
+        "source",
+        "flag",
+    )
 
     def __post_init__(self) -> None:
         _require_one_of(self.limit, ("declared", "observed"), "saturation.limit")
@@ -959,8 +971,16 @@ class SaturationReport(Block):
 
 @dataclass
 class GelReport(Block):
-    """The gel check. ``kind`` ``pixels``: dead pixels of an image stream, with the largest connected
-    cluster; ``kind`` ``elements``: zero-variance elements of an array stream, listed."""
+    """The gel check.
+
+    ``kind`` ``pixels``: dead pixels of an image stream, with the largest connected cluster in
+    pixels and as a fraction of the image; ``median_variance`` is the episode's median pixel
+    variance in counts² and ``rest_variance`` the instance's rest flicker the check was judged
+    on, the quietest checked episode's median. ``kind`` ``elements``: ``constant_elements`` are
+    the elements constant in this episode, an observation, and ``dead_elements`` those constant
+    in every checked episode of the instance, which is what flags. ``episodes_checked`` is how
+    many episodes that decision, or the rest flicker, was taken over.
+    """
 
     kind: str
     dead_pct: float
@@ -968,6 +988,25 @@ class GelReport(Block):
     dead_elements: list[int] | None
     frames_used: int
     flag: bool
+    largest_cluster_pct: float | None = None
+    constant_elements: list[int] | None = None
+    median_variance: float | None = None
+    rest_variance: float | None = None
+    episodes_checked: int = 1
+
+    _key_order: ClassVar[tuple[str, ...] | None] = (
+        "kind",
+        "dead_pct",
+        "largest_cluster_px",
+        "largest_cluster_pct",
+        "dead_elements",
+        "constant_elements",
+        "frames_used",
+        "median_variance",
+        "rest_variance",
+        "episodes_checked",
+        "flag",
+    )
 
     def __post_init__(self) -> None:
         _require_one_of(self.kind, ("pixels", "elements"), "gel.kind")
@@ -1028,15 +1067,18 @@ class Thresholds(Block):
     """The thresholds a run flagged against. The defaults are conservative. ``drift`` is a fraction of
     the declared range; ``drift_units`` is in the stream's native units, for a stream without a
     range, and ``None`` means drift does not flag there. ``max_gap_ms`` ``None`` means ten declared
-    periods, resolved per instance and recorded in the framerate block. ``confidence`` is the
-    cross-correlation peak a skew lag needs before it can be flagged."""
+    periods, resolved per instance and recorded in the framerate block. ``cluster_pct`` is the
+    largest dead cluster as a fraction of the image; ``cluster_px`` the same in pixels, which
+    replaces the fraction when set. ``confidence`` is the cross-correlation peak a skew lag needs
+    before it can be flagged."""
 
     drift: float = 0.05
     drift_units: float | None = None
     dropped: float = 0.02
     max_gap_ms: float | None = None
     gel: float = 0.05
-    cluster_px: int = 25
+    cluster_px: int | None = None
+    cluster_pct: float = 0.005
     skew: float = 50.0
     confidence: float = 0.6
     saturated: float = 0.01

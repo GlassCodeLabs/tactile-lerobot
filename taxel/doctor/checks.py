@@ -7,7 +7,8 @@ reads a file; :mod:`taxel.doctor.report` feeds these from the loader.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 
 import numpy as np
 from numpy.typing import NDArray
@@ -35,29 +36,47 @@ from taxel.schema import (
 
 __all__ = [
     "BaselineInputs",
+    "DEAD_VARIANCE",
+    "ENCODER_FLOOR",
     "GAP_EDGES_PERIODS",
+    "PixelStats",
     "drift_check",
     "framerate_main_table",
     "framerate_sidecar",
     "gel_check_elements",
     "gel_check_pixels",
+    "gel_dead_across",
     "integrity_copy",
     "integrity_files",
     "integrity_raw",
     "max_gap_threshold_ms",
+    "pixel_stats",
     "saturation_check",
     "skew_check",
 ]
 
-DEAD_FRACTION = 0.2
-"""A pixel is dead when its variance over the episode is below this fraction of the median pixel variance.
+DEAD_VARIANCE = 2.0
+"""A pixel is dead when its grayscale variance over the sampled frames is at or under this, in counts².
 
-A fifth, not a hundredth: a constant region in a video flickers after encoding (LeRobot's default
-AV1 at CRF 30 leaves it a few tenths of a count of variance), and real gel images vary by tens.
+The default comes from the simulated gel (48×64, camera noise of 6 counts, a 6×6 dead block) after
+LeRobot's default encoding, AV1 at CRF 30 with a keyframe every two frames: the dead block's pixels
+flicker at 0.6 to 1.7 counts² while every live pixel sits at 2.3 or above, so 2.0 takes the block
+whole and no live pixel. A floor of 1.5 misses one pixel of the block; 3.0 adds a live one.
+"""
+
+ENCODER_FLOOR = 6.0
+"""The rest flicker an image stream needs, in counts², for the dead-pixel rule to mean anything.
+
+Three times :data:`DEAD_VARIANCE`. The encoder flattens weak camera noise to the same tenths of a
+count a dead pixel flickers at, so on a stream quieter than this a dead pixel cannot be told from a
+live one, and the check is skipped. The rest flicker is the median pixel variance of the instance's
+quietest checked episode, not of each episode: contact lifts an episode's median while the regions
+nothing touches stay at the rest level, and would read as dead. The simulated gel's medians are 10
+to 11; a visuotactile stream encoded from a quiet camera sits near 1.
 """
 
 CONSTANT_FRACTION = 1e-3
-"""An element is dead when its standard deviation over the episode is within this fraction of its
+"""An element is constant when its standard deviation over the episode is within this fraction of its
 largest magnitude: constant to one part in a thousand, on every channel."""
 
 GAP_EDGES_PERIODS = (1.5, 2.5, 3.5)
@@ -446,50 +465,140 @@ def _extreme_per_channel(values: NDArray[np.float64]) -> list[float]:
 # --- Gel -------------------------------------------------------------------------------------------------
 
 
-def gel_check_pixels(frames: NDArray[np.uint8], thresholds: Thresholds) -> GelReport | Skipped:
-    """Dead pixels of an image stream: pixels whose variance over the frames is near zero while the rest
-    varies.
+@dataclass(frozen=True)
+class PixelStats:
+    """What the pixel check reads off one episode's sampled frames; see :func:`pixel_stats`.
 
-    ``frames`` is ``(k, H, W, 3)`` uint8, a sample of the episode's frames. A pixel is dead when
-    its grayscale variance is below :data:`DEAD_FRACTION` of the median pixel variance, a rule
-    that holds through video encoding; the
-    largest 4-connected cluster of dead pixels is reported too. Flagged on the dead fraction or
-    the cluster size.
+    ``median_variance`` is the median per-pixel grayscale variance in counts²; ``dead_pct`` the
+    fraction of pixels at or under :data:`DEAD_VARIANCE` and ``largest_cluster_px`` the largest
+    4-connected cluster of them; ``area`` the pixels in a frame; ``frames_used`` the frames sampled.
+    """
+
+    median_variance: float
+    dead_pct: float
+    largest_cluster_px: int
+    area: int
+    frames_used: int
+
+
+def pixel_stats(frames: NDArray[np.uint8]) -> PixelStats:
+    """The statistics :func:`gel_check_pixels` reads off an episode's sampled frames, uint8 ``(k, H, W, 3)``.
+
+    Grayscale is the channel mean, the measure the evidence behind :data:`DEAD_VARIANCE` was taken
+    with. With fewer than two frames the variance is undefined and the statistics are zero; the
+    check then skips.
     """
     k = len(frames)
+    area = int(frames.shape[1] * frames.shape[2]) if frames.ndim == 4 else 0
     if k < 2:
-        return Skipped(f"{k} frame(s) decoded: variance needs at least two")
+        return PixelStats(0.0, 0.0, 0, area, k)
     variance = np.asarray(frames, dtype=np.float32).mean(axis=-1).var(axis=0)
-    median = float(np.median(variance))
-    if median <= 1e-9:
-        return Skipped("frames do not vary: a dead pixel cannot be told from a static scene")
-    dead = variance <= DEAD_FRACTION * median
-    cluster = largest_cluster(dead)
-    dead_pct = float(dead.mean())
-    flag = dead_pct > thresholds.gel or cluster > thresholds.cluster_px
-    return GelReport("pixels", dead_pct, cluster, None, k, flag)
+    dead = variance <= DEAD_VARIANCE
+    return PixelStats(float(np.median(variance)), float(dead.mean()), largest_cluster(dead), area, k)
+
+
+def gel_check_pixels(
+    stats: PixelStats,
+    thresholds: Thresholds,
+    rest_variance: float | None = None,
+    episodes_checked: int = 1,
+) -> GelReport | Skipped:
+    """Dead pixels of an image stream in one episode, from its :class:`PixelStats`.
+
+    A pixel is dead when its variance is at or under :data:`DEAD_VARIANCE`, a rule that only
+    means something when the stream's live pixels sit well above it. ``rest_variance`` is the
+    instance's rest flicker, the median pixel variance of the quietest of its ``episodes_checked``
+    episodes; when it is under :data:`ENCODER_FLOOR` the check is skipped with the number, on
+    every episode of the instance, since contact lifts an episode's own median while the regions
+    nothing touches stay at the rest level. Without ``rest_variance`` the episode's own median
+    stands in. Flagged on the dead fraction (``gel``) or on the largest cluster as a fraction of
+    the image (``cluster_pct``), or in pixels when ``cluster_px`` is set.
+    """
+    if stats.frames_used < 2:
+        return Skipped(f"{stats.frames_used} frame(s) decoded: variance needs at least two")
+    rest = stats.median_variance if rest_variance is None else rest_variance
+    if rest < ENCODER_FLOOR:
+        return Skipped(
+            f"quiet gel: median pixel variance {rest:.2f} counts² in the quietest of {episodes_checked} "
+            f"checked episode(s) is under the encoder floor {ENCODER_FLOOR:g}; a dead pixel cannot be "
+            "told from a live one after encoding"
+        )
+    cluster_pct = stats.largest_cluster_px / stats.area if stats.area else 0.0
+    if thresholds.cluster_px is not None:
+        over_cluster = stats.largest_cluster_px > thresholds.cluster_px
+    else:
+        over_cluster = cluster_pct > thresholds.cluster_pct
+    return GelReport(
+        kind="pixels",
+        dead_pct=stats.dead_pct,
+        largest_cluster_px=stats.largest_cluster_px,
+        dead_elements=None,
+        frames_used=stats.frames_used,
+        flag=stats.dead_pct > thresholds.gel or over_cluster,
+        largest_cluster_pct=cluster_pct,
+        median_variance=stats.median_variance,
+        rest_variance=rest,
+        episodes_checked=episodes_checked,
+    )
 
 
 def gel_check_elements(data: NDArray[np.floating], thresholds: Thresholds) -> GelReport | Skipped:
-    """Dead elements of an array stream ``(n, E, C)``: elements constant over the episode, listed by index.
+    """Constant elements of an array stream ``(n, E, C)`` in one episode, listed by index.
 
-    An element is dead when, on every channel, its standard deviation over the episode is within
-    :data:`CONSTANT_FRACTION` of its largest magnitude, while the stream as a whole varies. The
-    rule is per element, not relative to the other elements: a taxel array's elements share a
-    unit but not a level of activity, and a plain dataset's "tactile" vector may hold quantities
-    of different scales. Flagged on the dead fraction.
+    An element is constant when, on every channel, its standard deviation over the episode is
+    within :data:`CONSTANT_FRACTION` of its largest magnitude. The rule is per element, not
+    relative to the other elements: a taxel array's elements share a unit but not a level of
+    activity, and a plain dataset's "tactile" vector may hold quantities of different scales.
+    One episode cannot tell a dead element from one nothing touched, so the block lists
+    ``constant_elements`` as an observation, leaves ``dead_elements`` empty and does not flag;
+    :func:`gel_dead_across` decides over the instance's episodes. A feature whose values are only
+    0 and 1 is skipped: a constant zone of a contact flag is an untouched zone. So is an episode in
+    which no element varies.
     """
     n = len(data)
     if n < 2:
         return Skipped(f"{n} frame(s): variance needs at least two")
     values = np.asarray(data, dtype=np.float64)
+    finite = values[np.isfinite(values)]
+    if finite.size and bool(np.all((finite == 0.0) | (finite == 1.0))):
+        return Skipped(
+            "binary feature (values 0 and 1): a constant element is an untouched zone, not a dead one"
+        )
     spread = values.std(axis=0)
     scale = np.maximum(np.abs(values).max(axis=0), np.finfo(np.float32).tiny)
-    if float(np.median(spread)) <= 1e-12:
-        return Skipped("stream does not vary: a dead element cannot be told from a constant reading")
-    dead = np.flatnonzero(np.all(spread <= CONSTANT_FRACTION * scale, axis=1))
-    dead_pct = float(dead.size / values.shape[1])
-    return GelReport("elements", dead_pct, None, [int(i) for i in dead], n, dead_pct > thresholds.gel)
+    constant = np.flatnonzero(np.all(spread <= CONSTANT_FRACTION * scale, axis=1))
+    if constant.size == values.shape[1]:
+        return Skipped("stream does not vary: no element changes in this episode")
+    return GelReport(
+        kind="elements",
+        dead_pct=0.0,
+        largest_cluster_px=None,
+        dead_elements=[],
+        frames_used=n,
+        flag=False,
+        constant_elements=[int(i) for i in constant],
+        episodes_checked=1,
+    )
+
+
+def gel_dead_across(blocks: Sequence[GelReport], n_elements: int, thresholds: Thresholds) -> list[GelReport]:
+    """The cross-episode step for the element blocks of one instance: an element constant in every
+    checked episode is dead.
+
+    Returns one block per input with ``dead_elements`` the intersection of their
+    ``constant_elements``, ``dead_pct`` its fraction of ``n_elements``, ``episodes_checked`` the
+    number of blocks, and the flag on ``dead_pct`` over ``gel``, set only with two or more
+    episodes: one episode cannot separate a dead element from an untouched one. The caller
+    groups the episodes, by session where a sidecar says which episodes share one, and leaves
+    out the episodes whose check was skipped.
+    """
+    if not blocks:
+        return []
+    dead = sorted(set.intersection(*(set(b.constant_elements or []) for b in blocks)))
+    pct = len(dead) / n_elements if n_elements else 0.0
+    n = len(blocks)
+    flag = n >= 2 and pct > thresholds.gel
+    return [replace(b, dead_elements=dead, dead_pct=pct, episodes_checked=n, flag=flag) for b in blocks]
 
 
 # --- Skew ------------------------------------------------------------------------------------------------
