@@ -328,7 +328,7 @@ time). One press is an onset and a release quantized to two video-frame phases, 
 confidence of a clean pair then sits near the floor on an unlucky recording; two give four events."""
 IMAGE_RATE = 60.0
 DELAY_FRAMES = 2  # the image sensor shows the press two of its frames late: 33 ms at 60 Hz
-DEAD_BLOCK = (10, 20, 6, 6)  # 36 pixels, over the 25-pixel cluster default
+DEAD_BLOCK = (10, 20, 6, 6)  # 36 pixels, 1.2% of the 48x64 image, over the 0.5% cluster default
 
 
 def two_sensor_dataset(root: Path, *, faults: bool) -> Path:
@@ -413,9 +413,10 @@ class TestTwoSensors:
             block = report.episodes[f"episode_{e:06d}"]
             pixels = block["gel"].gel
             assert pixels.kind == "pixels" and pixels.frames_used == 60 and pixels.episodes_checked == 2
-            assert abs(pixels.largest_cluster_px - 36) <= 1 and pixels.flag
-            assert pixels.largest_cluster_pct == pytest.approx(36 / (48 * 64), abs=0.0005)
-            assert pixels.dead_pct == pytest.approx(36 / (48 * 64), abs=0.001)
+            # Encoder output differs between machines: a pixel or two of the block's edge crosses the floor.
+            assert abs(pixels.largest_cluster_px - 36) <= 2 and pixels.flag
+            assert pixels.largest_cluster_pct == pytest.approx(36 / (48 * 64), abs=2 / (48 * 64))
+            assert pixels.dead_pct == pytest.approx(36 / (48 * 64), abs=0.002)
             assert ENCODER_FLOOR <= pixels.rest_variance <= pixels.median_variance
             elements = block[INSTANCE].gel
             assert elements.kind == "elements" and elements.constant_elements == [2, 5]
