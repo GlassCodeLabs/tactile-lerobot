@@ -73,6 +73,31 @@ def _check_presses(schedule: Sequence[Sequence[float]] | None) -> list[Press] | 
     return presses
 
 
+def _check_intervals(
+    schedule: Sequence[Sequence[float]] | None, name: str
+) -> list[tuple[float, float]] | None:
+    """Validate ``(start_s, duration_s)`` intervals and return them as tuples, or ``None`` when empty."""
+    if not schedule:
+        return None
+    intervals: list[tuple[float, float]] = []
+    for i, interval in enumerate(schedule):
+        items = tuple(interval) if isinstance(interval, (list, tuple)) else ()
+        if len(items) != 2 or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in items):
+            raise ValueError(f"{name}[{i}] must be (start_s, duration_s), got {interval!r}")
+        start, duration = float(items[0]), float(items[1])
+        if start < 0 or duration <= 0:
+            raise ValueError(f"{name}[{i}]: start_s must be >= 0 and duration_s > 0, got {interval!r}")
+        intervals.append((start, duration))
+    return intervals
+
+
+def _interval_frames(schedule: Sequence[tuple[float, float]] | None, rate_hz: float) -> list[tuple[int, int]]:
+    """Intervals in frames, ``(first, end)`` covering ``first <= seq < end``, rounded as presses are."""
+    return [
+        (first, end) for first, end, _ in _press_frames([(s, d, 0.0) for s, d in schedule or ()], rate_hz)
+    ]
+
+
 def _press_frames(schedule: Sequence[Press] | None, rate_hz: float) -> list[tuple[int, int, float]]:
     """The schedule in frames: ``(first, end, amplitude)`` per press, covering ``first <= seq < end``.
 
@@ -133,6 +158,14 @@ class SimulatedTactileConfig(TactileSensorConfig):
             rest pattern plus the drift so far, so stored frames return to zero while the sensor
             has not. Each re-baseline is stamped on the readings like a host baseline and is
             forgotten when the sensor reconnects.
+        nan_schedule: Fault. ``(start_s, duration_s)`` intervals of sensor time in which
+            ``nan_elements`` read NaN, the way a dataset marks a reading it lost or blanked.
+        nan_elements: The elements NaN in those intervals; default every element.
+        hold_schedule: Fault. ``(start_s, duration_s)`` intervals in which the sensor sends the
+            frame from just before the interval again on ``hold_elements``, the way a reader with
+            no new frame passes the last one on; ``seq`` and the timestamps keep advancing. An
+            interval must start after the first frame.
+        hold_elements: The elements held; default every element, a whole-frame hold.
     """
 
     family: TactileFamily = TactileFamily.TAXEL_ARRAY
@@ -152,6 +185,10 @@ class SimulatedTactileConfig(TactileSensorConfig):
     saturation_max: float | None = None
     declare_range: bool = True
     rebaseline_at_s: list[float] | None = None
+    nan_schedule: list[tuple[float, float]] | None = None
+    nan_elements: list[int] | None = None
+    hold_schedule: list[tuple[float, float]] | None = None
+    hold_elements: list[int] | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -181,6 +218,16 @@ class SimulatedTactileConfig(TactileSensorConfig):
         times = self.rebaseline_at_s
         if times is not None and (any(t < 0 for t in times) or list(times) != sorted(times)):
             raise ValueError(f"rebaseline_at_s must be non-negative and increasing, got {times!r}")
+        self.nan_schedule = _check_intervals(self.nan_schedule, "nan_schedule")
+        self.hold_schedule = _check_intervals(self.hold_schedule, "hold_schedule")
+        if any(first < 1 for first, _ in _interval_frames(self.hold_schedule, self.declared_rate_hz)):
+            raise ValueError(
+                "hold_schedule: a hold repeats the frame before it, so it cannot start at frame 0"
+            )
+        for name in ("nan_elements", "hold_elements"):
+            chosen = getattr(self, name)
+            if chosen is not None and (not chosen or any(not 0 <= i < self.n_elements for i in chosen)):
+                raise ValueError(f"{name} must be a non-empty subset of range({self.n_elements})")
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -211,6 +258,8 @@ class SimulatedTactile(TactileSensor):
         rng = np.random.default_rng([config.seed, 0])
         self._rest: NDArray[np.float64] = rng.normal(0.0, config.rest_std, config.shape)
         self._presses = _press_frames(config.contact_schedule, config.declared_rate_hz)
+        self._nans = _interval_frames(config.nan_schedule, config.declared_rate_hz)
+        self._holds = _interval_frames(config.hold_schedule, config.declared_rate_hz)
         self._rebaseline_seqs = [round(t * config.declared_rate_hz) for t in config.rebaseline_at_s or ()]
         self._t0 = 0.0
         self._seq = -1
@@ -318,7 +367,27 @@ class SimulatedTactile(TactileSensor):
         return bool(np.random.default_rng([self.config.seed, 2, seq]).random() < self.config.drop_probability)
 
     def _frame(self, seq: int) -> NDArray[np.float32]:
-        """Frame ``seq`` with the stimulus and every fault applied; pure in the seed and ``seq``."""
+        """Frame ``seq`` with the stimulus and every fault applied; pure in the seed and ``seq``.
+
+        A hold replaces the frame, or its ``hold_elements``, with the frame before the hold; NaN
+        is written last, over everything else.
+        """
+        cfg = self.config
+        data = self._live_frame(seq)
+        for first, end in self._holds:
+            if first <= seq < end:
+                held = self._live_frame(first - 1)
+                if cfg.hold_elements is None:
+                    data = held
+                else:
+                    data[cfg.hold_elements] = held[cfg.hold_elements]
+        for first, end in self._nans:
+            if first <= seq < end:
+                data[slice(None) if cfg.nan_elements is None else cfg.nan_elements] = np.nan
+        return data
+
+    def _live_frame(self, seq: int) -> NDArray[np.float32]:
+        """Frame ``seq`` with the stimulus and the faults that act on every frame, before holds and NaN."""
         cfg = self.config
         noise = np.random.default_rng([cfg.seed, 1, seq]).normal(0.0, cfg.noise_std, cfg.shape)
         data = self._rest + noise

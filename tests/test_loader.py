@@ -311,6 +311,28 @@ class TestPlainDataset:
         with pytest.raises(SchemaError, match="video frame at 0.0333 s where the table's frame 1"):
             list(DoctorDataset(copy).iter_frames(key, 0))
 
+    def test_clock_column_names_and_files_on_disk(self, plain_video, tmp_path) -> None:
+        root, _ = plain_video
+        ds = DoctorDataset(root)
+        assert ds.instances()["probe"].names is None  # no per-element names in this feature
+        ds.check_clock("timestamp")  # any one-number-per-frame column will do
+        np.testing.assert_array_equal(ds.clock_times("timestamp", 1), ds.timestamps(1))
+        with pytest.raises(KeyError, match="clock column 'nope'"):
+            ds.check_clock("nope")
+        with pytest.raises(SchemaError, match="float32 \\[4, 3\\], not one number per frame"):
+            ds.check_clock("observation.tactile.probe")
+        inputs = ds.episode_inputs(ds.instances()["probe"], 1, clock="timestamp")
+        assert inputs.clock == "timestamp" and np.array_equal(inputs.clock_times, inputs.timestamps)
+        assert ds.has_frames("observation.images.cam", 0) and ds.has_frames("observation.tactile.gel", 1)
+        partial_root = tmp_path / "partial"
+        shutil.copytree(root, partial_root)
+        for video in (partial_root / "videos" / "observation.images.cam").rglob("*.mp4"):
+            video.unlink()
+        partial = DoctorDataset(partial_root)
+        assert not partial.has_frames("observation.images.cam", 0)
+        with pytest.raises(FileNotFoundError, match="observation.images.cam: episode 0's video file videos/"):
+            next(partial.iter_frames("observation.images.cam", 0))
+
     def test_png_frames_through_the_same_pass(self, plain_image) -> None:
         root, fed = plain_image
         ds = DoctorDataset(root)

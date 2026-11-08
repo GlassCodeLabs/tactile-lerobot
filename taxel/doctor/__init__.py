@@ -1,4 +1,4 @@
-"""``taxel doctor``: the integrity check and the five health checks on a recorded dataset.
+"""``taxel doctor``: the integrity check and the six health checks on a recorded dataset.
 
 The check functions take numpy arrays and return report blocks; they are pure and need
 numpy only. :mod:`taxel.doctor.loader` turns a dataset root into those arrays, reading

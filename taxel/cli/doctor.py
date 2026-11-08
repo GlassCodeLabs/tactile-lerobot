@@ -3,8 +3,8 @@
 ::
 
     taxel doctor <dataset_root_or_repo_id> [--episodes 0,3-5] [--instances left_fingertip]
-        [--checks drift,framerate] [--reference observation.images.front | all] [--json path]
-        [--fail-on drift=0.05,dropped=0.02,gel=0.05,skew=50,saturated=0.01,integrity]
+        [--checks drift,framerate] [--reference observation.images.front | all] [--clock column]
+        [--json path] [--fail-on drift=0.05,dropped=0.02,gel=0.05,skew=50,saturated=0.01,held=0.05,integrity]
         [--thresholds file.json] [--no-write] [--guess]
 
 The report goes to ``tactile/health.json`` inside the dataset unless ``--no-write`` is given,
@@ -12,8 +12,9 @@ and to ``--json`` when given; a per-instance table is printed either way. The ex
 when no ``--fail-on`` threshold is hit, 1 when one is, 2 on a usage error. Without
 ``--fail-on`` a flag is an annotation only (SCHEMA.md, principle 6) and the exit code is 0.
 ``--guess`` lists the feature keys that look like tactile streams by name and exits, for a
-dataset whose streams are not under ``observation.tactile``. Reading the dataset needs
-``taxel[doctor]``; the image checks need ``taxel[lerobot]``.
+dataset whose streams are not under ``observation.tactile``. ``--clock`` names a main-table
+column that holds the dataset's real per-frame times, for a dataset that keeps ``timestamp``
+nominal. Reading the dataset needs ``taxel[doctor]``; the image checks need ``taxel[lerobot]``.
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ FAIL_ON_CHECKS = {
     "cluster_pct": "gel",
     "skew": "skew",
     "saturated": "saturation",
+    "held": "held",
     "integrity": "integrity",
 }
 """``--fail-on`` names, each a :class:`~taxel.schema.Thresholds` field, and the check whose flag they fail."""
@@ -171,7 +173,7 @@ def failed_checks(report: HealthReport, checks: set[str]) -> list[tuple[str, str
 
 # --- Table output ------------------------------------------------------------------------------------
 
-_COLUMNS = ("episode", "integrity", "drift", "framerate", "saturation", "gel", "skew")
+_COLUMNS = ("episode", "integrity", "drift", "framerate", "saturation", "gel", "skew", "held")
 _NUMBER = re.compile(r" -?\d+(\.\d+)?(?= below)")
 
 
@@ -248,10 +250,18 @@ def _cell(checks: InstanceChecks, check: str, skipped: dict[str, dict[str, int]]
         pct = "" if value.offset_pct_range is None else f" ({max(value.offset_pct_range):.1%})"
         return f"{offset:+.3g}{pct}{events}{zero}{mark}"
     if check == "framerate":
+        stalled = f", {value.stalled} stalled" if value.stalled else ""
         if value.dropped_pct is not None:
-            return f"{value.dropped_pct:.1%} dropped, gap {value.max_gap_ms:.0f} ms{mark}"
-        note = "nominal" if value.timestamps == "nominal" else f"{value.effective_hz:.2f} Hz"
-        return f"{note}, gap {value.max_gap_ms:.0f} ms{mark}"
+            return f"{value.dropped_pct:.1%} dropped, gap {value.max_gap_ms:.0f} ms{stalled}{mark}"
+        if value.timestamps == "nominal":
+            return f"nominal, gap {value.max_gap_ms:.0f} ms{stalled}{mark}"
+        clock = f" ({value.clock})" if value.clock else ""
+        over = sum(value.gap_histogram.counts[1:])
+        edge_ms = value.gap_histogram.edges_periods[0] * 1000.0 / (value.declared_hz or value.effective_hz)
+        return (
+            f"{value.effective_hz:.2f} Hz{clock}, {over} gaps >{edge_ms:.0f} ms, "
+            f"max {value.max_gap_ms:.0f} ms{stalled}{mark}"
+        )
     if check == "saturation":
         if value.limit == "observed" and value.at_min_pct is not None and value.at_max_pct is not None:
             return f"min {max(value.at_min_pct):.1%}, max {max(value.at_max_pct):.1%} (observed)"
@@ -259,8 +269,20 @@ def _cell(checks: InstanceChecks, check: str, skipped: dict[str, dict[str, int]]
     if check == "gel":
         if value.kind == "pixels":
             return f"{value.dead_pct:.2%} dead, cluster {value.largest_cluster_px} px{mark}"
-        constant = "" if value.constant_elements is None else f", {len(value.constant_elements)} constant"
-        return f"{len(value.dead_elements or [])} dead{constant} element(s){mark}"
+        if value.constant_elements is None:  # a report written before constant elements were listed
+            return f"{len(value.dead_elements or [])} dead element(s){mark}"
+        constant = len(value.constant_elements)
+        if value.dead_elements is None:
+            return f"{constant} constant element(s), 1 episode"
+        return f"{len(value.dead_elements)} dead, {constant} constant element(s){mark}"
+    if check == "held":
+        text = f"{value.held_pct:.2%} held, run {value.longest_run}"
+        worst = max((value.groups or {}).items(), key=lambda item: item[1].held_pct, default=None)
+        if worst is not None and worst[1].held_pct > 0:
+            text += f", {worst[0]} {worst[1].held_pct:.2%}"
+        if value.nan_pct and max(value.nan_pct) > 0:
+            text += f", NaN up to {max(value.nan_pct):.0%}"
+        return text + mark
     return f"{value.lag_ms:+.0f} ms (conf {value.confidence:.2f}){mark}"
 
 
@@ -271,7 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="taxel doctor",
         description=(
-            "Per-episode checks of a recorded dataset: integrity, drift, framerate, saturation, gel and skew."
+            "Per-episode checks of a recorded dataset: integrity, drift, framerate, saturation, gel, skew "
+            "and held."
         ),
     )
     parser.add_argument("dataset", help="dataset root directory, or a Hub repo id to download")
@@ -289,6 +312,10 @@ def build_parser() -> argparse.ArgumentParser:
             f"a checked instance), or '{REFERENCE_ALL}' to decode every video stream and take the one "
             "with the most motion"
         ),
+    )
+    parser.add_argument(
+        "--clock",
+        help="main-table column of real per-frame times for framerate and skew, when timestamp is nominal",
     )
     parser.add_argument(
         "--guess",
@@ -341,6 +368,7 @@ def run(argv: Sequence[str]) -> int:
             instances=instances,
             reference=args.reference,
             checks=selected,
+            clock=args.clock,
             thresholds=thresholds,
             window_s=args.window_s,
         )

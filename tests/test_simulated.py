@@ -89,6 +89,11 @@ class TestRegistryAndShape:
             ({"contact_elements": []}, "contact_elements"),
             ({"rebaseline_at_s": [1.0, 0.5]}, "increasing"),
             ({"rebaseline_at_s": [-1.0]}, "non-negative"),
+            ({"nan_schedule": [(0.0, 0.0)]}, "duration_s > 0"),
+            ({"nan_schedule": [(1.0,)]}, "nan_schedule\\[0\\]"),
+            ({"nan_elements": [16]}, "nan_elements"),
+            ({"hold_schedule": [(0.0, 0.1)]}, "cannot start at frame 0"),
+            ({"hold_elements": []}, "hold_elements"),
         ],
     )
     def test_config_validation(self, overrides: dict, match: str) -> None:
@@ -318,3 +323,39 @@ class TestRebaseline:
         sensor.disconnect()
         again = sensor.drain()
         assert again and again[0].seq == 0 and again[0].baseline is None
+
+
+class TestLapses:
+    """Frames a sensor or its reader got wrong: NaN where a reading was lost, the last frame resent."""
+
+    def test_nan_marks_the_scheduled_frames_on_the_chosen_elements(self) -> None:
+        sensor = SimulatedTactile(config(nan_schedule=[(0.1, 0.01)], nan_elements=[1, 3]))
+        first, end = round(0.1 * RATE), round(0.11 * RATE)  # frames 50 to 54
+        for seq in range(first - 2, end + 2):
+            frame = sensor._frame(seq)
+            inside = first <= seq < end
+            assert np.isnan(frame[[1, 3]]).all() == inside and not np.isnan(frame[[0, 2]]).any()
+        every = SimulatedTactile(config(nan_schedule=[(0.1, 0.01)]))
+        assert np.isnan(every._frame(first)).all()
+
+    def test_a_hold_resends_the_frame_before_it(self) -> None:
+        sensor = SimulatedTactile(config(hold_schedule=[(0.1, 0.006)], contact_schedule=[(0.0, 1.0, 2.0)]))
+        first, end = round(0.1 * RATE), round(0.106 * RATE)  # frames 50, 51, 52 repeat frame 49
+        before = sensor._frame(first - 1)
+        for seq in range(first, end):
+            np.testing.assert_array_equal(sensor._frame(seq), before)
+        assert not np.array_equal(sensor._frame(end), before)  # the stream moves on
+        partial = SimulatedTactile(config(hold_schedule=[(0.1, 0.006)], hold_elements=[0, 2]))
+        held, live = partial._frame(first + 1), partial._live_frame(first + 1)
+        np.testing.assert_array_equal(held[[0, 2]], partial._frame(first - 1)[[0, 2]])
+        np.testing.assert_array_equal(held[[1, 3]], live[[1, 3]])  # the other elements are live
+
+    def test_seq_and_time_keep_advancing_through_a_hold(self) -> None:
+        sensor, frames = collect(config(hold_schedule=[(0.02, 0.02)]), 0.08)
+        seqs = [f.seq for f in frames]
+        assert seqs == list(range(seqs[0], seqs[0] + len(seqs)))  # no gap, no repeat
+        assert all(b.host_ts > a.host_ts for a, b in zip(frames, frames[1:], strict=False))
+        data = by_seq(frames)
+        assert all(s in data for s in range(9, 21))
+        assert all(np.array_equal(data[s], data[9]) for s in range(10, 20))
+        assert not np.array_equal(data[20], data[9])

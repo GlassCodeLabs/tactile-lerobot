@@ -39,6 +39,8 @@ class TestParsing:
         thresholds, checks = parse_fail_on("drift_units=0.2", Thresholds())
         assert thresholds.drift_units == 0.2 and checks == {"drift"}
         assert parse_fail_on("dropped,max_gap_ms=40", Thresholds())[1] == {"framerate"}
+        thresholds, checks = parse_fail_on("held=0.1", Thresholds())
+        assert thresholds.held == 0.1 and checks == {"held"}
         assert parse_fail_on("", Thresholds()) == (Thresholds(), set())
         with pytest.raises(UsageError, match="unknown check 'noise'"):
             parse_fail_on("noise=1", Thresholds())
@@ -49,7 +51,7 @@ class TestParsing:
 
     def test_checks(self) -> None:
         assert parse_checks("skew, drift") == ["drift", "skew"]  # report order
-        assert parse_checks("integrity,drift,framerate,saturation,gel,skew") == list(CHECK_NAMES)
+        assert parse_checks("held,integrity,drift,framerate,saturation,gel,skew") == list(CHECK_NAMES)
         with pytest.raises(UsageError, match="unknown \\['noise'\\]"):
             parse_checks("drift,noise")
         with pytest.raises(UsageError, match="no check given"):
@@ -93,6 +95,7 @@ class TestParsing:
         assert "missing keys meta.sessions[0].baseline.frame_range" in text
         assert "000012" in text and "ok copy,raw,files" in text and ", 1 rebaseline" in text
         assert "skipped gel: no visuotactile feature (1 episode)" in text
+        assert "0.16% held, run 1" in text and "2.00% held" not in text
         plain = copy.deepcopy(HEALTH)
         drift = plain["episodes"]["episode_000012"]["left_fingertip"]["drift"]
         drift["offset"] = {"skipped": "no session baseline"}
@@ -112,18 +115,31 @@ class TestParsing:
         assert text.rstrip().endswith(
             "2 episode(s), 1 instance(s), 0 flag(s); ! marks a flag, - a skipped check"
         )
-        # The cells of a plain dataset: a measured rate to two decimals, so 29.97 Hz is not 30.0, and
-        # the observed extremes shown at each end, never flagged.
+        # The cells of a plain dataset: a measured rate to two decimals, so 29.97 Hz is not 30.0, the
+        # steps over 1.5 periods counted, and the observed extremes shown at each end, never flagged.
         checks = plain["episodes"]["episode_000012"]["left_fingertip"]
         checks["framerate"].update(dropped_pct=None, frames=None, source="main_table", effective_hz=29.97)
+        checks["framerate"].update(declared_hz=30.0, clock="source_timestamp", stalled=3)
         checks["saturation"].update(at_min_pct=[0.915, 0.0, 0.0], at_max_pct=[0.0, 0.001, 0.0])
         text = format_report(HealthReport.from_dict(plain))
-        assert "29.97 Hz, gap 31 ms" in text and "min 91.5%, max 0.1% (observed)" in text
+        assert "29.97 Hz (source_timestamp), 11 gaps >50 ms, max 31 ms, 3 stalled" in text
+        assert "min 91.5%, max 0.1% (observed)" in text
         checks["framerate"]["timestamps"] = "nominal"
         checks["saturation"].update(limit="declared", confidence="declared", saturated_pct=[0.02, 0, 0])
         checks["saturation"]["flag"] = True
+        checks["held"].update(
+            held_pct=0.12,
+            longest_run=9,
+            nan_pct=[0.25] + [0.0] * 51,
+            flag=True,
+            groups={
+                "tip_a": {"held_pct": 0.0, "longest_run": 0, "single_holds": 0},
+                "tip_b": {"held_pct": 0.3, "longest_run": 9, "single_holds": 0},
+            },
+        )
         text = format_report(HealthReport.from_dict(plain))
-        assert "nominal, gap 31 ms" in text and "2.00% (declared) !" in text
+        assert "nominal, gap 31 ms, 3 stalled" in text and "2.00% (declared) !" in text
+        assert "12.00% held, run 9, tip_b 30.00%, NaN up to 25% !" in text
 
     def test_usage(self, capsys) -> None:
         assert main([]) == 2
@@ -203,6 +219,10 @@ class TestRun:
         assert "not a feature" in capsys.readouterr().err
         assert main([str(faulty), "--no-write", "--checks", "drift,noise"]) == 2
         assert "--checks: unknown ['noise']" in capsys.readouterr().err
+        assert main([str(faulty), "--no-write", "--clock", "observation.none"]) == 2
+        assert "clock column 'observation.none' is not a feature" in capsys.readouterr().err
+        assert main([str(faulty), "--no-write", "--clock", "observation.tactile.left_fingertip"]) == 2
+        assert "not one number per frame" in capsys.readouterr().err
 
     def test_checks_selects_what_runs(self, faulty, tmp_path, capsys) -> None:
         out_path = tmp_path / "report.json"

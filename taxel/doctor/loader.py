@@ -65,11 +65,17 @@ GUESS_WORDS = ("tactile", "touch", "wrench", "force")
 
 _IMAGE_DTYPES = ("video", "image")
 _ARRAY_DTYPES = ("float32", "float64")
+_CLOCK_DTYPES = ("float32", "float64", "int32", "int64")
 
 _REQUIRED_INFO_KEYS = frozenset(
     f.name for f in fields(TactileInfo) if f.default is MISSING and f.default_factory is MISSING
 )
 """The keys a tactile ``info`` block cannot lack; a block with none of them is not an instance's."""
+
+_CORE_INFO_PREFIXES = ("video.", "audio.")
+_CORE_INFO_KEYS = frozenset({"has_audio", "is_depth_map"})
+"""What LeRobot 0.6.1 writes into a video feature's ``info`` itself: the probed ``video.*`` and
+``audio.*`` values, ``has_audio`` and ``is_depth_map``. None of it belongs to the tactile block."""
 
 
 # --- Discovery -----------------------------------------------------------------------------------
@@ -185,7 +191,8 @@ class InstanceSource:
 
     ``kind`` is ``array`` for a float feature of one or two dimensions, ``image`` for a
     video or image feature. ``metadata``, ``error``, ``unknown_keys`` and ``missing_keys``
-    are what the lenient readers found; see :class:`~taxel.schema.InstanceReport`.
+    are what the lenient readers found; see :class:`~taxel.schema.InstanceReport`. ``names``
+    are the feature's own element names, when it gives one per element.
     """
 
     instance_id: str
@@ -200,6 +207,7 @@ class InstanceSource:
     sidecar: bool
     unknown_keys: list[str] = field(default_factory=list)
     missing_keys: list[str] = field(default_factory=list)
+    names: list[str] | None = None
 
     @property
     def family(self) -> str:
@@ -253,8 +261,9 @@ class EpisodeInputs:
     ``frames`` is the main-table copy as float32 ``(n, n_elements, n_channels)``, a
     one-dimensional feature reshaped to one channel; ``None`` for an image instance,
     whose frames come from :meth:`DoctorDataset.frames`. ``timestamps`` is LeRobot's
-    ``timestamp`` column. The sidecar inputs are ``None`` when absent, with the reason in
-    ``missing``.
+    ``timestamp`` column, and ``clock_times`` the column named by ``clock`` when the run reads
+    a dataset's real clock from a column of its own. The sidecar inputs are ``None`` when
+    absent, with the reason in ``missing``.
     """
 
     episode_index: int
@@ -267,6 +276,8 @@ class EpisodeInputs:
     session: SessionRecord | None
     origin: float | None
     missing: list[str]
+    clock: str | None = None
+    clock_times: NDArray[np.float64] | None = None
 
     @property
     def n_frames(self) -> int:
@@ -345,8 +356,27 @@ class DoctorDataset:
         sessions, sidecar, missing, session_error = self._read_sessions(instance_id, info)
         if session_error is not None:
             error = session_error if error is None else f"{error}; {session_error}"
+        names = entry.get("names")
+        per_element = (
+            kind == "array"
+            and isinstance(names, list)
+            and len(names) == shape[0]
+            and all(isinstance(n, str) for n in names)
+        )
         return InstanceSource(
-            instance_id, key, kind, dtype, shape, info, metadata, error, sessions, sidecar, unknown, missing
+            instance_id,
+            key,
+            kind,
+            dtype,
+            shape,
+            info,
+            metadata,
+            error,
+            sessions,
+            sidecar,
+            unknown,
+            missing,
+            names=list(names) if per_element else None,
         )
 
     @staticmethod
@@ -354,13 +384,15 @@ class DoctorDataset:
         key: str, entry: Mapping[str, Any]
     ) -> tuple[TactileInfo | None, str, str | None, list[str]]:
         block = entry.get("info")
-        own = {k: v for k, v in (block or {}).items() if not k.startswith("video.")}
+        own = {
+            k: v
+            for k, v in (block or {}).items()
+            if not k.startswith(_CORE_INFO_PREFIXES) and k not in _CORE_INFO_KEYS
+        }
         if not own.keys() & _REQUIRED_INFO_KEYS:
-            # LeRobot writes keys of its own beside ``video.*`` on every video feature (``has_audio``,
-            # ``is_depth_map``); a block with none of the tactile block's required keys is core's.
-            return None, "none", None, []
+            return None, "none", None, []  # LeRobot's own keys alone, or nothing: no tactile block
         try:
-            info, unknown = read_info_lenient(block)
+            info, unknown = read_info_lenient(own)
         except SchemaError as e:
             return None, "invalid", f"{key}: info block: {e}", []
         return info, "info", None, unknown
@@ -421,8 +453,32 @@ class DoctorDataset:
             self._stamps[episode_index] = self.timestamps(episode_index)
         return self._stamps[episode_index]
 
-    def episode_inputs(self, instance: InstanceSource, episode_index: int) -> EpisodeInputs:
-        """Collect the checks' inputs for one instance in one episode; what is absent goes in ``missing``."""
+    def check_clock(self, name: str) -> None:
+        """Make sure ``name`` is a main-table column holding one number per frame, usable as a clock.
+
+        Raises:
+            KeyError: If the dataset has no such feature.
+            SchemaError: If it is not one number per frame.
+        """
+        entry = self.features.get(name)
+        if entry is None:
+            raise KeyError(f"clock column {name!r} is not a feature of the dataset")
+        dtype, shape = entry.get("dtype"), list(entry.get("shape") or [])
+        if dtype not in _CLOCK_DTYPES or shape not in ([], [1]):
+            raise SchemaError(f"clock column {name!r} is {dtype} {shape}, not one number per frame")
+
+    def clock_times(self, name: str, episode_index: int) -> NDArray[np.float64]:
+        """A clock column's values for the episode, as float64 seconds; see :meth:`check_clock`."""
+        return np.asarray(self.column(name, episode_index), dtype=np.float64).reshape(-1)
+
+    def episode_inputs(
+        self, instance: InstanceSource, episode_index: int, clock: str | None = None
+    ) -> EpisodeInputs:
+        """Collect the checks' inputs for one instance in one episode; what is absent goes in ``missing``.
+
+        ``clock`` names a main-table column of real times (see :meth:`check_clock`) read beside
+        LeRobot's ``timestamp``.
+        """
         missing: list[str] = []
         timestamps = self.timestamps(episode_index)
         frames = None
@@ -463,6 +519,8 @@ class DoctorDataset:
             session,
             origin,
             missing,
+            clock,
+            self.clock_times(clock, episode_index) if clock is not None else None,
         )
 
     # --- Video ------------------------------------------------------------------------------------
@@ -520,12 +578,17 @@ class DoctorDataset:
 
         Raises:
             ImportError: Naming the extra when the decoder is not installed.
+            FileNotFoundError: If the episode's video file is not on disk.
             SchemaError: If the video's frames do not line up with the table's rows.
         """
         row = self.episode(episode_index)
         dtype = self.features[key].get("dtype")
         if dtype not in _IMAGE_DTYPES:
             raise SchemaError(f"{key} is {dtype!r}, not a video or image feature")
+        if not self.has_frames(key, episode_index):
+            video = row.videos.get(key)
+            where = "not in the episodes table" if video is None else video[0].relative_to(self.root)
+            raise FileNotFoundError(f"{key}: episode {episode_index}'s video file {where} not found")
         wanted = {int(i) for i in rgb_at}
         if dtype == "image":
             rows = self.column(key, episode_index)
@@ -568,6 +631,17 @@ class DoctorDataset:
             raise SchemaError(
                 f"{key} episode {episode_index}: the video ends after {k} of {row.length} frames"
             )
+
+    def has_frames(self, key: str, episode_index: int) -> bool:
+        """Whether the episode's frames of a video or image feature are on disk.
+
+        A partial download (``--include`` globs, or LeRobot's own partial load) leaves video files
+        out; an image feature is stored in the data parquet and is always there.
+        """
+        if self.features[key].get("dtype") == "image":
+            return True
+        video = self.episode(episode_index).videos.get(key)
+        return video is not None and video[0].is_file()
 
     def _png_frames(self, key: str, episode_index: int, indices: NDArray[np.int64]) -> NDArray[np.uint8]:
         rows = self.column(key, episode_index)

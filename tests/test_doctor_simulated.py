@@ -20,7 +20,15 @@ from taxel.dataset.writer import TactileDatasetWriter, tactile_features  # noqa:
 from taxel.doctor.checks import ENCODER_FLOOR  # noqa: E402
 from taxel.doctor.loader import DoctorDataset  # noqa: E402
 from taxel.doctor.report import run_doctor, write_report  # noqa: E402
-from taxel.schema import DriftReport, HealthReport, IntegrityReport, Skipped, Thresholds, feature_key  # noqa: E402
+from taxel.schema import (  # noqa: E402
+    DriftReport,
+    HealthReport,
+    IntegrityReport,
+    SchemaError,
+    Skipped,
+    Thresholds,
+    feature_key,
+)
 from taxel.sensors import (  # noqa: E402
     SimulatedTactile,
     SimulatedTactileConfig,
@@ -74,6 +82,19 @@ def record(base: Path, sensor: dict) -> Path:
 @pytest.fixture(scope="module")
 def faulty(tmp_path_factory) -> Path:
     return record(tmp_path_factory.mktemp("faulty"), FAULTS)
+
+
+LAPSES = {
+    **BASE,
+    "hold_schedule": [[1.0, 0.2], [1.6, 0.002]],  # in episode 0: 100 frames resent, then one
+    "nan_schedule": [[3.0, 0.2]],  # in episode 1: elements 0 and 1 lost for 0.2 s
+    "nan_elements": [0, 1],
+}
+
+
+@pytest.fixture(scope="module")
+def lapses(tmp_path_factory) -> Path:
+    return record(tmp_path_factory.mktemp("lapses"), LAPSES)
 
 
 @pytest.fixture(scope="module")
@@ -164,6 +185,30 @@ class TestCleanRecording:
             assert ep.gel.kind == "elements" and isinstance(ep.skew, Skipped)
         first = episodes[0].drift
         assert first.no_contact_windows < first.windows  # the press is there, and is not drift
+
+
+class TestLapses:
+    """A recording whose sensor resent frames in episode 0 and lost readings in episode 1."""
+
+    def test_held_frames_are_counted_and_flagged_on_the_native_stream(self, lapses) -> None:
+        _, (first, second) = checks(lapses)
+        held = first.held
+        assert held.source == "sidecar" and held.expected_pct == 0.0 and held.groups is None
+        assert held.longest_run == 100 and held.single_holds == 1
+        assert held.held_pct == pytest.approx(101 / held.frames) and held.flag  # about 10%, over 5%
+        assert first.framerate.stalled == 0  # the host clock kept advancing through the holds
+        assert second.held.held_pct == 0.0 and not second.held.flag
+        assert not first.integrity.flag  # a resent frame is stored as it came, and reproduces
+
+    def test_nan_is_reported_and_left_out(self, lapses) -> None:
+        _, (first, second) = checks(lapses)
+        assert first.saturation.nan_pct == [0.0] * 16
+        for block in (second.saturation, second.drift, second.held, second.gel):
+            assert block.nan_pct[:2] == [pytest.approx(0.1, abs=0.01)] * 2 and block.nan_pct[2:] == [0.0] * 14
+        assert second.held.frames < len(read_episode(episode_path(lapses, INSTANCE, 1))) - 1
+        assert isinstance(second.drift, DriftReport) and abs(second.drift.slope_per_s[0]) < 0.05
+        assert not second.integrity.flag  # NaN reproduced as NaN in the copy and the samples
+        assert second.integrity.copy.mismatches == 0 and second.integrity.raw.mismatches == 0
 
 
 class TestTamperedRecording:
@@ -301,10 +346,84 @@ class TestPlainDataset:
             assert gel.dead_pct == pytest.approx(4 / 17) and gel.flag
             contact = report.episodes[f"episode_{e:06d}"]["contact"].gel
             assert isinstance(contact, Skipped) and contact.skipped.startswith("binary feature")
-        # One checked episode cannot tell the idle zones from the dead ones, and does not flag.
+        # One checked episode cannot tell the idle zones from the dead ones: dead stays undecided.
         one = run_doctor(DoctorDataset(root), window_s=0.1, checks=["gel"], episodes=[1])
         gel = one.episodes["episode_000001"]["glove"].gel
-        assert gel.dead_elements == sorted(dead + [6, 10]) and gel.episodes_checked == 1 and not gel.flag
+        assert gel.constant_elements == sorted(dead + [6, 10]) and gel.dead_elements is None
+        assert gel.episodes_checked == 1 and gel.dead_pct == 0.0 and not gel.flag
+
+    def test_a_clock_column_runs_framerate_and_skew(self, tmp_path) -> None:
+        """A dataset that keeps ``timestamp`` nominal and its real clock in a column of its own."""
+        root = tmp_path / "clocked"
+        features = {
+            "observation.tactile.probe": {"dtype": "float32", "shape": [4, 3], "names": None},
+            "source_timestamp": {"dtype": "float64", "shape": [1], "names": ["seconds"]},
+        }
+        dataset = LeRobotDataset.create("taxel/clock", fps=30, features=features, root=root, use_videos=False)
+        rng = np.random.default_rng(0)
+        steps = np.full(89, 1 / 30)
+        steps[[10, 40, 41]] = [0.06, 0.0, 0.07]  # two long steps and a stalled one
+        clock = 1.7e9 + np.concatenate([[0.0], np.cumsum(steps)])
+        for t in clock:
+            frame = rng.normal(size=(4, 3)).astype(np.float32)
+            dataset.add_frame(
+                {"observation.tactile.probe": frame, "source_timestamp": np.array([t]), "task": "t"}
+            )
+        dataset.save_episode()
+        dataset.finalize()
+        report = run_doctor(DoctorDataset(root), window_s=0.5, clock="source_timestamp")
+        framerate = report.episodes["episode_000000"]["probe"].framerate
+        assert framerate.clock == "source_timestamp" and framerate.timestamps == "measured"
+        assert framerate.gap_histogram.counts[1:] == [2, 0, 0] and framerate.stalled == 1
+        assert framerate.max_gap_ms == pytest.approx(70.0, abs=0.01)  # epoch seconds resolve to about 0.2 us
+        nominal = run_doctor(DoctorDataset(root), window_s=0.5).episodes["episode_000000"]["probe"].framerate
+        assert nominal.timestamps == "nominal" and nominal.clock is None
+        with pytest.raises(KeyError, match="clock column 'missing'"):
+            run_doctor(DoctorDataset(root), clock="missing")
+        with pytest.raises(SchemaError, match="not one number per frame"):
+            run_doctor(DoctorDataset(root), clock="observation.tactile.probe")
+
+    def test_held_groups_come_from_the_feature_names(self, tmp_path) -> None:
+        """Two fingertips of six channels, named as T-Rex names them: a blackout filled on one tip is a
+        held group, not a held frame."""
+        root = tmp_path / "tips"
+        names = [f"left_{tip}_f6_{i}" for tip in ("thumb", "index") for i in range(6)]
+        features = {"observation.tactile_force": {"dtype": "float32", "shape": [12], "names": names}}
+        dataset = LeRobotDataset.create("taxel/tips", fps=30, features=features, root=root, use_videos=False)
+        rng = np.random.default_rng(0)
+        previous = None
+        for k in range(60):
+            frame = rng.normal(size=12).astype(np.float32)
+            if k in (20, 40) and previous is not None:
+                frame[:6] = previous[:6]  # the thumb repeats a frame, twice in the episode
+            dataset.add_frame({"observation.tactile_force": frame, "task": "t"})
+            previous = frame
+        dataset.save_episode()
+        dataset.finalize()
+        report = run_doctor(DoctorDataset(root), instances=["observation.tactile_force"], checks=["held"])
+        held = report.episodes["episode_000000"]["observation.tactile_force"].held
+        assert held.held_pct == 0.0 and held.source == "main_table" and not held.flag  # no declared rate
+        assert set(held.groups) == {"left_thumb_f6", "left_index_f6"}
+        assert held.groups["left_thumb_f6"].single_holds == 2 and held.groups["left_index_f6"].held_pct == 0.0
+
+    def test_a_missing_video_file_is_skipped_with_the_reason(self, tmp_path) -> None:
+        from test_loader import plain_dataset as plain
+
+        root = tmp_path / "partial"
+        plain(root, use_videos=True)
+        for video in (root / "videos" / "observation.images.cam").rglob("*.mp4"):
+            video.unlink()  # a partial download: the camera's files are not there
+        report = run_doctor(DoctorDataset(root), window_s=0.1, checks=["gel", "skew"])
+        block = report.episodes["episode_000000"]
+        assert block["probe"].skew.reference == "observation.tactile.gel"  # the camera is passed over
+        assert block["gel"].gel.kind == "pixels" or isinstance(block["gel"].gel, Skipped)
+        for video in (root / "videos" / "observation.tactile.gel").rglob("*.mp4"):
+            video.unlink()
+        report = run_doctor(DoctorDataset(root), window_s=0.1, checks=["gel", "skew"])
+        block = report.episodes["episode_000000"]
+        assert block["gel"].gel.skipped.startswith("observation.tactile.gel: episode 0's video file videos/")
+        assert block["gel"].gel.skipped.endswith("not found")
+        assert block["probe"].skew == Skipped("no reference: the video files of 2 camera(s) are not on disk")
 
     def test_checks_selects_what_runs(self, tmp_path) -> None:
         root = tmp_path / "plain"
@@ -402,6 +521,7 @@ class TestTwoSensors:
         assert sorted(report.instances) == ["gel", INSTANCE]
         gel = report.instances["gel"]
         assert gel.family == "visuotactile" and gel.metadata == "info" and not gel.sidecar
+        assert gel.unknown_keys == []  # LeRobot's has_audio and is_depth_map are not the tactile block's
         for e in (0, 1):
             block = report.episodes[f"episode_{e:06d}"]
             assert block[INSTANCE].skew.reference == GEL_KEY and block["gel"].skew.reference == ARRAY_KEY

@@ -5,6 +5,7 @@ import pytest
 
 from taxel.doctor.windows import (
     MAX_CANDIDATES,
+    QUIET_FRACTION,
     contact_signal,
     cross_correlate,
     largest_cluster,
@@ -69,6 +70,33 @@ class TestWindowStats:
         stats = window_stats(ramp_stream(noise=0.0).astype(np.float32), *window_edges(200, 50))
         assert stats.quiet.all() and float(stats.noise.max()) < 1e-6
 
+    def test_a_large_array_is_quiet_with_a_few_elements_moving(self) -> None:
+        """A glove of 100 cells: a window is quiet when nine tenths of its cells are within their noise,
+        so five cells pressed and released in the middle windows do not make those windows loud."""
+        rng = np.random.default_rng(0)
+        data = rng.normal(0.0, 0.01, (400, 100, 1))
+        steps = np.where((np.arange(400) // 10) % 2 == 0, 0.0, 1.0)  # on and off every 10 samples
+        steps[:100] = steps[300:] = 0.0  # in the middle four of eight windows only
+        data[:, :5, 0] += steps[:, None]
+        stats = window_stats(data, *window_edges(400, 50))
+        assert QUIET_FRACTION == 0.9 and stats.quiet.all()
+        data[:, 5:15, 0] += steps[:, None]  # fifteen cells moving: those four windows are not quiet
+        quiet = window_stats(data, *window_edges(400, 50)).quiet
+        assert quiet.tolist() == [True, True, False, False, False, False, True, True]
+
+    def test_an_element_without_two_finite_samples_counts_against_its_window(self) -> None:
+        data = ramp_stream()
+        data[50:99, 0] = np.nan  # one finite sample of element 0 left in the second window
+        data[160:170, 1] = np.nan  # ten missing in the fourth window: still a level and a spread
+        stats = window_stats(data, *window_edges(200, 50))
+        assert np.isnan(stats.level[1, 0, 0]) and np.isinf(stats.spread[1, 0, 0])
+        assert np.isfinite(stats.level[3]).all() and stats.quiet.tolist() == [True, False, True, True]
+        np.testing.assert_allclose(
+            stats.level[3, 1, 0],
+            np.nanmean(data[150:200, 1, 0]),  # the mean of the forty finite samples
+            rtol=1e-12,
+        )
+
 
 class TestNoContact:
     def test_plateau_is_contact_and_the_line_is_the_ramp(self) -> None:
@@ -111,6 +139,14 @@ class TestNoContact:
         assert first.candidates == MAX_CANDIDATES == 300  # 79,800 pairs exist; a seeded sample is tried
         np.testing.assert_allclose(first.slope, 0.5, atol=1e-9)
 
+    def test_a_level_missing_on_one_element_leaves_the_line_to_the_others(self) -> None:
+        t = np.arange(8) * 0.5 + 0.25
+        y = 0.5 * t[:, None, None] + np.zeros((20, 1))[None]
+        y[3, 7, 0] = np.nan  # one of twenty element-channels without a level in one window
+        fit = no_contact(y, t, np.ones(8, bool), np.full((20, 1), 0.01))
+        assert fit.mask.all()  # 19 of 20 is over nine tenths
+        np.testing.assert_allclose(fit.slope, 0.5, atol=1e-9)
+
     def test_half_the_windows_pressed_still_picks_the_rest_level(self) -> None:
         t = np.arange(6) * 0.5 + 0.25
         y = 0.5 * t[:, None, None] + np.zeros((2, 1))[None]
@@ -128,6 +164,13 @@ class TestSignals:
     def test_contact_signal_is_the_l1_distance_from_the_median_frame(self) -> None:
         data = np.zeros((10, 2, 1))
         data[4:7, 0, 0] = 2.0  # a press on element 0 in frames 4 to 6
+        np.testing.assert_allclose(contact_signal(data), [0, 0, 0, 0, 2, 2, 2, 0, 0, 0])
+
+    def test_contact_signal_with_nan_does_not_step_where_samples_go_missing(self) -> None:
+        data = np.zeros((10, 4, 1))
+        data[4:7, 0, 0] = 2.0  # the press
+        data[2, 1:, 0] = np.nan  # three of four elements missing in frame 2: no step
+        data[8, :, 0] = np.nan  # all missing in frame 8: repeats frame 7
         np.testing.assert_allclose(contact_signal(data), [0, 0, 0, 0, 2, 2, 2, 0, 0, 0])
 
     def test_motion_energy_is_the_mean_absolute_frame_difference(self) -> None:

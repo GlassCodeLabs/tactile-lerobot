@@ -19,6 +19,7 @@ from numpy.typing import NDArray
 from taxel import __version__
 from taxel.dataset.sidecar import episode_path, raw_frames, read_episode
 from taxel.doctor.checks import (
+    NAN_FLOOR,
     BaselineInputs,
     PixelStats,
     drift_check,
@@ -27,9 +28,12 @@ from taxel.doctor.checks import (
     gel_check_elements,
     gel_check_pixels,
     gel_dead_across,
+    held_check,
     integrity_copy,
     integrity_files,
     integrity_raw,
+    name_groups,
+    nan_fraction,
     pixel_stats,
     saturation_check,
     skew_check,
@@ -38,8 +42,10 @@ from taxel.doctor.loader import DoctorDataset, EpisodeInputs, InstanceSource, sa
 from taxel.doctor.windows import contact_signal
 from taxel.schema import (
     CHECK_NAMES,
+    FramerateReport,
     GelReport,
     HealthReport,
+    HeldReport,
     InstanceChecks,
     IntegrityReport,
     SessionRecord,
@@ -68,6 +74,7 @@ def run_doctor(
     instances: Iterable[str] = (),
     reference: str | None = None,
     checks: Iterable[str] | None = None,
+    clock: str | None = None,
     thresholds: Thresholds | None = None,
     window_s: float = 0.5,
     generated_at: str | None = None,
@@ -80,10 +87,15 @@ def run_doctor(
     feature the skew check correlates against: by default the first video or image feature
     that is not a checked instance, else another image instance, else another array
     instance; :data:`REFERENCE_ALL` decodes every video stream and takes the one with the
-    most motion. ``window_s`` is the drift check's window.
+    most motion. ``clock`` names a main-table column that holds the dataset's real per-frame
+    times where ``timestamp`` is nominal; the framerate and skew checks of a stream read from
+    the main table then run on it, and video is still decoded at ``timestamp``. ``window_s``
+    is the drift check's window.
 
     Raises:
-        KeyError: If no instance is found, or an episode, a check or the reference is unknown.
+        KeyError: If no instance is found, or an episode, a check, the reference or the clock
+            column is unknown.
+        SchemaError: If the clock column is not one number per frame.
     """
     thresholds = thresholds or Thresholds()
     sources = dataset.instances(instances)
@@ -102,14 +114,17 @@ def run_doctor(
     unknown_checks = sorted(selected - set(CHECK_NAMES))
     if unknown_checks:
         raise KeyError(f"unknown checks {unknown_checks}; the checks are {', '.join(CHECK_NAMES)}")
+    if clock is not None:
+        dataset.check_clock(clock)
     totals = _SessionTotals(dataset)
     report_episodes: dict[str, dict[str, InstanceChecks]] = {}
     stats: dict[tuple[str, int], PixelStats] = {}
     for e in wanted:
-        signals = _Signals(dataset, e, sources, gel_frames=GEL_FRAMES if "gel" in selected else None)
+        gel_frames = GEL_FRAMES if "gel" in selected else None
+        signals = _Signals(dataset, e, sources, gel_frames=gel_frames, clock=clock)
         block: dict[str, InstanceChecks] = {}
         for name, source in sources.items():
-            inputs = dataset.episode_inputs(source, e)
+            inputs = dataset.episode_inputs(source, e, clock=clock)
             block[name] = check_episode(inputs, thresholds, totals, window_s, signals, reference, selected)
             if source.key in signals.pixel_stats:
                 stats[(name, e)] = signals.pixel_stats[source.key]
@@ -157,14 +172,14 @@ def check_episode(
         gel = _gel(inputs, signals, thresholds) if "gel" in on else NOT_SELECTED
         skew = _skew(inputs, signals, reference, thresholds) if "skew" in on else NOT_SELECTED
     if source.kind != "array":
-        framerate = framerate_main_table(inputs.timestamps, inputs.fps, thresholds)
         return InstanceChecks(
             integrity=Skipped("image instance: no native stream to verify"),
             drift=Skipped("drift is defined for array instances"),
-            framerate=framerate if "framerate" in on else NOT_SELECTED,
+            framerate=_main_table_framerate(inputs, thresholds) if "framerate" in on else NOT_SELECTED,
             saturation=Skipped("saturation is defined for array instances"),
             gel=gel,
             skew=skew,
+            held=Skipped("held is defined for array instances") if "held" in on else NOT_SELECTED,
         )
     missing = inputs.missing[0] if inputs.missing else None
     session = inputs.session
@@ -213,7 +228,7 @@ def check_episode(
             saturation = saturation_check(raw, limits, "sidecar", thresholds)
     else:
         if "framerate" in on:
-            framerate = framerate_main_table(inputs.timestamps, inputs.fps, thresholds)
+            framerate = _main_table_framerate(inputs, thresholds)
         if "saturation" in on:
             saturation = saturation_check(frames, limits, "main_table", thresholds)
 
@@ -249,11 +264,35 @@ def check_episode(
         saturation=saturation,
         gel=gel,
         skew=skew,
+        held=_held(inputs, thresholds) if "held" in on else NOT_SELECTED,
     )
 
 
 GelReportOrSkipped = GelReport | Skipped
 SkewReportOrSkipped = SkewReport | Skipped
+
+
+def _main_table_framerate(inputs: EpisodeInputs, thresholds: Thresholds) -> FramerateReport:
+    """Framerate from the main table: the clock column when the run names one, else ``timestamp``."""
+    if inputs.clock is not None and inputs.clock_times is not None:
+        return framerate_main_table(inputs.clock_times, inputs.fps, thresholds, clock=inputs.clock)
+    return framerate_main_table(inputs.timestamps, inputs.fps, thresholds)
+
+
+def _held(inputs: EpisodeInputs, thresholds: Thresholds) -> HeldReport | Skipped:
+    """The held check on the native stream when there is one, else on the main-table copy.
+
+    A main-table copy of a sensor slower than the dataset repeats ``1 - rate / fps`` of its frames
+    by construction, and that is the expected fraction; the native stream should repeat none.
+    """
+    source = inputs.instance
+    groups = name_groups(source.names)
+    declared = source.declared_rate_hz
+    if inputs.native is not None:
+        return held_check(inputs.native.data, "sidecar", 0.0, declared is not None, thresholds, groups)
+    assert inputs.frames is not None
+    expected = max(0.0, 1.0 - declared / inputs.fps) if declared is not None else 0.0
+    return held_check(inputs.frames, "main_table", expected, declared is not None, thresholds, groups)
 
 
 def _gel(inputs: EpisodeInputs, signals: _Signals, thresholds: Thresholds) -> GelReportOrSkipped:
@@ -265,7 +304,7 @@ def _gel(inputs: EpisodeInputs, signals: _Signals, thresholds: Thresholds) -> Ge
         return gel_check_elements(data, thresholds)
     try:
         frames = signals.gel_sample(source.key)
-    except ImportError as e:
+    except (ImportError, FileNotFoundError) as e:
         return Skipped(str(e))
     stats = pixel_stats(frames)
     signals.pixel_stats[source.key] = stats
@@ -323,9 +362,16 @@ def _skew(
             if reference not in (None, REFERENCE_ALL)
             else signals.default_reference(source.key, everything=reference == REFERENCE_ALL)
         )
-    except ImportError as e:
+    except (ImportError, FileNotFoundError) as e:
         return Skipped(str(e))
     if key is None:
+        absent = [
+            k
+            for k in signals.image_keys
+            if k != source.key and not signals.dataset.has_frames(k, inputs.episode_index)
+        ]
+        if absent:
+            return Skipped(f"no reference: the video files of {len(absent)} camera(s) are not on disk")
         return Skipped("no reference: the dataset has no camera and no other tactile instance")
     if key == source.key:
         return Skipped(f"reference {key!r} is the instance itself")
@@ -333,7 +379,7 @@ def _skew(
     try:
         tactile_times, tactile = signals.signal(source.key, inputs, nominal)
         ref_times, ref = signals.signal(key, None, nominal)
-    except ImportError as e:
+    except (ImportError, FileNotFoundError) as e:
         return Skipped(str(e))
     if inputs.native is not None and inputs.origin is None:
         return Skipped(
@@ -347,7 +393,8 @@ class _Signals:
 
     Each video or image feature is decoded in one sequential pass (:meth:`DoctorDataset.iter_frames`)
     that yields the motion energy for the skew check and, for an image instance when the gel check
-    runs, the ``gel_frames`` sampled RGB frames the gel check reads.
+    runs, the ``gel_frames`` sampled RGB frames the gel check reads. The main-table times are the
+    ``clock`` column when the run names one, else ``timestamp``.
     """
 
     def __init__(
@@ -356,6 +403,7 @@ class _Signals:
         episode_index: int,
         sources: dict[str, InstanceSource],
         gel_frames: int | None = GEL_FRAMES,
+        clock: str | None = None,
     ) -> None:
         self.dataset = dataset
         self.episode_index = episode_index
@@ -365,7 +413,12 @@ class _Signals:
         """Per image instance key, the statistics its gel check read this episode; see :func:`_settle_gel`."""
         self._motion: dict[str, NDArray[np.float64]] = {}
         self._samples: dict[str, NDArray[np.uint8]] = {}
-        self._timestamps = dataset.timestamps(episode_index)
+        self._clock = clock
+        self._timestamps = (
+            dataset.clock_times(clock, episode_index)
+            if clock is not None
+            else dataset.timestamps(episode_index)
+        )
 
     @property
     def image_keys(self) -> list[str]:
@@ -408,9 +461,12 @@ class _Signals:
         The first video or image feature that is not a checked instance, a scene camera, so
         one stream is decoded for every instance; else the first other image instance; else
         another array instance. With ``everything`` the image feature with the most motion
-        in the episode, which decodes them all.
+        in the episode, which decodes them all. A video whose file is not on disk, as in a
+        partial download, is passed over.
         """
-        others = [k for k in self.image_keys if k != own_key]
+        others = [
+            k for k in self.image_keys if k != own_key and self.dataset.has_frames(k, self.episode_index)
+        ]
         if everything:
             best, best_energy = None, -1.0
             for key in others:
@@ -448,7 +504,11 @@ class _Signals:
             return times - 0.5 / self.dataset.fps, energy
         source = self.sources.get(key)
         if inputs is None or inputs.instance.key != key:
-            inputs = self.dataset.episode_inputs(source, self.episode_index) if source is not None else None
+            inputs = (
+                self.dataset.episode_inputs(source, self.episode_index, clock=self._clock)
+                if source is not None
+                else None
+            )
         if inputs is None:
             raise KeyError(f"{key!r} is not a tactile instance of this run")
         if not nominal and inputs.native is not None:
@@ -456,6 +516,7 @@ class _Signals:
         else:
             assert inputs.frames is not None
             times, data = self._timestamps, inputs.frames
+        data = data[:, nan_fraction(data) <= NAN_FLOOR]  # as the array checks: mostly-NaN elements are out
         return (times[1:] + times[:-1]) / 2.0, np.abs(
             np.diff(contact_signal(data))
         )  # between the two samples

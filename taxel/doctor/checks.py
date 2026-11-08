@@ -7,15 +7,25 @@ reads a file; :mod:`taxel.doctor.report` feeds these from the loader.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from functools import cached_property
 
 import numpy as np
 from numpy.typing import NDArray
 
 from taxel.dataset.reduce import reduce_episode
 from taxel.dataset.sidecar import BaselineRows, EpisodeStream, frame_times, raw_frames
-from taxel.doctor.windows import cross_correlate, largest_cluster, no_contact, window_edges, window_stats
+from taxel.doctor.windows import (
+    QUIET_FRACTION,
+    cross_correlate,
+    largest_cluster,
+    nanmedian,
+    no_contact,
+    window_edges,
+    window_stats,
+)
 from taxel.schema import (
     CopyCheck,
     DriftReport,
@@ -24,6 +34,8 @@ from taxel.schema import (
     FramerateReport,
     GapHistogram,
     GelReport,
+    HeldGroup,
+    HeldReport,
     RawCheck,
     RebaselineEvent,
     Reduction,
@@ -39,6 +51,7 @@ __all__ = [
     "DEAD_VARIANCE",
     "ENCODER_FLOOR",
     "GAP_EDGES_PERIODS",
+    "NAN_FLOOR",
     "PixelStats",
     "drift_check",
     "framerate_main_table",
@@ -46,10 +59,13 @@ __all__ = [
     "gel_check_elements",
     "gel_check_pixels",
     "gel_dead_across",
+    "held_check",
     "integrity_copy",
     "integrity_files",
     "integrity_raw",
     "max_gap_threshold_ms",
+    "name_groups",
+    "nan_fraction",
     "pixel_stats",
     "saturation_check",
     "skew_check",
@@ -82,6 +98,52 @@ largest magnitude: constant to one part in a thousand, on every channel."""
 GAP_EDGES_PERIODS = (1.5, 2.5, 3.5)
 """Bin edges of the gap histogram, in declared periods; the last bin is open."""
 
+NAN_FLOOR = 0.5
+"""An element NaN in more than this fraction of an episode's frames is left out of the array checks.
+
+NaN is how a dataset says a reading is missing (a blanked interval, a sensor that dropped out), never a
+reading. An element missing most of the episode has too little left to judge it by; below the floor the
+checks run on its finite frames. Every array block carries ``nan_pct`` per element, so what was left out
+is in the report.
+"""
+
+
+def nan_fraction(data: NDArray[np.floating]) -> NDArray[np.float64]:
+    """Per element, the fraction of frames in which it reads NaN on any channel; ``data`` is ``(n, E, C)``."""
+    values = np.asarray(data)
+    if not len(values):
+        return np.zeros(values.shape[1])
+    return np.isnan(values).any(axis=2).mean(axis=0)
+
+
+def _finite_elements(
+    data: NDArray[np.floating],
+) -> tuple[NDArray[np.float64], NDArray[np.bool_], list[float]] | Skipped:
+    """The elements of ``(n, E, C)`` at or under :data:`NAN_FLOOR` as float64, the mask of them and
+    ``nan_pct`` for every element; ``Skipped`` when no element is left."""
+    values = np.asarray(data, dtype=np.float64)
+    pct = nan_fraction(values)
+    keep = pct <= NAN_FLOOR
+    if not keep.any():
+        return Skipped(
+            f"NaN in more than {NAN_FLOOR:.0%} of the frames on every element "
+            f"(the least, {float(pct.min()):.1%}): nothing left to check"
+        )
+    return values[:, keep], keep, [float(p) for p in pct]
+
+
+def _same(a: NDArray[np.floating], b: NDArray[np.floating]) -> NDArray[np.bool_]:
+    """Elementwise equality in which NaN equals NaN: a missing value reproduced as missing is a match."""
+    return (a == b) | (np.isnan(a) & np.isnan(b))
+
+
+def _max_abs_diff(a: NDArray[np.floating], b: NDArray[np.floating]) -> float:
+    """The largest absolute difference over the values both sides hold."""
+    diff = np.abs(np.asarray(a, dtype=np.float64) - np.asarray(b, dtype=np.float64))
+    diff = diff[np.isfinite(diff)]
+    return float(diff.max()) if diff.size else 0.0
+
+
 _NOMINAL_ATOL = 1e-5
 
 
@@ -99,7 +161,7 @@ def integrity_copy(
 
     ``frames`` is the main-table copy ``(n, *shape)``; the reduction is ``reduction``'s
     method and window, or ``last`` over one dataset period when none is declared.
-    Equality is exact in float32.
+    Equality is exact in float32, and a NaN reproduced as NaN is equal.
     """
     method, window_ms = (
         ("last", 1000.0 / fps) if reduction is None else (reduction.method, reduction.window_ms)
@@ -114,25 +176,26 @@ def integrity_copy(
         return CopyCheck(
             frames=len(frames), mismatches=len(frames), first_mismatch=0, max_abs_diff=0.0, flag=True
         )
-    differs = np.any(stored != expected, axis=tuple(range(1, stored.ndim)))
+    differs = ~np.all(_same(stored, expected), axis=tuple(range(1, stored.ndim)))
     mismatches = int(differs.sum())
     first = int(np.flatnonzero(differs)[0]) if mismatches else None
-    max_diff = float(np.abs(stored.astype(np.float64) - expected).max()) if len(stored) else 0.0
+    max_diff = _max_abs_diff(stored, expected)
     return CopyCheck(len(frames), mismatches, first, max_diff, flag=mismatches > 0)
 
 
 def integrity_raw(native: EpisodeStream, rows: BaselineRows) -> RawCheck:
-    """``raw``: every sample row equals the reconstruction from stored data plus the captures, bit for bit."""
+    """``raw``: every sample row equals the reconstruction from stored data plus the captures, bit for bit
+    (a NaN reproduced as NaN is equal)."""
     raw = raw_frames(native, rows)
     sampled = rows.sample_index[rows.samples]
     values = rows.values[rows.samples]
     if sampled.size == 0:
         return RawCheck(samples=0, mismatches=0, first_mismatch=None, max_abs_diff=0.0, flag=False)
     reconstructed = raw[sampled]
-    differs = np.any(values != reconstructed, axis=tuple(range(1, values.ndim)))
+    differs = ~np.all(_same(values, reconstructed), axis=tuple(range(1, values.ndim)))
     mismatches = int(differs.sum())
     first = int(sampled[np.flatnonzero(differs)[0]]) if mismatches else None
-    max_diff = float(np.abs(values.astype(np.float64) - reconstructed).max())
+    max_diff = _max_abs_diff(values, reconstructed)
     return RawCheck(int(sampled.size), mismatches, first, max_diff, flag=mismatches > 0)
 
 
@@ -178,17 +241,17 @@ def max_gap_threshold_ms(thresholds: Thresholds, rate_hz: float) -> float:
     return thresholds.max_gap_ms if thresholds.max_gap_ms is not None else 10_000.0 / rate_hz
 
 
-def _gaps(times: NDArray[np.float64], rate_hz: float) -> tuple[float, GapHistogram, float]:
-    """Effective rate, the gap histogram in periods and the longest gap in ms of a time series."""
+def _gaps(times: NDArray[np.float64], rate_hz: float) -> tuple[float, GapHistogram, float, int]:
+    """Effective rate, the gap histogram in periods, the longest gap in ms and the zero-length steps."""
     n = len(times)
     if n < 2:
-        return 0.0, GapHistogram(list(GAP_EDGES_PERIODS), [0] * (len(GAP_EDGES_PERIODS) + 1)), 0.0
+        return 0.0, GapHistogram(list(GAP_EDGES_PERIODS), [0] * (len(GAP_EDGES_PERIODS) + 1)), 0.0, 0
     gaps = np.diff(times)
     effective = (n - 1) / float(times[-1] - times[0]) if times[-1] > times[0] else 0.0
     periods = gaps * rate_hz
     counts = np.histogram(periods, bins=[-np.inf, *GAP_EDGES_PERIODS, np.inf])[0]
     histogram = GapHistogram(list(GAP_EDGES_PERIODS), [int(c) for c in counts])
-    return effective, histogram, float(gaps.max() * 1000.0)
+    return effective, histogram, float(gaps.max() * 1000.0), int((gaps == 0).sum())
 
 
 def framerate_sidecar(
@@ -198,9 +261,14 @@ def framerate_sidecar(
     counters: FrameCounts | None,
     thresholds: Thresholds,
 ) -> FramerateReport:
-    """Framerate from the native stream: effective rate, gaps in ``host_ts``, drops from ``seq`` gaps."""
+    """Framerate from the native stream: effective rate, gaps in ``host_ts``, drops from ``seq`` gaps.
+
+    A step of zero length, a host clock that did not advance between two frames, is counted in
+    ``stalled``, apart from the drops: a stalled clock is a reader that delivered a frame twice
+    or stamped two frames at once, not a frame the device lost.
+    """
     times = np.asarray(host_ts, dtype=np.float64)
-    effective, histogram, max_gap = _gaps(times, declared_hz)
+    effective, histogram, max_gap, stalled = _gaps(times, declared_hz)
     dropped_pct = None
     if seq is not None and len(seq) > 1:
         span = int(seq[-1] - seq[0] + 1)
@@ -218,20 +286,24 @@ def framerate_sidecar(
         source="sidecar",
         timestamps="measured",
         flag=bool(flag),
+        stalled=stalled,
     )
 
 
 def framerate_main_table(
-    timestamps: NDArray[np.float64], fps: float, thresholds: Thresholds
+    timestamps: NDArray[np.float64], fps: float, thresholds: Thresholds, clock: str | None = None
 ) -> FramerateReport:
-    """Framerate from the main table's ``timestamp`` column: regularity against the dataset fps.
+    """Framerate from a main-table time column: regularity against the dataset fps.
 
-    LeRobot writes ``frame_index / fps`` there, in which case the column is ``nominal`` and
-    says nothing about the sensor; the check reports that rather than a result.
+    The column is LeRobot's ``timestamp``, or the one named by ``clock`` when a dataset keeps a
+    real clock in a column of its own. LeRobot writes ``frame_index / fps`` in ``timestamp``; a
+    column evenly spaced at that period from its first value is ``nominal`` and says nothing
+    about the sensor, and the check reports that rather than a result.
     """
     times = np.asarray(timestamps, dtype=np.float64)
-    nominal = bool(np.allclose(times, np.arange(len(times)) / fps, atol=_NOMINAL_ATOL))
-    effective, histogram, max_gap = _gaps(times, fps)
+    start = times[0] if len(times) else 0.0
+    nominal = bool(np.allclose(times - start, np.arange(len(times)) / fps, atol=_NOMINAL_ATOL))
+    effective, histogram, max_gap, stalled = _gaps(times, fps)
     limit = max_gap_threshold_ms(thresholds, fps)
     return FramerateReport(
         effective_hz=effective,
@@ -244,6 +316,8 @@ def framerate_main_table(
         source="main_table",
         timestamps="nominal" if nominal else "measured",
         flag=bool(max_gap > limit),
+        stalled=stalled,
+        clock=clock,
     )
 
 
@@ -265,23 +339,30 @@ def saturation_check(
     and the check never flags: a stream rests at an extreme as readily as it clips there
     (zero with nothing touching, a 0/1 contact flag, an ADC floor), so ``at_min_pct`` and
     ``at_max_pct`` are what a reader looks at, and a declared ``range`` is what makes the
-    fraction a saturation.
+    fraction a saturation. NaN samples are left out of every fraction, and an element NaN in
+    more than :data:`NAN_FLOOR` of the frames is left out of the check.
     """
-    values = np.asarray(data, dtype=np.float64).reshape(len(data), -1, data.shape[-1])
+    shaped = np.asarray(data, dtype=np.float64).reshape(len(data), -1, data.shape[-1])
+    usable = _finite_elements(shaped)
+    if isinstance(usable, Skipped):
+        return usable
+    values, _, nan_pct = usable
+    present = ~np.isnan(values)
     if limits is not None:
         lo, hi = (np.asarray(v, dtype=np.float64) for v in limits)
         limit, confidence = "declared", "declared"
         # Raw frames reconstructed from subtracted data carry float32 rounding: a few ulps of slack.
         slack = 4 * np.finfo(np.float32).eps * np.maximum(1.0, np.maximum(np.abs(lo), np.abs(hi)))
     else:
-        lo, hi = values.min(axis=(0, 1)), values.max(axis=(0, 1))
+        lo = np.where(present, values, np.inf).min(axis=(0, 1))
+        hi = np.where(present, values, -np.inf).max(axis=(0, 1))
         limit, confidence = "observed", "low"
         slack = np.zeros_like(lo)
-    at_min, at_max = values <= lo + slack, values >= hi - slack
-    none = np.zeros(values.shape[-1])
-    pct = (at_min | at_max).mean(axis=(0, 1)) if values.size else none
-    min_pct = at_min.mean(axis=(0, 1)) if values.size else none
-    max_pct = at_max.mean(axis=(0, 1)) if values.size else none
+    at_min, at_max = present & (values <= lo + slack), present & (values >= hi - slack)
+    count = np.maximum(present.sum(axis=(0, 1)), 1)
+    pct = (at_min | at_max).sum(axis=(0, 1)) / count
+    min_pct = at_min.sum(axis=(0, 1)) / count
+    max_pct = at_max.sum(axis=(0, 1)) / count
     return SaturationReport(
         saturated_pct=[float(p) for p in pct],
         at_min_pct=[float(p) for p in min_pct],
@@ -292,6 +373,7 @@ def saturation_check(
         confidence=confidence,
         source=source,
         flag=limits is not None and bool(np.any(pct > thresholds.saturated)),
+        nan_pct=nan_pct,
     )
 
 
@@ -335,9 +417,16 @@ def drift_check(
     the baseline in force is fitted per segment with :func:`~taxel.doctor.windows.no_contact`;
     the report's ``offset`` is the last segment's line at the last no-contact window (never
     extrapolated past the data), per channel the element of largest magnitude, signed, and
-    ``slope_per_s`` that line's slope, per channel the median over elements.
+    ``slope_per_s`` that line's slope, per channel the median over elements. An element NaN in
+    more than :data:`NAN_FLOOR` of the frames is left out, and NaN samples are left out of the
+    windows' levels and spreads.
     """
-    data = np.asarray(stored, dtype=np.float64)
+    usable = _finite_elements(stored)
+    if isinstance(usable, Skipped):
+        return usable
+    data, keep, nan_pct = usable
+    if not keep.all():
+        baseline = _kept_baseline(baseline, keep)
     n, n_elements, n_channels = data.shape
     window = max(2, int(round(window_s * rate_hz)))
     captures = baseline.captures
@@ -367,7 +456,7 @@ def drift_check(
         for w, (s, e) in enumerate(zip(starts, ends, strict=True)):
             inside = (index >= s) & (index < e)
             if inside.any():
-                raw_level[w] = values[inside].astype(np.float64).mean(axis=0)
+                raw_level[w] = _nanmean(values[inside].astype(np.float64))
                 t[w] = float(index[inside].mean()) / rate_hz  # the level is the samples', so is its time
                 used_samples += 1
     if source == "main_table":
@@ -390,14 +479,19 @@ def drift_check(
         mask[part], slope, intercept, candidates = fit.mask, fit.slope, fit.intercept, fit.candidates
     no_contact_idx = np.flatnonzero(mask)
     if no_contact_idx.size == 0:
+        if np.isnan(data).any():
+            return Skipped(
+                "no no-contact window in the episode: contact throughout, or NaN on more than "
+                f"{1 - QUIET_FRACTION:.0%} of the element-channels of every window"
+            )
         return Skipped("no no-contact window in the episode: contact throughout")
     first, last = no_contact_idx[0], no_contact_idx[-1]
     level_first, level_last = raw_level[first], raw_level[last]
-    no_contact_level = [float(v) for v in level_first.mean(axis=0)]
+    no_contact_level = [float(v) for v in _nanmean(level_first)]
     level_change = _extreme_per_channel(level_last - level_first)
-    slope_per_s = [float(v) for v in np.median(slope, axis=0)]  # the typical element, not the noisiest
+    slope_per_s = [float(v) for v in nanmedian(slope, axis=0)]  # the typical element, not the noisiest
 
-    if in_force is None or np.any(np.isnan(intercept)):
+    if in_force is None or np.all(np.isnan(intercept)):
         offset: list[float] | Skipped = Skipped("no session baseline")
         pct = None
         measure = np.abs(level_last - level_first)
@@ -410,6 +504,7 @@ def drift_check(
         measure = np.abs(end)
         pct = None
         confidence = "normal"
+    measure = np.where(np.isnan(measure), 0.0, measure)  # an element without a level there does not count
     # The flag: a fraction of the declared range, or the caller's native-unit threshold; else never.
     if limits is not None:
         lo, hi = (np.asarray(v, dtype=np.float64) for v in limits)
@@ -453,32 +548,65 @@ def drift_check(
         rebaselines=events,
         confidence=confidence,
         flag=flag,
+        nan_pct=nan_pct,
     )
 
 
+def _kept_baseline(baseline: BaselineInputs, keep: NDArray[np.bool_]) -> BaselineInputs:
+    """``baseline`` restricted to the elements in ``keep``, as the stream it goes with."""
+    captures, samples = baseline.captures, baseline.samples
+    return replace(
+        baseline,
+        captures=None if captures is None else (captures[0], captures[1], captures[2][:, keep]),
+        session_values=None if baseline.session_values is None else baseline.session_values[keep],
+        samples=None if samples is None else (samples[0], samples[1][:, keep]),
+    )
+
+
+def _nanmean(values: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Mean over the first axis of the non-NaN values; NaN where there are none, without a warning."""
+    present = ~np.isnan(values)
+    count = present.sum(axis=0)
+    total = np.where(present, values, 0.0).sum(axis=0)
+    return np.where(count > 0, total / np.maximum(count, 1), np.nan)
+
+
 def _extreme_per_channel(values: NDArray[np.float64]) -> list[float]:
-    """Per channel, the element with the largest magnitude, signed."""
-    picked = np.take_along_axis(values, np.abs(values).argmax(axis=0)[None, :], axis=0)[0]
+    """Per channel, the element with the largest magnitude, signed; a NaN element is passed over."""
+    magnitude = np.where(np.isnan(values), -1.0, np.abs(values))
+    picked = np.take_along_axis(values, magnitude.argmax(axis=0)[None, :], axis=0)[0]
     return [float(v) for v in picked]
 
 
 # --- Gel -------------------------------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class PixelStats:
     """What the pixel check reads off one episode's sampled frames; see :func:`pixel_stats`.
 
-    ``median_variance`` is the median per-pixel grayscale variance in counts²; ``dead_pct`` the
-    fraction of pixels at or under :data:`DEAD_VARIANCE` and ``largest_cluster_px`` the largest
-    4-connected cluster of them; ``area`` the pixels in a frame; ``frames_used`` the frames sampled.
+    ``median_variance`` is the median per-pixel grayscale variance in counts²; ``dead`` the mask of
+    pixels at or under :data:`DEAD_VARIANCE`; ``frames_used`` the frames sampled. ``dead_pct``,
+    ``area`` and ``largest_cluster_px``, the largest 4-connected cluster of dead pixels, are read
+    off the mask; the cluster is labelled only when asked for, since on a quiet gel most of a large
+    image is under the floor, the labelling takes about a second, and the check is skipped anyway.
     """
 
     median_variance: float
-    dead_pct: float
-    largest_cluster_px: int
-    area: int
+    dead: NDArray[np.bool_]
     frames_used: int
+
+    @property
+    def area(self) -> int:
+        return int(self.dead.size)
+
+    @property
+    def dead_pct(self) -> float:
+        return float(self.dead.mean()) if self.dead.size else 0.0
+
+    @cached_property
+    def largest_cluster_px(self) -> int:
+        return largest_cluster(self.dead)
 
 
 def pixel_stats(frames: NDArray[np.uint8]) -> PixelStats:
@@ -489,12 +617,10 @@ def pixel_stats(frames: NDArray[np.uint8]) -> PixelStats:
     check then skips.
     """
     k = len(frames)
-    area = int(frames.shape[1] * frames.shape[2]) if frames.ndim == 4 else 0
     if k < 2:
-        return PixelStats(0.0, 0.0, 0, area, k)
+        return PixelStats(0.0, np.zeros(frames.shape[1:3] if frames.ndim == 4 else (0, 0), bool), k)
     variance = np.asarray(frames, dtype=np.float32).mean(axis=-1).var(axis=0)
-    dead = variance <= DEAD_VARIANCE
-    return PixelStats(float(np.median(variance)), float(dead.mean()), largest_cluster(dead), area, k)
+    return PixelStats(float(np.median(variance)), variance <= DEAD_VARIANCE, k)
 
 
 def gel_check_pixels(
@@ -550,34 +676,42 @@ def gel_check_elements(data: NDArray[np.floating], thresholds: Thresholds) -> Ge
     relative to the other elements: a taxel array's elements share a unit but not a level of
     activity, and a plain dataset's "tactile" vector may hold quantities of different scales.
     One episode cannot tell a dead element from one nothing touched, so the block lists
-    ``constant_elements`` as an observation, leaves ``dead_elements`` empty and does not flag;
-    :func:`gel_dead_across` decides over the instance's episodes. A feature whose values are only
-    0 and 1 is skipped: a constant zone of a contact flag is an untouched zone. So is an episode in
-    which no element varies.
+    ``constant_elements`` as an observation, leaves ``dead_elements`` undecided (``None``) and
+    does not flag; :func:`gel_dead_across` decides over the instance's episodes. A feature whose
+    values are only 0 and 1 is skipped: a constant zone of a contact flag is an untouched zone.
+    So is an episode in which no element varies. NaN samples are left out, and an element NaN
+    in more than :data:`NAN_FLOOR` of the frames is neither constant nor dead.
     """
     n = len(data)
     if n < 2:
         return Skipped(f"{n} frame(s): variance needs at least two")
-    values = np.asarray(data, dtype=np.float64)
-    finite = values[np.isfinite(values)]
+    usable = _finite_elements(data)
+    if isinstance(usable, Skipped):
+        return usable
+    values, keep, nan_pct = usable
+    finite = values[~np.isnan(values)]
     if finite.size and bool(np.all((finite == 0.0) | (finite == 1.0))):
         return Skipped(
             "binary feature (values 0 and 1): a constant element is an untouched zone, not a dead one"
         )
-    spread = values.std(axis=0)
-    scale = np.maximum(np.abs(values).max(axis=0), np.finfo(np.float32).tiny)
-    constant = np.flatnonzero(np.all(spread <= CONSTANT_FRACTION * scale, axis=1))
-    if constant.size == values.shape[1]:
+    if np.isnan(values).any():  # a kept element is finite on every channel in half the frames or more
+        spread, scale = np.nanstd(values, axis=0), np.nanmax(np.abs(values), axis=0)
+    else:
+        spread, scale = values.std(axis=0), np.abs(values).max(axis=0)
+    scale = np.maximum(scale, np.finfo(np.float32).tiny)
+    local = np.flatnonzero(np.all(spread <= CONSTANT_FRACTION * scale, axis=1))
+    if local.size == values.shape[1]:
         return Skipped("stream does not vary: no element changes in this episode")
     return GelReport(
         kind="elements",
         dead_pct=0.0,
         largest_cluster_px=None,
-        dead_elements=[],
+        dead_elements=None,
         frames_used=n,
         flag=False,
-        constant_elements=[int(i) for i in constant],
+        constant_elements=[int(i) for i in np.flatnonzero(keep)[local]],
         episodes_checked=1,
+        nan_pct=nan_pct,
     )
 
 
@@ -587,18 +721,110 @@ def gel_dead_across(blocks: Sequence[GelReport], n_elements: int, thresholds: Th
 
     Returns one block per input with ``dead_elements`` the intersection of their
     ``constant_elements``, ``dead_pct`` its fraction of ``n_elements``, ``episodes_checked`` the
-    number of blocks, and the flag on ``dead_pct`` over ``gel``, set only with two or more
-    episodes: one episode cannot separate a dead element from an untouched one. The caller
-    groups the episodes, by session where a sidecar says which episodes share one, and leaves
-    out the episodes whose check was skipped.
+    number of blocks, and the flag on ``dead_pct`` over ``gel``. With fewer than two blocks
+    ``dead_elements`` stays undecided (``None``) and nothing flags: one episode cannot separate
+    a dead element from an untouched one. The caller groups the episodes, by session where a
+    sidecar says which episodes share one, and leaves out the episodes whose check was skipped.
     """
     if not blocks:
         return []
+    n = len(blocks)
+    if n < 2:
+        return [replace(b, dead_elements=None, dead_pct=0.0, episodes_checked=n, flag=False) for b in blocks]
     dead = sorted(set.intersection(*(set(b.constant_elements or []) for b in blocks)))
     pct = len(dead) / n_elements if n_elements else 0.0
-    n = len(blocks)
-    flag = n >= 2 and pct > thresholds.gel
+    flag = pct > thresholds.gel
     return [replace(b, dead_elements=dead, dead_pct=pct, episodes_checked=n, flag=flag) for b in blocks]
+
+
+# --- Held frames ---------------------------------------------------------------------------------------
+
+_INDEX_SUFFIX = re.compile(r"_\d+$")
+
+
+def name_groups(names: Sequence[str] | None) -> dict[str, list[int]] | None:
+    """Groups of elements whose names differ only in a trailing ``_<index>``, by the shared stem.
+
+    ``left_thumb_f6_0`` to ``left_thumb_f6_5`` are the group ``left_thumb_f6``. ``None`` unless at
+    least two groups of two or more elements come out: one group is the whole frame, and an
+    element alone says nothing a frame does not.
+    """
+    if not names:
+        return None
+    groups: dict[str, list[int]] = {}
+    for i, name in enumerate(names):
+        groups.setdefault(_INDEX_SUFFIX.sub("", str(name)), []).append(i)
+    kept = {stem: members for stem, members in groups.items() if len(members) >= 2}
+    return kept if len(kept) >= 2 else None
+
+
+def _holds(values: NDArray[np.float64]) -> tuple[float, int, int, int]:
+    """Held fraction, pairs compared, longest run and single holds over the rows of ``(n, ...)``.
+
+    A row is held when every value equals the row before. A pair in which either row holds a NaN
+    is not compared, so a missing frame is never a repeat, and it ends a run.
+    """
+    rows = values.reshape(len(values), -1)
+    missing = np.isnan(rows).any(axis=1)
+    compared = ~(missing[1:] | missing[:-1])
+    held = compared & np.all(rows[1:] == rows[:-1], axis=1)
+    frames = int(compared.sum())
+    if not frames:
+        return 0.0, 0, 0, 0
+    edges = np.diff(np.concatenate([[0], held.astype(np.int8), [0]]))
+    lengths = np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)
+    return float(held.sum() / frames), frames, int(lengths.max(initial=0)), int((lengths == 1).sum())
+
+
+def held_check(
+    data: NDArray[np.floating],
+    source: str,
+    expected_pct: float,
+    declared_rate: bool,
+    thresholds: Thresholds,
+    groups: Mapping[str, Sequence[int]] | None = None,
+) -> HeldReport | Skipped:
+    """Frames identical to the frame before in an array stream ``(n, E, C)``.
+
+    A device or a reader with no new frame that passes the last one on again leaves an exact
+    repeat: a glove clock that stalls, a blackout filled from the frame before, a run filled with
+    one value. Sensor noise makes an exact repeat of a live frame rare, so the held fraction is
+    the size of the fault. ``expected_pct`` is what the stream holds when correct; the flag needs
+    ``declared_rate``, a stream whose rate is known, and ``held_pct`` above ``expected_pct`` by
+    more than ``thresholds.held``. ``groups`` maps a name to element indices (see
+    :func:`name_groups`) and gives the same measures per group. A 0/1 feature is skipped, since it
+    repeats by nature; so is an element NaN in more than :data:`NAN_FLOOR` of the frames.
+    """
+    n = len(data)
+    if n < 2:
+        return Skipped(f"{n} frame(s): a held frame needs one before it")
+    usable = _finite_elements(data)
+    if isinstance(usable, Skipped):
+        return usable
+    values, keep, nan_pct = usable
+    finite = values[~np.isnan(values)]
+    if finite.size and bool(np.all((finite == 0.0) | (finite == 1.0))):
+        return Skipped("binary feature (values 0 and 1): a 0/1 stream repeats by nature")
+    held_pct, frames, longest, singles = _holds(values)
+    per_group: dict[str, HeldGroup] = {}
+    if groups:
+        position = np.cumsum(keep) - 1  # an element's index among the kept ones
+        for name, members in groups.items():
+            kept = [int(position[i]) for i in members if keep[i]]
+            if kept:
+                pct, _, run, single = _holds(values[:, kept])
+                per_group[name] = HeldGroup(pct, run, single)
+    return HeldReport(
+        held_pct=held_pct,
+        frames=frames,
+        longest_run=longest,
+        single_holds=singles,
+        expected_pct=float(expected_pct),
+        groups=per_group or None,
+        nan_pct=nan_pct,
+        source=source,
+        flag=bool(declared_rate and held_pct > expected_pct + thresholds.held),
+    )
 
 
 # --- Skew ------------------------------------------------------------------------------------------------

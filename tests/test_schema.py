@@ -557,7 +557,9 @@ class TestRange:
             TactileInfo.from_dict({**RIGHT_FINGERTIP, "range": {"min": 0.0, "max": 255.0}})
 
 
-# The report example from SCHEMA.md, "Health annotations".
+# The report example from SCHEMA.md, "Health annotations", with its "..." rows filled in: the
+# instance has 52 elements, and nan_pct has one value per element.
+NO_NAN = [0.0] * 52
 HEALTH = {
     "doctor_version": "0.1.0",
     "generated_at": "2026-11-05T14:03:05Z",
@@ -572,6 +574,7 @@ HEALTH = {
         "skew": 50.0,
         "confidence": 0.6,
         "saturated": 0.01,
+        "held": 0.05,
         "integrity": True,
     },
     "instances": {
@@ -631,6 +634,7 @@ HEALTH = {
                     "first_frame_zero": False,
                     "rebaselines": [{"sample_index": 1200, "host_ts": 10301.1, "delta": [0.0, 0.0, 0.03]}],
                     "confidence": "normal",
+                    "nan_pct": NO_NAN,
                     "flag": False,
                 },
                 "framerate": {
@@ -643,6 +647,8 @@ HEALTH = {
                     "frames": {"received": 30412, "dropped": 7, "overflowed": 0},
                     "source": "sidecar",
                     "timestamps": "measured",
+                    "stalled": 0,
+                    "clock": None,
                     "flag": False,
                 },
                 "saturation": {
@@ -654,6 +660,7 @@ HEALTH = {
                     "max": [3.1, 2.9, 24.8],
                     "confidence": "low",
                     "source": "sidecar",
+                    "nan_pct": NO_NAN,
                     "flag": False,
                 },
                 "gel": {"skipped": "no visuotactile feature"},
@@ -663,6 +670,17 @@ HEALTH = {
                     "reference": "observation.images.front",
                     "onsets": 3,
                     "resolution_ms": 5.0,
+                    "flag": False,
+                },
+                "held": {
+                    "held_pct": 0.0016,
+                    "frames": 611,
+                    "longest_run": 1,
+                    "single_holds": 1,
+                    "expected_pct": 0.0,
+                    "groups": None,
+                    "nan_pct": NO_NAN,
+                    "source": "sidecar",
                     "flag": False,
                 },
             }
@@ -713,12 +731,21 @@ class TestHealthReport:
 
     def test_a_report_from_before_the_added_keys_still_reads(self) -> None:
         """The keys added after 0.3.1 (saturation at_min_pct and at_max_pct, the gel block's cross-episode
-        fields, thresholds.cluster_pct) have defaults, so an older health.json still loads."""
+        fields, nan_pct, the framerate's stalled and clock, the held block and its threshold,
+        thresholds.cluster_pct) have defaults, so an older health.json still loads."""
         data = copy.deepcopy(HEALTH)
-        data["thresholds"] = {k: v for k, v in data["thresholds"].items() if k != "cluster_pct"}
+        data["thresholds"] = {k: v for k, v in data["thresholds"].items() if k not in ("cluster_pct", "held")}
         data["thresholds"]["cluster_px"] = 25
         block = data["episodes"]["episode_000012"]["left_fingertip"]
-        block["saturation"] = {k: v for k, v in block["saturation"].items() if not k.startswith("at_")}
+        del (
+            block["held"],
+            block["drift"]["nan_pct"],
+            block["framerate"]["stalled"],
+            block["framerate"]["clock"],
+        )
+        block["saturation"] = {
+            k: v for k, v in block["saturation"].items() if not k.startswith("at_") and k != "nan_pct"
+        }
         block["gel"] = {
             "kind": "elements",
             "dead_pct": 0.0,
@@ -729,12 +756,21 @@ class TestHealthReport:
         }
         report = HealthReport.from_dict(data)
         assert report.thresholds.cluster_px == 25 and report.thresholds.cluster_pct == 0.005
+        assert report.thresholds.held == 0.05
         checks = report.episodes["episode_000012"]["left_fingertip"]
         assert checks.saturation.at_min_pct is None and checks.saturation.at_max_pct is None
         assert checks.gel.constant_elements is None and checks.gel.rest_variance is None
-        assert checks.gel.episodes_checked == 1
+        assert checks.gel.episodes_checked == 1 and checks.held is None
+        assert (
+            checks.drift.nan_pct is None
+            and checks.framerate.stalled is None
+            and checks.framerate.clock is None
+        )
         out = report.to_dict()["episodes"]["episode_000012"]["left_fingertip"]
+        assert "held" not in out and list(out) == list(CHECK_NAMES[:-1])
         assert list(out["saturation"])[:3] == ["saturated_pct", "at_min_pct", "at_max_pct"]
+        assert list(out["drift"])[-2:] == ["nan_pct", "flag"]  # a check block's verdict stays last
+        assert list(out["framerate"])[-3:] == ["stalled", "clock", "flag"]
         assert list(out["gel"]) == [
             "kind",
             "dead_pct",
@@ -746,6 +782,7 @@ class TestHealthReport:
             "median_variance",
             "rest_variance",
             "episodes_checked",
+            "nan_pct",
             "flag",
         ]
 

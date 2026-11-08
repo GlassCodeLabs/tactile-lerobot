@@ -7,6 +7,7 @@ from taxel.dataset.reduce import reduce_episode
 from taxel.dataset.sidecar import BaselineRows, EpisodeStream, frame_times
 from taxel.doctor.checks import (
     ENCODER_FLOOR,
+    NAN_FLOOR,
     BaselineInputs,
     drift_check,
     framerate_main_table,
@@ -14,10 +15,13 @@ from taxel.doctor.checks import (
     gel_check_elements,
     gel_check_pixels,
     gel_dead_across,
+    held_check,
     integrity_copy,
     integrity_files,
     integrity_raw,
     max_gap_threshold_ms,
+    name_groups,
+    nan_fraction,
     pixel_stats,
     saturation_check,
     skew_check,
@@ -99,6 +103,30 @@ class TestFramerate:
         measured.sort()
         assert framerate_main_table(measured, 30.0, Thresholds()).timestamps == "measured"
         assert framerate_main_table(np.array([0.0, 0.5]), 30.0, Thresholds()).flag  # a 500 ms gap at 30 fps
+
+    def test_zero_length_steps_are_stalled_not_dropped(self) -> None:
+        host_ts = 1000.0 + np.arange(100) / RATE
+        host_ts[[20, 40, 41]] = host_ts[[19, 39, 39]]  # the clock did not advance on three steps
+        host_ts[42:] += 0.0  # and caught up after them
+        report = framerate_sidecar(np.sort(host_ts), np.arange(100), RATE, None, Thresholds())
+        assert report.stalled == 3 and report.dropped_pct == 0.0
+        assert framerate_sidecar(1000.0 + np.arange(100) / RATE, None, RATE, None, Thresholds()).stalled == 0
+        table = framerate_main_table(np.repeat(np.arange(15) / 15.0, 2), 30.0, Thresholds())
+        assert table.stalled == 15 and table.timestamps == "measured"
+
+    def test_a_clock_column_is_measured_and_named(self) -> None:
+        rng = np.random.default_rng(0)
+        steps = np.full(299, 1 / 30) + rng.normal(0.0, 0.002, 299)
+        steps[[50, 120]] = 0.052  # two steps over 1.5 periods
+        clock = 1.7e9 + np.concatenate([[0.0], np.cumsum(steps)])  # epoch seconds, as a recorder writes them
+        report = framerate_main_table(clock, 30.0, Thresholds(), clock="source_timestamp")
+        assert report.clock == "source_timestamp" and report.timestamps == "measured"
+        assert report.gap_histogram.counts[1] == 2 and report.max_gap_ms == pytest.approx(52.0)
+        assert report.effective_hz == pytest.approx(299 / float(clock[-1] - clock[0]))
+        # Evenly spaced at the dataset period from its first value is nominal, wherever it starts.
+        offset = 5.0 + np.arange(300) / 30.0
+        assert framerate_main_table(offset, 30.0, Thresholds(), clock="t").timestamps == "nominal"
+        assert framerate_main_table(np.arange(300) / 30.0, 30.0, Thresholds()).clock is None
 
     def test_max_gap_threshold(self) -> None:
         assert max_gap_threshold_ms(Thresholds(), 500.0) == 20.0
@@ -401,9 +429,8 @@ class TestGel:
         data[:, 6, :] = -1.0
         first = gel_check_elements(data, Thresholds())
         assert first.kind == "elements" and first.constant_elements == [3, 6]
-        assert (
-            first.dead_elements == [] and first.dead_pct == 0.0 and not first.flag
-        )  # one episode cannot tell
+        # One episode cannot tell a dead element from an untouched one: dead stays undecided.
+        assert first.dead_elements is None and first.dead_pct == 0.0 and not first.flag
         assert first.largest_cluster_px is None and first.frames_used == 100 and first.episodes_checked == 1
         second = np.random.default_rng(1).normal(0.0, 0.01, (80, 8, 2)).astype(np.float32)
         second[:, 3, :] = 0.0  # element 3 again; element 6 moves this time
@@ -416,7 +443,8 @@ class TestGel:
         assert blocks[0].constant_elements == [3, 6] and blocks[1].constant_elements == [1, 3]
         assert all(b.dead_pct == 0.125 and b.flag for b in blocks)  # 1 of 8 is over the 5% default
         alone = gel_dead_across([first], 8, Thresholds())[0]
-        assert alone.dead_elements == [3, 6] and alone.dead_pct == 0.25 and not alone.flag  # one episode
+        assert alone.dead_elements is None and alone.dead_pct == 0.0 and not alone.flag  # one episode
+        assert alone.constant_elements == [3, 6] and alone.episodes_checked == 1
         assert gel_dead_across([], 8, Thresholds()) == []
         clean = gel_check_elements(np.random.default_rng(1).normal(size=(100, 8, 2)), Thresholds())
         assert clean.constant_elements == [] and not clean.flag
@@ -431,6 +459,152 @@ class TestGel:
         # An element that is almost constant, within one part in a thousand of its level, is constant.
         mixed[:, 2, 0] = 5.0 + np.random.default_rng(3).normal(0.0, 1e-4, 100)
         assert gel_check_elements(mixed, Thresholds()).constant_elements == [2]
+
+
+class TestNaN:
+    """NaN marks a missing reading: left out of every statistic, and an element missing more than
+    half the frames is left out of the check, which says so when nothing is left."""
+
+    @staticmethod
+    def stream(n: int = 300, seed: int = 0) -> np.ndarray:
+        """Three elements on one channel: noise around 1.0, a slow ramp, a NaN interval on element 1
+        (20% of the frames) and element 2 NaN in 80% of them."""
+        rng = np.random.default_rng(seed)
+        t = np.arange(n) / RATE
+        data = (1.0 + 0.5 * t[:, None, None] + rng.normal(0.0, 0.01, (n, 3, 1))).astype(np.float32)
+        data[100:160, 1] = np.nan
+        data[: int(0.8 * n), 2] = np.nan
+        return data
+
+    def test_nan_fraction_is_per_element(self) -> None:
+        np.testing.assert_allclose(nan_fraction(self.stream()), [0.0, 0.2, 0.8])
+        two_channels = np.zeros((10, 2, 2))
+        two_channels[:3, 0, 1] = np.nan  # one channel is enough to make the frame missing
+        np.testing.assert_allclose(nan_fraction(two_channels), [0.3, 0.0])
+
+    def test_saturation_counts_finite_samples_of_the_kept_elements(self) -> None:
+        data = self.stream()
+        data[160:190, 1] = 3.0  # 30 of element 1's 240 finite frames pinned at a declared ceiling
+        report = saturation_check(data, (np.array([-3.0]), np.array([3.0])), "main_table", Thresholds())
+        assert report.nan_pct == pytest.approx([0.0, 0.2, 0.8])
+        assert report.saturated_pct == [pytest.approx(30 / 540)] and report.flag  # elements 0 and 1
+        observed = saturation_check(self.stream(), None, "main_table", Thresholds())
+        assert np.isfinite(observed.min[0]) and np.isfinite(observed.max[0]) and not observed.flag
+        all_out = np.full((10, 2, 1), np.nan)
+        all_out[:2] = 1.0
+        skipped = saturation_check(all_out, None, "main_table", Thresholds())
+        assert skipped == Skipped(
+            f"NaN in more than {NAN_FLOOR:.0%} of the frames on every element (the least, 80.0%): "
+            "nothing left to check"
+        )
+
+    def test_gel_leaves_a_missing_element_out_and_keeps_a_constant_one(self) -> None:
+        data = self.stream()
+        data[:, 0] = 0.25  # constant where it is finite
+        data[200:220, 0] = np.nan
+        report = gel_check_elements(data, Thresholds())
+        assert report.constant_elements == [0] and report.nan_pct == pytest.approx(
+            [0.0667, 0.2, 0.8], abs=1e-3
+        )
+
+    def test_drift_finds_the_ramp_on_the_finite_windows(self) -> None:
+        report = drift_check(self.stream(), RATE, BaselineInputs(), None, "main_table", None, Thresholds())
+        assert isinstance(report, DriftReport) and report.nan_pct == pytest.approx([0.0, 0.2, 0.8])
+        # Element 1 is missing through one window, which is therefore not quiet.
+        assert report.windows == 6 and report.no_contact_windows == 5
+        assert report.slope_per_s[0] == pytest.approx(0.5, abs=0.05)
+        assert report.level_change[0] == pytest.approx(0.5 * (2.75 - 0.25), abs=0.05)  # first to last window
+        dark = self.stream()
+        dark[:, 1] = np.nan
+        dark[::2, 1] = 1.0  # element 1 half missing, every other frame: no window has two finite samples
+        dark[25::50, 0] = np.nan  # and one NaN per window on element 0
+        dark[25::50, 1] = np.nan
+        report = drift_check(dark, RATE, BaselineInputs(), None, "main_table", None, Thresholds())
+        assert isinstance(report, DriftReport)  # every window still has element 0 on its finite samples
+
+    def test_drift_says_why_when_nan_breaks_every_window(self) -> None:
+        data = np.random.default_rng(0).normal(1.0, 0.01, (300, 2, 1)).astype(np.float32)
+        data[:150, 0] = np.nan  # element 0 missing for the first half, element 1 for the second:
+        data[150:, 1] = np.nan  # each is at the floor and kept, and no window has both
+        report = drift_check(data, RATE, BaselineInputs(), None, "main_table", None, Thresholds())
+        assert report == Skipped(
+            "no no-contact window in the episode: contact throughout, or NaN on more than 10% of the "
+            "element-channels of every window"
+        )
+
+    def test_integrity_matches_a_nan_reproduced_as_nan(self) -> None:
+        raw = drifting_raw(300)
+        raw[100:110, 1] = np.nan
+        stored = raw - REST[None]
+        rows = baseline_rows([(0, REST)], [(i, stored[i] + REST) for i in (0, 100, 200)])
+        report = integrity_raw(stream(stored), rows)
+        assert report.mismatches == 0 and not report.flag and report.max_abs_diff == 0.0
+        tampered = stored.copy()
+        tampered[100, 1] = 0.0  # a number where the sample row holds NaN
+        assert integrity_raw(stream(tampered), rows).first_mismatch == 100
+        native = stream(raw)
+        origin = float(native.host_ts[0]) + 0.1
+        frames = reduce_episode("mean", native.host_ts, native.data, frame_times(origin, 30, 30.0), 33.333)
+        from taxel.schema import Reduction
+
+        copy = integrity_copy(frames, native, origin, 30.0, Reduction("mean", 33.333))
+        assert np.isnan(frames).any() and copy.mismatches == 0 and not copy.flag
+
+
+def tips(n: int = 200, seed: int = 0) -> tuple[np.ndarray, list[str]]:
+    """Two fingertips of six channels each, as T-Rex names them, with noise on every frame."""
+    names = [f"left_{tip}_f6_{i}" for tip in ("thumb", "index") for i in range(6)]
+    data = np.random.default_rng(seed).normal(0.0, 1.0, (n, 12, 1)).astype(np.float32)
+    return data, names
+
+
+class TestHeld:
+    def test_holds_runs_and_single_holds(self) -> None:
+        data, _ = tips()
+        data[10] = data[9]  # a single-frame hold
+        data[20:23] = data[19]  # a run of three
+        data[50] = data[49]
+        report = held_check(data, "sidecar", 0.0, True, Thresholds())
+        assert report.frames == 199 and report.held_pct == pytest.approx(5 / 199)
+        assert report.longest_run == 3 and report.single_holds == 2 and report.groups is None
+        assert report.source == "sidecar" and report.expected_pct == 0.0 and not report.flag  # 2.5% < 5%
+        data[100:120] = data[99]
+        assert held_check(data, "sidecar", 0.0, True, Thresholds()).flag  # 12.6% held
+        assert not held_check(data, "sidecar", 0.0, False, Thresholds()).flag  # no declared rate: report only
+        assert not held_check(data, "main_table", 0.5, True, Thresholds()).flag  # a slower sensor's copy
+
+    def test_a_missing_frame_is_never_a_repeat(self) -> None:
+        data, _ = tips()
+        data[60:63] = np.nan  # three NaN frames: equal to each other, and still not held
+        data[61, 0] = 0.0
+        report = held_check(data, "main_table", 0.0, True, Thresholds())
+        assert report.frames == 199 - 4 and report.held_pct == 0.0 and report.longest_run == 0
+        assert report.nan_pct == pytest.approx([2 / 200] + [3 / 200] * 11)
+
+    def test_groups_from_names_catch_a_hold_of_one_fingertip(self) -> None:
+        data, names = tips()
+        data[30:32, :6] = data[29, :6]  # the thumb repeats for two frames, the index does not
+        groups = name_groups(names)
+        assert groups == {"left_thumb_f6": list(range(6)), "left_index_f6": list(range(6, 12))}
+        report = held_check(data, "main_table", 0.0, False, Thresholds(), groups)
+        assert report.held_pct == 0.0 and set(report.groups) == {"left_thumb_f6", "left_index_f6"}
+        thumb = report.groups["left_thumb_f6"]
+        assert thumb.held_pct == pytest.approx(2 / 199) and thumb.longest_run == 2 and thumb.single_holds == 0
+        assert report.groups["left_index_f6"].held_pct == 0.0
+
+    def test_name_groups_need_two_groups_of_two(self) -> None:
+        assert name_groups(["Fx_N", "Fy_N", "Fz_N", "Mx_Nm", "My_Nm", "Mz_Nm"]) is None
+        assert name_groups([f"taxel_{i}" for i in range(16)]) is None  # one group is the whole frame
+        assert name_groups(None) is None and name_groups([]) is None
+        assert name_groups(["a_0", "a_1", "b_0", "b_1", "c"]) == {"a": [0, 1], "b": [2, 3]}
+
+    def test_skips(self) -> None:
+        data, _ = tips()
+        assert held_check(data[:1], "sidecar", 0.0, True, Thresholds()).skipped.startswith("1 frame(s)")
+        contact = np.random.default_rng(0).integers(0, 2, (100, 17, 1)).astype(np.float32)
+        assert held_check(contact, "main_table", 0.0, True, Thresholds()).skipped.startswith("binary feature")
+        gone = np.full((10, 2, 1), np.nan)
+        assert "nothing left to check" in held_check(gone, "main_table", 0.0, True, Thresholds()).skipped
 
 
 def step_signal(times: np.ndarray, onsets: list[tuple[float, float]], level: float = 1.0) -> np.ndarray:

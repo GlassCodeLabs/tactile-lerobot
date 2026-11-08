@@ -58,6 +58,8 @@ __all__ = [
     "Gel",
     "GelReport",
     "HealthReport",
+    "HeldGroup",
+    "HeldReport",
     "InstanceChecks",
     "InstanceReport",
     "IntegrityReport",
@@ -113,7 +115,7 @@ SURFACES = ("gel", "die", "skin", "pad", "vendor")
 HEALTH_REPORT_PATH = "tactile/health.json"
 """Where ``taxel doctor`` writes its report, relative to the dataset root."""
 
-CHECK_NAMES = ("integrity", "drift", "framerate", "saturation", "gel", "skew")
+CHECK_NAMES = ("integrity", "drift", "framerate", "saturation", "gel", "skew", "held")
 """The checks a health report carries per episode per instance, in report order."""
 
 _SLUG = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -135,7 +137,8 @@ class Block:
     (keys left out of the dict when ``None``), ``_key_order`` (the key order in
     ``SCHEMA.md``, when it differs from field order) and ``_lenient_missing``
     (required keys a lenient read fills with ``None`` when absent, for documents
-    written under an earlier schema version).
+    written under an earlier schema version). Without ``_key_order`` a ``flag`` key is
+    written last, after any field a later version added with a default.
     """
 
     _label: ClassVar[str]
@@ -872,7 +875,9 @@ class DriftReport(Block):
     a baseline, so the numbers are a level change in unknown units. The flag compares
     ``offset_pct_range`` with the ``drift`` threshold when the range is known, and the
     native offset (or level change) with ``drift_units`` when the caller set one; without
-    either, drift never flags.
+    either, drift never flags. ``nan_pct`` is, per element, the fraction of frames in which it
+    reads NaN; an element over half is left out of the check, and the rest is measured on the
+    finite frames.
     """
 
     no_contact_level: list[float]
@@ -891,6 +896,7 @@ class DriftReport(Block):
     rebaselines: list[RebaselineEvent]
     confidence: str
     flag: bool
+    nan_pct: list[float] | None = None
 
     def __post_init__(self) -> None:
         _require_one_of(self.baseline, ("capture", "session", "none"), "drift.baseline")
@@ -915,8 +921,10 @@ class GapHistogram(Block):
 class FramerateReport(Block):
     """The framerate check. ``source`` is ``sidecar`` (native ``host_ts`` and ``seq``) or
     ``main_table``; ``timestamps`` says whether they were ``measured`` or are LeRobot's nominal
-    ``frame_index / fps`` (``nominal``), which says nothing about the sensor. ``frames`` is the
-    session's counters when known."""
+    ``frame_index / fps`` (``nominal``), which says nothing about the sensor. ``clock`` names the
+    main-table column the times were read from when it is not ``timestamp``. ``stalled`` counts
+    the steps of zero length, a clock that did not advance, apart from the drops. ``frames`` is
+    the session's counters when known."""
 
     effective_hz: float
     declared_hz: float | None
@@ -928,6 +936,8 @@ class FramerateReport(Block):
     source: str
     timestamps: str
     flag: bool
+    stalled: int | None = None
+    clock: str | None = None
 
     def __post_init__(self) -> None:
         _require_one_of(self.source, ("sidecar", "main_table"), "framerate.source")
@@ -939,7 +949,9 @@ class SaturationReport(Block):
     """The saturation check, per channel: the fraction of samples at or beyond the limit, and at the
     lower (``at_min_pct``) and the upper (``at_max_pct``) limit separately. ``limit`` is ``declared``
     (from ``range``) or ``observed`` (the extremes seen, ``confidence`` ``low``). Only a declared
-    limit flags: a stream rests at an observed extreme as readily as it clips there."""
+    limit flags: a stream rests at an observed extreme as readily as it clips there. ``nan_pct``
+    is per element; the fractions are of the finite samples of the elements NaN in at most half
+    the frames."""
 
     saturated_pct: list[float]
     limit: str
@@ -950,6 +962,7 @@ class SaturationReport(Block):
     flag: bool
     at_min_pct: list[float] | None = None
     at_max_pct: list[float] | None = None
+    nan_pct: list[float] | None = None
 
     _key_order: ClassVar[tuple[str, ...] | None] = (
         "saturated_pct",
@@ -960,6 +973,7 @@ class SaturationReport(Block):
         "max",
         "confidence",
         "source",
+        "nan_pct",
         "flag",
     )
 
@@ -978,8 +992,10 @@ class GelReport(Block):
     variance in counts² and ``rest_variance`` the instance's rest flicker the check was judged
     on, the quietest checked episode's median. ``kind`` ``elements``: ``constant_elements`` are
     the elements constant in this episode, an observation, and ``dead_elements`` those constant
-    in every checked episode of the instance, which is what flags. ``episodes_checked`` is how
-    many episodes that decision, or the rest flicker, was taken over.
+    in every checked episode of the instance, which is what flags; it is ``null`` until two
+    episodes were checked, since one cannot tell a dead element from one nothing touched.
+    ``episodes_checked`` is how many episodes that decision, or the rest flicker, was taken
+    over. ``nan_pct`` is per element, on an array stream.
     """
 
     kind: str
@@ -993,6 +1009,7 @@ class GelReport(Block):
     median_variance: float | None = None
     rest_variance: float | None = None
     episodes_checked: int = 1
+    nan_pct: list[float] | None = None
 
     _key_order: ClassVar[tuple[str, ...] | None] = (
         "kind",
@@ -1005,6 +1022,7 @@ class GelReport(Block):
         "median_variance",
         "rest_variance",
         "episodes_checked",
+        "nan_pct",
         "flag",
     )
 
@@ -1026,8 +1044,49 @@ class SkewReport(Block):
 
 
 @dataclass
+class HeldGroup(Block):
+    """Held frames of one group of elements, a fingertip's six channels say: the measures of
+    :class:`HeldReport` over the group's elements alone."""
+
+    held_pct: float
+    longest_run: int
+    single_holds: int
+
+
+@dataclass
+class HeldReport(Block):
+    """The held check on an array stream: frames identical to the frame before.
+
+    ``held_pct`` is the fraction of compared frames equal to the previous frame on every element,
+    and ``frames`` how many were compared: a pair in which either frame holds a NaN is left out,
+    and so is an element NaN in more than half the frames. ``longest_run`` is the most consecutive
+    held frames and ``single_holds`` the runs of exactly one. ``expected_pct`` is what a correct
+    stream holds anyway: 0 on a native stream, ``1 - rate / fps`` on a main-table copy of a slower
+    sensor. ``groups`` has the same measures per group of elements when the feature's names share
+    stems (``left_thumb_f6_0`` to ``_5``), else ``null``; a frame held on one group and not on the
+    others is a held group, not a held frame. ``source`` is ``sidecar`` or ``main_table`` and
+    ``nan_pct`` is per element. The flag needs a declared rate: ``held_pct`` above
+    ``expected_pct`` by more than the ``held`` threshold.
+    """
+
+    held_pct: float
+    frames: int
+    longest_run: int
+    single_holds: int
+    expected_pct: float
+    groups: dict[str, HeldGroup] | None
+    nan_pct: list[float]
+    source: str
+    flag: bool
+
+    def __post_init__(self) -> None:
+        _require_one_of(self.source, ("sidecar", "main_table"), "held.source")
+
+
+@dataclass
 class InstanceChecks(Block):
-    """One episode's checks for one instance, each a result or ``Skipped``."""
+    """One episode's checks for one instance, each a result or ``Skipped``. ``held`` is absent from
+    a report written before the check existed."""
 
     integrity: IntegrityReport | Skipped
     drift: DriftReport | Skipped
@@ -1035,6 +1094,9 @@ class InstanceChecks(Block):
     saturation: SaturationReport | Skipped
     gel: GelReport | Skipped
     skew: SkewReport | Skipped
+    held: HeldReport | Skipped | None = None
+
+    _omit_when_none: ClassVar[frozenset[str]] = frozenset({"held"})
 
 
 @dataclass
@@ -1070,7 +1132,7 @@ class Thresholds(Block):
     periods, resolved per instance and recorded in the framerate block. ``cluster_pct`` is the
     largest dead cluster as a fraction of the image; ``cluster_px`` the same in pixels, which
     replaces the fraction when set. ``confidence`` is the cross-correlation peak a skew lag needs
-    before it can be flagged."""
+    before it can be flagged. ``held`` is how far the held fraction may exceed the expected one."""
 
     drift: float = 0.05
     drift_units: float | None = None
@@ -1082,6 +1144,7 @@ class Thresholds(Block):
     skew: float = 50.0
     confidence: float = 0.6
     saturated: float = 0.01
+    held: float = 0.05
     integrity: bool = True
 
 
@@ -1131,7 +1194,7 @@ class _Reader:
 def _to_dict(obj: Any) -> dict[str, Any]:
     cls = type(obj)
     omit = getattr(cls, "_omit_when_none", frozenset())
-    order = getattr(cls, "_key_order", None) or tuple(f.name for f in fields(obj))
+    order = getattr(cls, "_key_order", None) or _flag_last(tuple(f.name for f in fields(obj)))
     out: dict[str, Any] = {}
     for name in order:
         value = getattr(obj, name)
@@ -1139,6 +1202,11 @@ def _to_dict(obj: Any) -> dict[str, Any]:
             continue
         out[name] = _encode(value)
     return out
+
+
+def _flag_last(names: tuple[str, ...]) -> tuple[str, ...]:
+    """Field order with ``flag`` moved last: a check block's verdict follows the fields added later."""
+    return (*(n for n in names if n != "flag"), "flag") if "flag" in names else names
 
 
 def _encode(value: Any) -> Any:
