@@ -1,4 +1,4 @@
-# Tactile data schema for LeRobot datasets — draft 0.3.1
+# Tactile data schema for LeRobot datasets — draft 0.3.2
 
 *Status: draft for feedback, November 2026. Nothing here is final. The goal is to converge with [LeRobot PR #4469](https://github.com/huggingface/lerobot/pull/4469), [TLabel](https://github.com/liesliy/tlabel) and [Multi-Frequency-LeRobot](https://github.com/RoboCoin-BAAI/Multi-Frequency-LeRobot), not to add a fourth incompatible layout. 0.3 applies the answers given on #4469 ([comment](https://github.com/huggingface/lerobot/pull/4469#issuecomment-6555461272)) to 0.2's open questions. The questions still open are listed at the end; those are the ones I'd most like answered.*
 
@@ -291,14 +291,15 @@ This project therefore records through the public API with its own `taxel record
 
 ## Health annotations
 
-`taxel doctor` writes one report per dataset to `tactile/health.json`, beside the data and never inside `info.json`. It carries the doctor version and the thresholds the run used, so two runs are distinguishable; what the run found out about each instance before checking any episode; and, per episode and per instance, the integrity check and the five health checks, each with its numbers and a `flag`:
+`taxel doctor` writes one report per dataset to `tactile/health.json`, beside the data and never inside `info.json`. It carries the doctor version and the thresholds the run used, so two runs are distinguishable; what the run found out about each instance before checking any episode; and, per episode and per instance, the integrity check and the six health checks, each with its numbers and a `flag`:
 
 ```json
 {
   "doctor_version": "0.1.0",
   "generated_at": "2026-11-05T14:03:05Z",
   "thresholds": {"drift": 0.05, "drift_units": null, "dropped": 0.02, "max_gap_ms": null, "gel": 0.05,
-                 "cluster_px": 25, "skew": 50.0, "confidence": 0.6, "saturated": 0.01, "integrity": true},
+                 "cluster_px": null, "cluster_pct": 0.005, "skew": 50.0, "confidence": 0.6, "saturated": 0.01,
+                 "held": 0.05, "integrity": true},
   "instances": {
     "left_fingertip": {"key": "observation.tactile.left_fingertip", "family": "taxel_array", "metadata": "info",
                        "sidecar": true, "declared_rate_hz": 91, "range": null,
@@ -316,24 +317,29 @@ This project therefore records through the public API with its own `taxel record
                   "baseline": "capture", "source": "samples", "baseline_age_s": 3.2, "frame_range": "not recorded",
                   "windows": 20, "no_contact_windows": 14, "candidates": 91, "first_frame_zero": false,
                   "rebaselines": [{"sample_index": 1200, "host_ts": 10301.1, "delta": [0.0, 0.0, 0.03]}],
-                  "confidence": "normal", "flag": false},
+                  "confidence": "normal", "nan_pct": [0.0, 0.0, "..."], "flag": false},
         "framerate": {"effective_hz": 89.4, "declared_hz": 91, "dropped_pct": 0.018, "max_gap_ms": 31.0,
                       "max_gap_threshold_ms": 109.9,
                       "gap_histogram": {"edges_periods": [1.5, 2.5, 3.5], "counts": [600, 9, 2, 0]},
                       "frames": {"received": 30412, "dropped": 7, "overflowed": 0},
-                      "source": "sidecar", "timestamps": "measured", "flag": false},
-        "saturation": {"saturated_pct": [0.0, 0.0, 0.0], "limit": "observed", "min": [-0.4, -0.5, -0.1],
-                       "max": [3.1, 2.9, 24.8], "confidence": "low", "source": "sidecar", "flag": false},
-        "gel": {"skipped": "no visuotactile feature"},
+                      "source": "sidecar", "timestamps": "measured", "stalled": 0, "clock": null, "flag": false},
+        "saturation": {"saturated_pct": [0.0, 0.0, 0.0], "at_min_pct": [0.0, 0.0, 0.0], "at_max_pct": [0.0, 0.0, 0.0],
+                       "limit": "observed", "min": [-0.4, -0.5, -0.1], "max": [3.1, 2.9, 24.8],
+                       "confidence": "low", "source": "sidecar", "nan_pct": [0.0, 0.0, "..."], "flag": false},
+        "gel": {"kind": "elements", "dead_pct": 0.0, "largest_cluster_px": null, "largest_cluster_pct": null,
+                "dead_elements": [], "constant_elements": [], "frames_used": 612, "median_variance": null,
+                "rest_variance": null, "episodes_checked": 14, "nan_pct": [0.0, 0.0, "..."], "flag": false},
         "skew": {"lag_ms": -12.0, "confidence": 0.81, "reference": "observation.images.front",
-                 "onsets": 3, "resolution_ms": 5.0, "flag": false}
+                 "onsets": 3, "resolution_ms": 5.0, "flag": false},
+        "held": {"held_pct": 0.0016, "frames": 611, "longest_run": 1, "single_holds": 1, "expected_pct": 0.0,
+                 "groups": null, "nan_pct": [0.0, 0.0, "..."], "source": "sidecar", "flag": false}
       }
     }
   }
 }
 ```
 
-A check that cannot run because its input is missing is `{"skipped": "<reason>"}` and nothing else, so an absent `flag` means "not evaluated", never "passed". The `integrity` check has three parts, `copy`, `raw` and `files`, each run or skipped on its own; on a dataset without a sidecar all three are skipped. `thresholds` records the values used, not a name. `drift` is a fraction of the declared range and `drift_units` a value in the stream's native units for instances without a `range`; with neither applicable, drift reports its numbers and never flags, and with no baseline either its `confidence` is `low`. `max_gap_ms` `null` means ten declared periods, resolved per instance into the framerate block's `max_gap_threshold_ms`, and `confidence` is the cross-correlation peak a skew lag needs before it can be flagged. `first_frame_zero` is an observation, never a flag. `instances` records how each instance's metadata was read (`info`, `none` for a plain LeRobot dataset, `invalid` with an `error`) and the lenient readers' unknown and missing keys. `gel` on an array instance reports `"kind": "elements"` and the zero-variance elements instead of pixel clusters. A flag is an annotation (principle 6); the exit code follows the thresholds the caller names.
+A check that cannot run because its input is missing is `{"skipped": "<reason>"}` and nothing else, so an absent `flag` means "not evaluated", never "passed". The `integrity` check has three parts, `copy`, `raw` and `files`, each run or skipped on its own; on a dataset without a sidecar all three are skipped. `thresholds` records the values used, not a name. `drift` is a fraction of the declared range and `drift_units` a value in the stream's native units for instances without a `range`; with neither applicable, drift reports its numbers and never flags, and with no baseline either its `confidence` is `low`. `max_gap_ms` `null` means ten declared periods, resolved per instance into the framerate block's `max_gap_threshold_ms`, and `confidence` is the cross-correlation peak a skew lag needs before it can be flagged. `cluster_pct` is the largest dead cluster as a fraction of the image; `cluster_px`, `null` by default, replaces it with a pixel count. `held` is how far the held fraction may exceed the expected one. `first_frame_zero` is an observation, never a flag. `instances` records how each instance's metadata was read (`info`, `none` for a plain LeRobot dataset, `invalid` with an `error`) and the lenient readers' unknown and missing keys. `gel` on an array instance reports `"kind": "elements"`: `constant_elements` in the episode, and `dead_elements`, constant in every one of `episodes_checked` episodes and `null` until two were checked; on an image instance it reports `"kind": "pixels"`, the dead fraction, the largest cluster in pixels and as a fraction of the image, and the episode's `median_variance` and the instance's `rest_variance` in counts². `held` counts the frames identical to the frame before, per group of elements when the feature's names give groups. Every array block carries `nan_pct`, per element the fraction of frames that read NaN. `framerate` counts zero-length steps in `stalled` and names the main-table `clock` column it read, `null` for `timestamp`. `saturation` reports `at_min_pct` and `at_max_pct` and flags only against a declared `range`. A key added after 0.3.1 has a default, so a report written under 0.3.1 still reads. A flag is an annotation (principle 6); the exit code follows the thresholds the caller names.
 
 For a video feature with `reduction`, `framerate` is measured against the dataset fps; the native rate is checked from the suffixed streams when present. For array families `drift` is read from the baseline stream: the raw samples against the baseline in force, which separates sensor drift from a sustained press, and a capture row inside an episode is reported as a `rebaseline` event rather than scored. On a dataset without a sidecar the checks degrade to what the main table allows and say so in `source`.
 
@@ -360,6 +366,7 @@ For a video feature with `reduction`, `framerate` is measured against the datase
 
 ## Changelog
 
+- 0.3.2 (2026-11-08): health report: new fields (`held`, `nan_pct`, `stalled`, `clock`, `at_min_pct`, `at_max_pct`, the gel block's cross-episode and variance fields, thresholds `cluster_pct` and `held`).
 - 0.3.1 (2026-11-05):
   - `range` added to the static metadata, optional, array families only: the rated range of the readings per channel, so a saturation check has a limit to measure against instead of the observed extremes.
   - Health report shape fixed: one document with `doctor_version`, `generated_at`, `thresholds` as the values used, an `instances` block with how each instance's metadata was read and the lenient readers' findings, and `episodes` keyed `episode_{index:06d}`; the `integrity` check with its three parts; the `{"skipped": reason}` form for a check that could not run; `gel` on array instances with `"kind": "elements"`.

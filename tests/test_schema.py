@@ -663,7 +663,20 @@ HEALTH = {
                     "nan_pct": NO_NAN,
                     "flag": False,
                 },
-                "gel": {"skipped": "no visuotactile feature"},
+                "gel": {
+                    "kind": "elements",
+                    "dead_pct": 0.0,
+                    "largest_cluster_px": None,
+                    "largest_cluster_pct": None,
+                    "dead_elements": [],
+                    "constant_elements": [],
+                    "frames_used": 612,
+                    "median_variance": None,
+                    "rest_variance": None,
+                    "episodes_checked": 14,
+                    "nan_pct": NO_NAN,
+                    "flag": False,
+                },
                 "skew": {
                     "lag_ms": -12.0,
                     "confidence": 0.81,
@@ -696,7 +709,8 @@ class TestHealthReport:
         assert json.loads(json.dumps(report.to_dict())) == HEALTH
         checks = report.episodes["episode_000012"]["left_fingertip"]
         assert isinstance(checks, InstanceChecks) and isinstance(checks.drift, DriftReport)
-        assert isinstance(checks.gel, Skipped) and checks.gel.skipped == "no visuotactile feature"
+        assert isinstance(checks.gel, GelReport) and checks.gel.kind == "elements"
+        assert checks.gel.dead_elements == [] and checks.gel.episodes_checked == 14
         assert checks.drift.frame_range == "not recorded" and checks.drift.rebaselines[0].sample_index == 1200
         assert [f for f in checks.to_dict()] == list(CHECK_NAMES)
 

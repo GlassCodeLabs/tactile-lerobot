@@ -94,7 +94,7 @@ class TestParsing:
         assert "left_fingertip  observation.tactile.left_fingertip  taxel_array" in text
         assert "missing keys meta.sessions[0].baseline.frame_range" in text
         assert "000012" in text and "ok copy,raw,files" in text and ", 1 rebaseline" in text
-        assert "skipped gel: no visuotactile feature (1 episode)" in text
+        assert "0 dead, 0 constant element(s)" in text
         assert "0.16% held, run 1" in text and "2.00% held" not in text
         plain = copy.deepcopy(HEALTH)
         drift = plain["episodes"]["episode_000012"]["left_fingertip"]["drift"]
