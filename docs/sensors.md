@@ -45,7 +45,7 @@ While connected, three methods return a `TactileReading` with different guarante
 
 ## Counters
 
-- `dropped_frames`: frames lost at the source. The base class detects them from gaps in `seq`; a backend with another gap signal calls `_count_dropped(n)`. Gap detection assumes `seq` only grows, so a backend whose device counter wraps (an 8-bit or 16-bit counter, say) must unwrap it into a monotonically increasing integer before building the reading.
+- `dropped_frames`: frames lost at the source. The base class detects them from gaps in `seq`; a backend whose device reports losses some other way, a loss counter for one, calls `_count_dropped(n)`. A gap in timestamps is never counted as a drop ([SCHEMA.md](../SCHEMA.md), Per-session metadata). Gap detection assumes `seq` only grows, so a backend whose device counter wraps (an 8-bit or 16-bit counter, say) must unwrap it into a monotonically increasing integer before building the reading.
 - `overflowed_frames`: frames discarded on the host because `drain()` was not called often enough.
 - `frames_received`: frames received since `connect()`.
 
@@ -59,7 +59,9 @@ Subtraction is never silent. `apply_baseline(values, frame_range)` makes the rea
 
 ## Metadata
 
-`metadata()` returns a `TactileInfo`, the static `info` block of the instance's feature entry, built from what the backend knows (family, vendor, model, channels, and the `layout`: the sensor's coordinate frame and the position of each element in it) and what the config supplies (`declared_rate_hz`, `mount`, `device`, `instance_id`). It validates itself on construction, so a backend that declares `taxel_array` without `channels` or without a `layout` fails at `metadata()`, not at write time.
+`metadata()` returns a `TactileInfo`, the static `info` block of the instance's feature entry, built from what the backend knows (family, vendor, model, the channels with each one's unit and source, and the `layout`: the sensor's coordinate frame and the position of each element in it) and what the config supplies (`declared_rate_hz`, `mount`, `device`, `instance_id`). It validates itself on construction, so a backend that declares `taxel_array` without `channels` or without a `layout` fails at `metadata()`, not at write time.
+
+A backend declares only the channels its sensor produces. A sensor that measures normal force alone declares one channel, not three with two filled with zeros, and a sensor that measures three force axes at one point is a one-element `taxel_array`. A channel the device reports is `measured`; one the backend computes from other readings is `derived`, with the `derived` block naming the method. `unavailable` is for converted data that has to keep a fixed channel set, never for a backend ([SCHEMA.md](../SCHEMA.md), Static metadata).
 
 ## Registry
 
