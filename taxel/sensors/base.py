@@ -29,7 +29,16 @@ from typing import Any, ClassVar, TypeVar
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from taxel.schema import Baseline, DeviceGroup, Mount, SchemaError, TactileFamily, TactileInfo, feature_key
+from taxel.schema import (
+    Baseline,
+    DeviceGroup,
+    Mount,
+    SchemaError,
+    TactileFamily,
+    TactileInfo,
+    Transport,
+    feature_key,
+)
 
 __all__ = [
     "AppliedBaseline",
@@ -94,6 +103,8 @@ class TactileSensorConfig:
             ) from None
         if not self.declared_rate_hz > 0:
             raise ValueError(f"declared_rate_hz must be positive, got {self.declared_rate_hz}")
+        if self.device is not None:
+            self.device.require_index()
         if not self.timeout_ms > 0:
             raise ValueError(f"timeout_ms must be positive, got {self.timeout_ms}")
         if self.buffer_size < 1:
@@ -295,7 +306,8 @@ class TactileSensor(abc.ABC):
 
         Called only from the background thread. Must return or raise ``TimeoutError``
         within ``config.timeout_ms`` so that :meth:`disconnect` can stop the thread.
-        Backends that detect gaps by a means other than ``seq`` call :meth:`_count_dropped`.
+        Backends whose device reports lost frames by a means other than ``seq``, a loss
+        counter for one, call :meth:`_count_dropped`; a gap in timestamps is never a drop.
         """
 
     @abc.abstractmethod
@@ -310,6 +322,14 @@ class TactileSensor(abc.ABC):
     @abc.abstractmethod
     def find_sensors() -> list[dict[str, Any]]:
         """Describe the devices of this type visible on the host, one dict per device."""
+
+    def transport(self) -> Transport | None:
+        """The link this sensor is read over and the rate it is configured to on it, for the session record.
+
+        ``None``, the default, records the link as unknown. A backend that knows them returns
+        both: the same sensor can run at different rates over different links.
+        """
+        return None
 
     # --- Lifecycle ----------------------------------------------------------------------------
 

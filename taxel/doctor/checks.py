@@ -260,12 +260,16 @@ def framerate_sidecar(
     declared_hz: float,
     counters: FrameCounts | None,
     thresholds: Thresholds,
+    configured_hz: float | None = None,
 ) -> FramerateReport:
     """Framerate from the native stream: effective rate, gaps in ``host_ts``, drops from ``seq`` gaps.
 
-    A step of zero length, a host clock that did not advance between two frames, is counted in
-    ``stalled``, apart from the drops: a stalled clock is a reader that delivered a frame twice
-    or stamped two frames at once, not a frame the device lost.
+    Drops are counted from ``seq`` only, never from timestamps. A step of zero length, a host
+    clock that did not advance between two frames, is counted in ``stalled``, apart from the
+    drops: a stalled clock is a reader that delivered a frame twice or stamped two frames at
+    once, not a frame the device lost. ``configured_hz``, the rate the session's ``transport``
+    says the sensor was set to, is reported beside the effective rate and never flagged; gaps
+    are measured in periods of ``declared_hz``.
     """
     times = np.asarray(host_ts, dtype=np.float64)
     effective, histogram, max_gap, stalled = _gaps(times, declared_hz)
@@ -287,6 +291,7 @@ def framerate_sidecar(
         timestamps="measured",
         flag=bool(flag),
         stalled=stalled,
+        configured_hz=None if configured_hz is None else float(configured_hz),
     )
 
 

@@ -2,6 +2,7 @@
 
 import re
 import time
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -23,7 +24,7 @@ from taxel.dataset.sidecar import (  # noqa: E402
     read_session_meta,
 )
 from taxel.dataset.writer import TactileDatasetWriter, baseline_rows, tactile_features  # noqa: E402
-from taxel.schema import Reduction, SchemaError, Skin  # noqa: E402
+from taxel.schema import Channel, DeviceGroup, Reduction, SchemaError, Skin, Transport  # noqa: E402
 from taxel.sensors import SimulatedTactile, SimulatedTactileConfig, TactileReading, host_clock  # noqa: E402
 from taxel.sensors.base import AppliedBaseline  # noqa: E402
 
@@ -103,6 +104,18 @@ class TestFeatures:
         with pytest.raises(ValueError, match="not connected"):
             tactile_features([SimulatedTactile(sensor_config())], FPS)
 
+    def test_device_index_is_carried_and_unique_on_a_device(self, connected) -> None:
+        thumb = connected(instance_id="thumb", device=DeviceGroup("hand", "hand", 0))
+        index = connected(instance_id="index", device=DeviceGroup("hand", "hand", 1))
+        features = tactile_features([thumb, index], FPS)
+        assert read_feature_entry(features["observation.tactile.thumb"]).device.index == 0
+        assert read_feature_entry(features["observation.tactile.index"]).device == DeviceGroup(
+            "hand", "hand", 1
+        )
+        twin = connected(instance_id="middle", device=DeviceGroup("hand", "hand", 1))
+        with pytest.raises(SchemaError, match="'index' and 'middle' share device.index 1 on device 'hand'"):
+            tactile_features([thumb, index, twin], FPS)
+
 
 class TestWriterSetup:
     def test_dataset_must_carry_the_sensor_metadata(self, connected, tmp_path) -> None:
@@ -119,6 +132,44 @@ class TestWriterSetup:
             TactileDatasetWriter(dataset, [sensor], baseline_s=0, apply_baseline=True)
         with pytest.raises(SchemaError, match="sample_every"):
             TactileDatasetWriter(dataset, [sensor], baseline_sample_every=0)
+
+    def test_a_dataset_recorded_under_0_3_cannot_be_resumed(self, connected, tmp_path) -> None:
+        sensor = connected()
+        dataset = make_dataset(tmp_path / "ds", [sensor])
+        info = dataset.meta.features[KEY]["info"]
+        info["channels"] = [c["name"] for c in info["channels"]]  # as SCHEMA 0.3.x wrote them
+        info["units"] = {"force": "N"}
+        with pytest.raises(SchemaError, match="recorded under SCHEMA 0.3.x.*resuming it needs a new dataset"):
+            TactileDatasetWriter(dataset, [sensor])
+
+    def test_counts_need_an_uncalibrated_session(self, connected, tmp_path) -> None:
+        """A sensor that reports raw ADC counts: its session records the calibration method as uncalibrated,
+        and a caller who gives another method is refused when the session starts, before any recording."""
+
+        class CountsSensor(SimulatedTactile):
+            def metadata(self):
+                info = super().metadata()
+                return replace(info, channels=[Channel(c.name, "counts", "measured") for c in info.channels])
+
+        sensor = CountsSensor(sensor_config())
+        sensor.connect()
+        try:
+            dataset = make_dataset(tmp_path / "ds", [sensor])
+            vendor = TactileDatasetWriter(
+                dataset, [sensor], baseline_s=0, session={"calibration": {"method": "vendor"}}
+            )
+            with pytest.raises(SchemaError, match=r"\['counts'\] require calibration.method 'uncalibrated'"):
+                vendor.start_session("one")
+            raw = {"calibration": {"method": "uncalibrated", "reference": "ADC 12-bit"}}
+            TactileDatasetWriter(dataset, [sensor], baseline_s=0, session=raw).start_session("two")
+            writer = TactileDatasetWriter(dataset, [sensor], baseline_s=0)
+            writer.start_session("three")
+            record(dataset, writer, n_episodes=1, n_frames=5)
+            writer.finalize()
+            calibration = read_session_meta(tmp_path / "ds", "left_fingertip").sessions[0].calibration
+            assert calibration.method == "uncalibrated" and calibration.version is None
+        finally:
+            sensor.disconnect()
 
     def test_episode_protocol(self, connected, tmp_path) -> None:
         sensor = connected()
@@ -172,6 +223,7 @@ class TestEndToEnd:
         lo_seq, hi_seq = session.baseline.frame_range
         assert 0 <= lo_seq < hi_seq and session.baseline_stream.sample_every == 100
         assert session.skin == Skin(id="skin-7") and session.calibration is None and session.serial is None
+        assert session.transport == Transport("other", 500.0)  # no physical link, at the configured rate
         assert session.frames.received == counters[0]
         assert session.frames.dropped == counters[1]
         assert session.frames.overflowed == counters[2] == 0

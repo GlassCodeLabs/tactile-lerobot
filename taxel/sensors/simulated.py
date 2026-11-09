@@ -30,6 +30,7 @@ from taxel.schema import (
     SchemaError,
     TactileFamily,
     TactileInfo,
+    Transport,
     session_meta_path,
 )
 from taxel.sensors.base import (
@@ -294,6 +295,10 @@ class SimulatedTactile(TactileSensor):
     @staticmethod
     def find_sensors() -> list[dict[str, Any]]:
         return [{"id": "simulated", "type": "simulated"}]
+
+    def transport(self) -> Transport:
+        """No physical link: ``other``, at the declared rate the simulation runs at."""
+        return Transport("other", self.config.declared_rate_hz)
 
     def metadata(self) -> TactileInfo:
         cfg = self.config

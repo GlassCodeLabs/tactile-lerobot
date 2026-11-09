@@ -189,8 +189,9 @@ class Block:
     Subclasses may set ``_label`` (the root of error paths), ``_omit_when_none``
     (keys left out of the dict when ``None``), ``_key_order`` (the key order in
     ``SCHEMA.md``, when it differs from field order) and ``_lenient_missing``
-    (required keys a lenient read fills with ``None`` when absent, for documents
-    written under an earlier schema version). Without ``_key_order`` a ``flag`` key is
+    (keys a later schema version made required: a lenient read fills them with
+    ``None`` when absent and reports them, for documents written under an earlier
+    version). Without ``_key_order`` a ``flag`` key is
     written last, after any field a later version added with a default.
     """
 
@@ -583,22 +584,30 @@ class DeviceGroup(Block):
 
     Instances with the same ``clock`` have directly comparable ``device_ts``. ``index`` is the
     instance's 0-based position on the device, unique among the instances with the same ``id`` and
-    fixed for the dataset's life; a lenient read of 0.3 metadata, which had none, leaves it ``None``.
+    fixed for the dataset's life. :class:`TactileInfo` and a sensor config require it; a lenient read
+    of 0.3 metadata, which had none, leaves it ``None`` and reports it.
     """
 
     id: str
     clock: str
-    index: int | None
+    index: int | None = None
 
     _lenient_missing: ClassVar[frozenset[str]] = frozenset({"index"})
 
     def __post_init__(self) -> None:
         _require_slug(self.id, "device.id")
         _require_slug(self.clock, "device.clock")
-        if self.index is None and _LENIENT.get():
-            return
-        if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
-            raise SchemaError(f"device.index must be a non-negative integer, got {self.index!r}")
+        index = self.index
+        if index is not None and (isinstance(index, bool) or not isinstance(index, int) or index < 0):
+            raise SchemaError(f"device.index must be a non-negative integer, got {index!r}")
+
+    def require_index(self) -> None:
+        """Raise the fix when ``index`` is missing: it is set in the sensor config."""
+        if self.index is None:
+            raise SchemaError(
+                f"device.index is missing: set device.index in the sensor config, the instance's 0-based "
+                f"position on device {self.id!r}"
+            )
 
 
 @dataclass
@@ -682,6 +691,8 @@ class TactileInfo(Block):
             )
         if self.clock_column is not None:
             _require_nonempty_str(self.clock_column, "clock_column")
+        if self.device is not None and not _LENIENT.get():
+            self.device.require_index()
         if self.range is not None:
             if self.family not in ARRAY_FAMILIES:
                 raise SchemaError(f"range is defined for the array families, not {self.family.value!r}")
@@ -1249,13 +1260,13 @@ class IntegrityReport(Block):
 class RebaselineEvent(Block):
     """A capture row inside an episode: the baseline changed at ``sample_index``.
 
-    ``delta`` is, per channel, the largest change of the baseline across elements. The
-    event is reported, not scored as drift.
+    ``delta`` is, per channel, the largest change of the baseline across elements, ``None`` at an
+    ``unavailable`` channel. The event is reported, not scored as drift.
     """
 
     sample_index: int
     host_ts: float
-    delta: list[float]
+    delta: list[float | None]
 
 
 @dataclass
@@ -1280,14 +1291,15 @@ class DriftReport(Block):
     native offset (or level change) with ``drift_units`` when the caller set one; without
     either, drift never flags. ``nan_pct`` is, per element, the fraction of frames in which it
     reads NaN; an element over half is left out of the check, and the rest is measured on the
-    finite frames.
+    finite frames. Every per-channel list is ``None`` at a channel declared ``unavailable``, which
+    the check leaves out.
     """
 
-    no_contact_level: list[float]
-    level_change: list[float]
-    offset: list[float] | Skipped
-    offset_pct_range: list[float] | None
-    slope_per_s: list[float]
+    no_contact_level: list[float | None]
+    level_change: list[float | None]
+    offset: list[float | None] | Skipped
+    offset_pct_range: list[float | None] | None
+    slope_per_s: list[float | None]
     baseline: str
     source: str
     baseline_age_s: float | None
@@ -1372,17 +1384,17 @@ class SaturationReport(Block):
     (from ``range``) or ``observed`` (the extremes seen, ``confidence`` ``low``). Only a declared
     limit flags: a stream rests at an observed extreme as readily as it clips there. ``nan_pct``
     is per element; the fractions are of the finite samples of the elements NaN in at most half
-    the frames."""
+    the frames. Every per-channel list is ``None`` at a channel declared ``unavailable``."""
 
-    saturated_pct: list[float]
+    saturated_pct: list[float | None]
     limit: str
-    min: list[float]
-    max: list[float]
+    min: list[float | None]
+    max: list[float | None]
     confidence: str
     source: str
     flag: bool
-    at_min_pct: list[float] | None = None
-    at_max_pct: list[float] | None = None
+    at_min_pct: list[float | None] | None = None
+    at_max_pct: list[float | None] | None = None
     nan_pct: list[float] | None = None
 
     _key_order: ClassVar[tuple[str, ...] | None] = (
@@ -1686,11 +1698,11 @@ def _from_dict(cls: type, data: Any, reader: _Reader, path: str) -> Any:
     kwargs: dict[str, Any] = {}
     for field in fields(cls):
         if field.name not in data:
+            if not reader.strict and field.name in getattr(cls, "_lenient_missing", ()):
+                reader.missing.append(f"{path}.{field.name}")
+                kwargs[field.name] = None
+                continue
             if field.default is MISSING and field.default_factory is MISSING:
-                if not reader.strict and field.name in getattr(cls, "_lenient_missing", ()):
-                    reader.missing.append(f"{path}.{field.name}")
-                    kwargs[field.name] = None
-                    continue
                 raise SchemaError(f"{path}: missing required key {field.name!r}")
             continue
         kwargs[field.name] = _decode(hints[field.name], data[field.name], reader, f"{path}.{field.name}")

@@ -13,21 +13,32 @@ pytest.importorskip("lerobot")
 from lerobot.datasets import LeRobotDataset  # noqa: E402
 from test_loader import plain_dataset  # noqa: E402
 
+from taxel.cli.doctor import format_report  # noqa: E402
 from taxel.cli.main import main  # noqa: E402
 from taxel.dataset.features import feature_entry  # noqa: E402
-from taxel.dataset.sidecar import episode_path, read_episode, write_episode  # noqa: E402
+from taxel.dataset.sidecar import episode_path, read_episode, read_session_meta, write_episode  # noqa: E402
 from taxel.dataset.writer import TactileDatasetWriter, tactile_features  # noqa: E402
-from taxel.doctor.checks import ENCODER_FLOOR  # noqa: E402
+from taxel.doctor.checks import ENCODER_FLOOR, saturation_check  # noqa: E402
 from taxel.doctor.loader import DoctorDataset  # noqa: E402
-from taxel.doctor.report import run_doctor, write_report  # noqa: E402
+from taxel.doctor.report import UNAVAILABLE, run_doctor, write_report  # noqa: E402
 from taxel.schema import (  # noqa: E402
+    Axes,
+    Channel,
     DriftReport,
     HealthReport,
+    Indexing,
     IntegrityReport,
+    Layout,
+    Origin,
+    Processed,
+    Range,
     SchemaError,
     Skipped,
+    TactileInfo,
     Thresholds,
+    Transport,
     feature_key,
+    session_meta_path,
 )
 from taxel.sensors import (  # noqa: E402
     SimulatedTactile,
@@ -590,3 +601,204 @@ class TestNoVideo:
             assert ep.gel.kind == "elements" and ep.gel.dead_elements == [] and not ep.gel.flag
             assert isinstance(ep.skew, Skipped)
             assert ep.skew.skipped == "no reference: the dataset has no camera and no other tactile instance"
+
+
+# --- SCHEMA 0.4: channel sources, a clock column in info, processed images, 0.3 metadata --------------
+
+GRID = Layout(
+    Origin("corner", "cell 0"),
+    Axes("along a row", "down a column", "out of the skin"),
+    "skin",
+    indexing=Indexing("grid", [2, 4], [5.0, 5.0]),
+)
+
+
+def converted(
+    root: Path, info: TactileInfo, shape: tuple[int, ...], frames: list[list[np.ndarray]], **extra
+) -> Path:
+    """A dataset as a converter writes it: one instance with an ``info`` block and no sidecar, one list of
+    frames per episode, and ``extra`` main-table features with their per-frame values."""
+    key = feature_key("probe")
+    features = {key: feature_entry(info, shape)}
+    features.update({name: {"dtype": "float64", "shape": [1], "names": None} for name in extra})
+    dataset = LeRobotDataset.create("taxel/converted", fps=30, features=features, root=root, use_videos=False)
+    for e, episode in enumerate(frames):
+        for k, frame in enumerate(episode):
+            values = {name: np.array([columns[e][k]]) for name, columns in extra.items()}
+            dataset.add_frame({key: frame, **values, "task": "t"})
+        dataset.save_episode()
+    dataset.finalize()
+    return root
+
+
+def glove_frames(rng: np.random.Generator, n_episodes: int = 2, n: int = 60) -> list[list[np.ndarray]]:
+    """An eight-cell glove at rest near 1000 counts on fz; fx and fy are kept as zeros."""
+    out = []
+    for _ in range(n_episodes):
+        episode = []
+        for _ in range(n):
+            frame = np.zeros((8, 3), np.float32)
+            frame[:, 2] = 1000.0 + rng.normal(0.0, 5.0, 8)
+            episode.append(frame)
+        out.append(episode)
+    return out
+
+
+class TestSchema04:
+    def test_an_unavailable_channel_is_never_flagged(self, tmp_path) -> None:
+        """A glove converted with fx and fy kept beside its normal force: the two are unavailable, stored as
+        0.0. Against the converter's range [0, 4095] those zeros sit at the lower limit, so a saturation check
+        that read them would flag every frame."""
+        info = TactileInfo(
+            family="taxel_array",
+            declared_rate_hz=30,
+            session_meta=session_meta_path("probe"),
+            channels=[
+                Channel("fx", "counts", "unavailable"),
+                Channel("fy", "counts", "unavailable"),
+                Channel("fz", "counts", "measured"),
+            ],
+            range=Range(min=0.0, max=4095.0),
+            layout=GRID,
+        )
+        frames = glove_frames(np.random.default_rng(0))
+        report = run_doctor(DoctorDataset(converted(tmp_path / "glove", info, (8, 3), frames)), window_s=0.5)
+        for e in (0, 1):
+            checks = report.episodes[f"episode_{e:06d}"]["probe"]
+            for block in (checks.drift, checks.saturation, checks.gel, checks.held):
+                assert not isinstance(block, Skipped) and not block.flag
+            assert checks.saturation.limit == "declared"
+            assert checks.saturation.saturated_pct == [None, None, 0.0]
+            assert checks.drift.level_change[:2] == [None, None] and checks.drift.level_change[2] is not None
+        unmasked = saturation_check(np.stack(frames[0]), info.range.limits(3), "main_table", Thresholds())
+        assert unmasked.flag and unmasked.saturated_pct[:2] == [1.0, 1.0]
+        assert [c.source for c in report.instances["probe"].channels] == [
+            "unavailable",
+            "unavailable",
+            "measured",
+        ]
+        assert "channels fx, fy (counts, unavailable, not checked); fz (counts, measured)" in format_report(
+            report
+        )
+
+    def test_an_instance_with_no_measured_channel_is_not_checked(self, tmp_path) -> None:
+        names = ("fx", "fy", "fz", "mx", "my", "mz")
+        info = TactileInfo(
+            family="force_torque",
+            declared_rate_hz=30,
+            session_meta=session_meta_path("probe"),
+            channels=[Channel(n, "N" if n[0] == "f" else "N.m", "unavailable") for n in names],
+            layout=Layout(Origin("mount", "the flange"), Axes("x", "y", "out of the tool face"), "vendor"),
+        )
+        zeros = [[np.zeros((1, 6), np.float32)] * 30]
+        report = run_doctor(DoctorDataset(converted(tmp_path / "blank", info, (1, 6), zeros)), window_s=0.5)
+        checks = report.episodes["episode_000000"]["probe"]
+        for block in (checks.drift, checks.saturation, checks.gel, checks.held, checks.skew):
+            assert block == Skipped(UNAVAILABLE)
+        assert not isinstance(checks.framerate, Skipped)  # the timing is still there to check
+
+    def test_info_clock_column_is_the_default_clock_and_clock_overrides_it(self, tmp_path) -> None:
+        steps = np.full(89, 1 / 30)
+        steps[[10, 40, 41]] = [0.06, 0.0, 0.07]  # two long steps and a stalled one
+        source = 1.7e9 + np.concatenate([[0.0], np.cumsum(steps)])
+        host = 50.0 + np.arange(90) / 30
+        info = TactileInfo(
+            family="taxel_array",
+            declared_rate_hz=30,
+            session_meta=session_meta_path("probe"),
+            channels=[Channel(n, "N", "measured") for n in ("fx", "fy", "fz")],
+            layout=GRID,
+            clock_column="source_timestamp",
+        )
+        rng = np.random.default_rng(1)
+        frames = [[rng.normal(size=(8, 3)).astype(np.float32) for _ in range(90)]]
+        root = converted(
+            tmp_path / "clocked", info, (8, 3), frames, source_timestamp=[source], host_seconds=[host]
+        )
+
+        def framerate(**kwargs):
+            report = run_doctor(DoctorDataset(root), window_s=0.5, checks=["framerate"], **kwargs)
+            return report.episodes["episode_000000"]["probe"].framerate
+
+        default = framerate()
+        assert default == framerate(clock="source_timestamp")
+        assert (
+            default.clock == "source_timestamp" and default.stalled == 1 and default.timestamps == "measured"
+        )
+        override = framerate(clock="host_seconds")
+        assert override.clock == "host_seconds" and override.stalled == 0
+
+    def test_a_clock_column_that_names_no_clock_is_reported(self, tmp_path) -> None:
+        info = TactileInfo(
+            family="taxel_array",
+            declared_rate_hz=30,
+            session_meta=session_meta_path("probe"),
+            channels=[Channel("fz", "N", "measured")],
+            layout=GRID,
+            clock_column="t_epoch",
+        )
+        frames = [[np.random.default_rng(2).normal(size=(8, 1)).astype(np.float32) for _ in range(30)]]
+        report = run_doctor(
+            DoctorDataset(converted(tmp_path / "bad", info, (8, 1), frames)), checks=["framerate"]
+        )
+        assert "info.clock_column: clock column 't_epoch' is not a feature" in report.instances["probe"].error
+        framerate = report.episodes["episode_000000"]["probe"].framerate
+        assert framerate.clock is None and framerate.timestamps == "nominal"
+
+    def test_a_processed_image_skips_gel_with_the_reason(self, tmp_path) -> None:
+        info = TactileInfo(
+            family="visuotactile",
+            declared_rate_hz=30,
+            session_meta=session_meta_path("probe"),
+            layout=Layout(
+                Origin("corner", "the top-left pixel"), Axes("right", "down", "out of the gel"), "gel"
+            ),
+            processed=Processed("difference-image", "1.0"),
+        )
+        root = tmp_path / "diff"
+        key = feature_key("probe")
+        features = {key: feature_entry(info, (24, 32, 3), use_videos=False)}
+        dataset = LeRobotDataset.create("taxel/diff", fps=30, features=features, root=root, use_videos=False)
+        rng = np.random.default_rng(3)
+        for _ in range(10):
+            dataset.add_frame({key: rng.integers(0, 255, (24, 32, 3), dtype=np.uint8), "task": "t"})
+        dataset.save_episode()
+        dataset.finalize()
+        gel = run_doctor(DoctorDataset(root), checks=["gel"]).episodes["episode_000000"]["probe"].gel
+        assert gel == Skipped(
+            "processed image (difference-image 1.0): dead pixels are defined on raw gel frames"
+        )
+
+    def test_a_0_3_1_dataset_reads_through_the_lenient_path(self, clean, tmp_path, capsys) -> None:
+        root = tmp_path / "old"
+        shutil.copytree(clean, root)
+        path = root / "meta" / "info.json"
+        info = json.loads(path.read_text())
+        block = info["features"][feature_key(INSTANCE)]["info"]
+        block["channels"], block["units"] = [c["name"] for c in block["channels"]], {"force": "N"}
+        path.write_text(json.dumps(info))
+        report = run_doctor(DoctorDataset(root), window_s=WINDOW_S)
+        instance = report.instances[INSTANCE]
+        assert instance.metadata == "info" and instance.upgraded and instance.error is None
+        assert [(c.name, c.unit, c.source) for c in instance.channels] == [
+            ("fx", "N", "unknown"),
+            ("fy", "N", "unknown"),
+            ("fz", "N", "unknown"),
+        ]
+        assert HealthReport.from_dict(report.to_dict()) == report  # the report still reads back strictly
+        first = report.episodes["episode_000000"][INSTANCE]
+        assert isinstance(first.integrity, IntegrityReport) and not first.integrity.flag
+        assert isinstance(first.drift, DriftReport)  # an unknown channel is checked as data
+        assert main(["doctor", str(root), "--no-write", "--window-s", str(WINDOW_S)]) == 0
+        out = capsys.readouterr().out
+        assert out.count("SCHEMA 0.3 form") == 1 and "fx, fy, fz (N, source unknown)" in out
+
+    def test_the_configured_rate_is_reported_beside_the_effective_rate(self, clean) -> None:
+        assert read_session_meta(clean, INSTANCE).sessions[0].transport == Transport("other", 500.0)
+        report, blocks = checks(clean)
+        for block in blocks:
+            assert block.framerate.configured_hz == 500.0 and block.framerate.effective_hz > 0
+        instance = report.instances[INSTANCE]
+        assert not instance.upgraded and {(c.unit, c.source) for c in instance.channels} == {
+            ("N", "measured")
+        }

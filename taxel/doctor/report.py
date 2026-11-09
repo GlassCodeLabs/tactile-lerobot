@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,12 +43,15 @@ from taxel.doctor.loader import DoctorDataset, EpisodeInputs, InstanceSource, sa
 from taxel.doctor.windows import contact_signal
 from taxel.schema import (
     CHECK_NAMES,
+    DriftReport,
     FramerateReport,
     GelReport,
     HealthReport,
     HeldReport,
     InstanceChecks,
     IntegrityReport,
+    SaturationReport,
+    SchemaError,
     SessionRecord,
     SkewReport,
     Skipped,
@@ -65,6 +69,9 @@ REFERENCE_ALL = "all"
 
 NOT_SELECTED = Skipped("not selected")
 """The block of a check the caller left out of ``checks``."""
+
+UNAVAILABLE = "every channel is declared unavailable: stored as 0.0, none holds a measurement"
+"""Why an array check does not run on an instance whose channels are all ``unavailable``."""
 
 
 def run_doctor(
@@ -89,8 +96,10 @@ def run_doctor(
     instance; :data:`REFERENCE_ALL` decodes every video stream and takes the one with the
     most motion. ``clock`` names a main-table column that holds the dataset's real per-frame
     times where ``timestamp`` is nominal; the framerate and skew checks of a stream read from
-    the main table then run on it, and video is still decoded at ``timestamp``. ``window_s``
-    is the drift check's window.
+    the main table then run on it, and video is still decoded at ``timestamp``. Without
+    ``clock`` an instance's ``info.clock_column`` is its clock; one that names no clock of the
+    dataset is reported in the instance's ``error``, and the instance reads ``timestamp``.
+    ``window_s`` is the drift check's window.
 
     Raises:
         KeyError: If no instance is found, or an episode, a check, the reference or the clock
@@ -116,15 +125,19 @@ def run_doctor(
         raise KeyError(f"unknown checks {unknown_checks}; the checks are {', '.join(CHECK_NAMES)}")
     if clock is not None:
         dataset.check_clock(clock)
+    clocks = {
+        name: clock if clock is not None else _declared_clock(dataset, source)
+        for name, source in sources.items()
+    }
     totals = _SessionTotals(dataset)
     report_episodes: dict[str, dict[str, InstanceChecks]] = {}
     stats: dict[tuple[str, int], PixelStats] = {}
     for e in wanted:
         gel_frames = GEL_FRAMES if "gel" in selected else None
-        signals = _Signals(dataset, e, sources, gel_frames=gel_frames, clock=clock)
+        signals = _Signals(dataset, e, sources, gel_frames=gel_frames)
         block: dict[str, InstanceChecks] = {}
         for name, source in sources.items():
-            inputs = dataset.episode_inputs(source, e, clock=clock)
+            inputs = dataset.episode_inputs(source, e, clock=clocks[name])
             block[name] = check_episode(inputs, thresholds, totals, window_s, signals, reference, selected)
             if source.key in signals.pixel_stats:
                 stats[(name, e)] = signals.pixel_stats[source.key]
@@ -138,6 +151,21 @@ def run_doctor(
         instances={name: source.report() for name, source in sources.items()},
         episodes=report_episodes,
     )
+
+
+def _declared_clock(dataset: DoctorDataset, source: InstanceSource) -> str | None:
+    """The instance's ``info.clock_column`` when it names a clock of the dataset, else ``None``. One
+    that does not is reported in the instance's ``error``, and the instance reads ``timestamp``."""
+    name = source.clock_column
+    if name is None:
+        return None
+    try:
+        dataset.check_clock(name)
+    except (KeyError, SchemaError) as e:
+        reason = f"info.clock_column: {e.args[0] if e.args else e}; framerate and skew read timestamp"
+        source.error = reason if source.error is None else f"{source.error}; {reason}"
+        return None
+    return name
 
 
 def write_report(report: HealthReport, root: str | Path) -> Path:
@@ -161,7 +189,9 @@ def check_episode(
 
     ``signals`` holds the episode's decoded frames, motion-energy and contact signals, shared
     by the instances; without it the gel check on images and the skew check are skipped.
-    ``selected`` names the checks to run; the others are ``skipped: not selected``.
+    ``selected`` names the checks to run; the others are ``skipped: not selected``. The array
+    checks leave out the channels ``info`` declares ``unavailable``, whose stored zeros would
+    read as dead elements, held frames or a level that never moves, and report ``None`` there.
     """
     source = inputs.instance
     on = set(CHECK_NAMES) if selected is None else set(selected)
@@ -188,6 +218,9 @@ def check_episode(
     assert frames is not None
     rate = source.declared_rate_hz or inputs.fps
     limits = source.range.limits(source.n_channels) if source.range is not None else None
+    keep = source.available
+    transport = session.transport if session is not None else None
+    configured = transport.rate_hz if transport is not None else None
 
     # Integrity, first.
     if "integrity" not in on:
@@ -222,21 +255,21 @@ def check_episode(
     if native is not None:
         counters = session.frames if session is not None else None
         if "framerate" in on:
-            framerate = framerate_sidecar(native.host_ts, native.seq, rate, counters, thresholds)
+            framerate = framerate_sidecar(native.host_ts, native.seq, rate, counters, thresholds, configured)
         if "saturation" in on:
             raw = raw_frames(native, rows) if rows is not None and rows.captures.any() else native.data
-            saturation = saturation_check(raw, limits, "sidecar", thresholds)
+            saturation = _saturation(raw, limits, "sidecar", thresholds, keep)
     else:
         if "framerate" in on:
             framerate = _main_table_framerate(inputs, thresholds)
         if "saturation" in on:
-            saturation = saturation_check(frames, limits, "main_table", thresholds)
+            saturation = _saturation(frames, limits, "main_table", thresholds, keep)
 
     # Drift from the baseline stream and the native stream, else from the main table.
     if "drift" not in on:
         drift = NOT_SELECTED
     elif native is not None:
-        drift = drift_check(
+        drift = _drift(
             native.data,
             rate,
             _baseline_inputs(inputs),
@@ -245,17 +278,11 @@ def check_episode(
             inputs.origin,
             thresholds,
             window_s,
+            keep,
         )
     else:
-        drift = drift_check(
-            frames,
-            inputs.fps,
-            BaselineInputs(),
-            None if limits is None else limits,
-            "main_table",
-            None,
-            thresholds,
-            window_s,
+        drift = _drift(
+            frames, inputs.fps, BaselineInputs(), limits, "main_table", None, thresholds, window_s, keep
         )
     return InstanceChecks(
         integrity=integrity,
@@ -272,6 +299,101 @@ GelReportOrSkipped = GelReport | Skipped
 SkewReportOrSkipped = SkewReport | Skipped
 
 
+def _measured(data: NDArray[np.floating], keep: NDArray[np.bool_]) -> NDArray[np.floating]:
+    """``(n, E, C)`` without the channels ``keep`` leaves out."""
+    return data if keep.all() else data[..., keep]
+
+
+def _expand(values: list[float], keep: NDArray[np.bool_]) -> list[float | None]:
+    """Per-channel values computed on the kept channels, back in channel order with ``None`` at the others."""
+    if keep.all():
+        return list(values)
+    found = iter(values)
+    return [next(found) if k else None for k in keep]
+
+
+def _limits(
+    limits: tuple[NDArray[np.float64], NDArray[np.float64]] | None, keep: NDArray[np.bool_]
+) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None:
+    """``(min, max)`` limits of the kept channels; ``None`` stays ``None``."""
+    if limits is None or keep.all():
+        return limits
+    return limits[0][keep], limits[1][keep]
+
+
+def _saturation(
+    data: NDArray[np.floating],
+    limits: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
+    source: str,
+    thresholds: Thresholds,
+    keep: NDArray[np.bool_],
+) -> SaturationReport | Skipped:
+    """:func:`saturation_check` on the channels that hold a measurement; the others read ``None``."""
+    if not keep.any():
+        return Skipped(UNAVAILABLE)
+    block = saturation_check(_measured(data, keep), _limits(limits, keep), source, thresholds)
+    if isinstance(block, Skipped) or keep.all():
+        return block
+    return replace(
+        block,
+        saturated_pct=_expand(block.saturated_pct, keep),
+        at_min_pct=None if block.at_min_pct is None else _expand(block.at_min_pct, keep),
+        at_max_pct=None if block.at_max_pct is None else _expand(block.at_max_pct, keep),
+        min=_expand(block.min, keep),
+        max=_expand(block.max, keep),
+    )
+
+
+def _drift(
+    stored: NDArray[np.floating],
+    rate: float,
+    baseline: BaselineInputs,
+    limits: tuple[NDArray[np.float64], NDArray[np.float64]] | None,
+    source: str,
+    origin: float | None,
+    thresholds: Thresholds,
+    window_s: float,
+    keep: NDArray[np.bool_],
+) -> DriftReport | Skipped:
+    """:func:`drift_check` on the channels that hold a measurement; the others read ``None``."""
+    if not keep.any():
+        return Skipped(UNAVAILABLE)
+    if keep.all():
+        return drift_check(stored, rate, baseline, limits, source, origin, thresholds, window_s)
+    block = drift_check(
+        stored[..., keep],
+        rate,
+        _baseline_channels(baseline, keep),
+        _limits(limits, keep),
+        source,
+        origin,
+        thresholds,
+        window_s,
+    )
+    if isinstance(block, Skipped):
+        return block
+    return replace(
+        block,
+        no_contact_level=_expand(block.no_contact_level, keep),
+        level_change=_expand(block.level_change, keep),
+        offset=block.offset if isinstance(block.offset, Skipped) else _expand(block.offset, keep),
+        offset_pct_range=None if block.offset_pct_range is None else _expand(block.offset_pct_range, keep),
+        slope_per_s=_expand(block.slope_per_s, keep),
+        rebaselines=[replace(event, delta=_expand(event.delta, keep)) for event in block.rebaselines],
+    )
+
+
+def _baseline_channels(baseline: BaselineInputs, keep: NDArray[np.bool_]) -> BaselineInputs:
+    """``baseline`` restricted to the channels in ``keep``, as the stream it goes with."""
+    captures, samples = baseline.captures, baseline.samples
+    return replace(
+        baseline,
+        captures=None if captures is None else (captures[0], captures[1], captures[2][..., keep]),
+        session_values=None if baseline.session_values is None else baseline.session_values[..., keep],
+        samples=None if samples is None else (samples[0], samples[1][..., keep]),
+    )
+
+
 def _main_table_framerate(inputs: EpisodeInputs, thresholds: Thresholds) -> FramerateReport:
     """Framerate from the main table: the clock column when the run names one, else ``timestamp``."""
     if inputs.clock is not None and inputs.clock_times is not None:
@@ -286,22 +408,35 @@ def _held(inputs: EpisodeInputs, thresholds: Thresholds) -> HeldReport | Skipped
     by construction, and that is the expected fraction; the native stream should repeat none.
     """
     source = inputs.instance
+    keep = source.available
+    if not keep.any():
+        return Skipped(UNAVAILABLE)
     groups = name_groups(source.names)
     declared = source.declared_rate_hz
     if inputs.native is not None:
-        return held_check(inputs.native.data, "sidecar", 0.0, declared is not None, thresholds, groups)
+        data = _measured(inputs.native.data, keep)
+        return held_check(data, "sidecar", 0.0, declared is not None, thresholds, groups)
     assert inputs.frames is not None
     expected = max(0.0, 1.0 - declared / inputs.fps) if declared is not None else 0.0
-    return held_check(inputs.frames, "main_table", expected, declared is not None, thresholds, groups)
+    data = _measured(inputs.frames, keep)
+    return held_check(data, "main_table", expected, declared is not None, thresholds, groups)
 
 
 def _gel(inputs: EpisodeInputs, signals: _Signals, thresholds: Thresholds) -> GelReportOrSkipped:
     """The gel check of one episode; :func:`_settle_gel` revisits it once every episode is in."""
     source = inputs.instance
     if source.kind == "array":
+        if not source.available.any():
+            return Skipped(UNAVAILABLE)
         data = inputs.native.data if inputs.native is not None else inputs.frames
         assert data is not None
-        return gel_check_elements(data, thresholds)
+        return gel_check_elements(_measured(data, source.available), thresholds)
+    processed = source.info.processed if source.info is not None else None
+    if processed is not None:
+        return Skipped(
+            f"processed image ({processed.method} {processed.version}): "
+            "dead pixels are defined on raw gel frames"
+        )
     try:
         frames = signals.gel_sample(source.key)
     except (ImportError, FileNotFoundError) as e:
@@ -356,6 +491,8 @@ def _skew(
     LeRobot's nominal timeline, and then both sides use it.
     """
     source = inputs.instance
+    if source.kind == "array" and not source.available.any():
+        return Skipped(UNAVAILABLE)
     try:
         key = (
             reference
@@ -377,8 +514,8 @@ def _skew(
         return Skipped(f"reference {key!r} is the instance itself")
     nominal = inputs.native is None or inputs.origin is None
     try:
-        tactile_times, tactile = signals.signal(source.key, inputs, nominal)
-        ref_times, ref = signals.signal(key, None, nominal)
+        tactile_times, tactile = signals.signal(source.key, inputs, nominal, inputs.clock)
+        ref_times, ref = signals.signal(key, None, nominal, inputs.clock)
     except (ImportError, FileNotFoundError) as e:
         return Skipped(str(e))
     if inputs.native is not None and inputs.origin is None:
@@ -393,8 +530,9 @@ class _Signals:
 
     Each video or image feature is decoded in one sequential pass (:meth:`DoctorDataset.iter_frames`)
     that yields the motion energy for the skew check and, for an image instance when the gel check
-    runs, the ``gel_frames`` sampled RGB frames the gel check reads. The main-table times are the
-    ``clock`` column when the run names one, else ``timestamp``.
+    runs, the ``gel_frames`` sampled RGB frames the gel check reads; an image instance marked
+    ``processed`` is not sampled. The main-table times are the checked instance's clock column
+    when it has one, else ``timestamp``.
     """
 
     def __init__(
@@ -403,7 +541,6 @@ class _Signals:
         episode_index: int,
         sources: dict[str, InstanceSource],
         gel_frames: int | None = GEL_FRAMES,
-        clock: str | None = None,
     ) -> None:
         self.dataset = dataset
         self.episode_index = episode_index
@@ -413,12 +550,18 @@ class _Signals:
         """Per image instance key, the statistics its gel check read this episode; see :func:`_settle_gel`."""
         self._motion: dict[str, NDArray[np.float64]] = {}
         self._samples: dict[str, NDArray[np.uint8]] = {}
-        self._clock = clock
-        self._timestamps = (
-            dataset.clock_times(clock, episode_index)
-            if clock is not None
-            else dataset.timestamps(episode_index)
-        )
+        self._gel_keys = {k for k, s in self.sources.items() if s.info is None or s.info.processed is None}
+        self._times: dict[str | None, NDArray[np.float64]] = {}
+
+    def times(self, clock: str | None) -> NDArray[np.float64]:
+        """The episode's main-table times: the ``clock`` column, else ``timestamp``."""
+        if clock not in self._times:
+            self._times[clock] = (
+                self.dataset.clock_times(clock, self.episode_index)
+                if clock is not None
+                else self.dataset.timestamps(self.episode_index)
+            )
+        return self._times[clock]
 
     @property
     def image_keys(self) -> list[str]:
@@ -427,7 +570,7 @@ class _Signals:
     def _decode(self, key: str) -> None:
         """One pass over the feature's frames: motion energy, and the gel sample for an image instance."""
         n = self.dataset.episode(self.episode_index).length
-        want_sample = self.gel_frames is not None and key in self.sources
+        want_sample = self.gel_frames is not None and key in self._gel_keys
         sampled = sample_indices(n, self.gel_frames) if want_sample else np.zeros(0, dtype=np.int64)
         energy = np.zeros(n)
         samples: list[NDArray[np.uint8]] = []
@@ -487,25 +630,27 @@ class _Signals:
         return None
 
     def signal(
-        self, key: str, inputs: EpisodeInputs | None, nominal: bool
+        self, key: str, inputs: EpisodeInputs | None, nominal: bool, clock: str | None = None
     ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
         """A feature's event signal and its times: motion energy for an image stream, the absolute first
-        difference of the contact magnitude for an array stream.
+        difference of the contact magnitude for an array stream, over its channels that hold a
+        measurement.
 
-        With ``nominal`` the times are the main table's; otherwise an array instance's native
-        ``host_ts`` and a video's ``origin + k / fps``. A difference is placed midway between
-        the two samples it compares: half a period before frame ``k`` for a video.
+        With ``nominal`` the times are the main table's, the ``clock`` column when given;
+        otherwise an array instance's native ``host_ts`` and a video's ``origin + k / fps``. A
+        difference is placed midway between the two samples it compares: half a period before
+        frame ``k`` for a video.
         """
         feature = self.dataset.features[key]
         if feature.get("dtype") in ("video", "image"):
             energy = self.motion(key)
-            times = self._timestamps if nominal else self._video_times(key, len(energy))
+            times = self.times(clock) if nominal else self._video_times(key, len(energy), clock)
             # Motion energy at frame k measures the change between frames k - 1 and k: it sits between them.
             return times - 0.5 / self.dataset.fps, energy
         source = self.sources.get(key)
         if inputs is None or inputs.instance.key != key:
             inputs = (
-                self.dataset.episode_inputs(source, self.episode_index, clock=self._clock)
+                self.dataset.episode_inputs(source, self.episode_index, clock=clock)
                 if source is not None
                 else None
             )
@@ -515,13 +660,14 @@ class _Signals:
             times, data = inputs.native.host_ts, inputs.native.data
         else:
             assert inputs.frames is not None
-            times, data = self._timestamps, inputs.frames
+            times, data = self.times(clock), inputs.frames
+        data = _measured(data, inputs.instance.available)  # an unavailable channel holds no contact
         data = data[:, nan_fraction(data) <= NAN_FLOOR]  # as the array checks: mostly-NaN elements are out
         return (times[1:] + times[:-1]) / 2.0, np.abs(
             np.diff(contact_signal(data))
         )  # between the two samples
 
-    def _video_times(self, key: str, n: int) -> NDArray[np.float64]:
+    def _video_times(self, key: str, n: int, clock: str | None) -> NDArray[np.float64]:
         origin = None
         for source in self.sources.values():
             if source.kind == "array" and source.sidecar:
@@ -530,7 +676,7 @@ class _Signals:
                     origin = float(session.clock.episode_origins[self.episode_index - session.episodes[0]])
                     break
         if origin is None:
-            return self._timestamps
+            return self.times(clock)
         return origin + np.arange(n) / self.dataset.fps
 
 

@@ -56,6 +56,7 @@ from taxel.dataset.sidecar import (
 )
 from taxel.schema import (
     ARRAY_FAMILIES,
+    UNCALIBRATED_UNITS,
     BaselineStream,
     Block,
     FrameCounts,
@@ -64,6 +65,8 @@ from taxel.schema import (
     SessionMeta,
     SessionRecord,
     TactileInfo,
+    check_device_indices,
+    check_session_calibration,
     feature_key,
 )
 from taxel.sensors.base import AppliedBaseline, TactileReading, TactileSensor, host_clock
@@ -90,8 +93,11 @@ def tactile_features(
         ValueError: If ``method`` is ``nearest``, which cannot be reproduced from the
             sidecar for array streams; use ``mean`` or ``last``.
         NotImplementedError: For a sensor outside the array families.
+        SchemaError: If two sensors on one device share a ``device.index``.
     """
     _check_method(method)
+    sensors = list(sensors)
+    check_device_indices({s.config.instance_id: s.metadata() for s in sensors})
     entries: dict[str, dict[str, Any]] = {}
     for sensor in sensors:
         info, shape = _instance(sensor)
@@ -121,12 +127,15 @@ class TactileDatasetWriter:
             ``baseline_stream.sample_every``.
         session: Values for the session record's ``serial``, ``firmware``, ``device``,
             ``calibration``, ``gel`` and ``skin``, as schema objects or dicts. Anything
-            not given is written as ``null``.
+            not given is written as ``null``, except the calibration of a sensor whose
+            channels are in ``counts`` or ``a.u.``, which is ``uncalibrated`` by its own
+            declaration; a caller who gives it another method is refused.
 
     Raises:
         ValueError: If a sensor is not connected, or ``apply_baseline`` is set without a baseline.
         SchemaError: If the dataset's feature entry for an instance does not match the
-            sensor's metadata, or declares a reduction the writer does not produce.
+            sensor's metadata, declares a reduction the writer does not produce, or was
+            recorded under SCHEMA 0.3.x; or if two sensors on one device share an index.
     """
 
     def __init__(
@@ -155,6 +164,8 @@ class TactileDatasetWriter:
             raise SchemaError(f"session fields {unknown} are the writer's; allowed: {sorted(SESSION_FIELDS)}")
         self._streams: dict[str, _Stream] = {}
         features = dataset.meta.features
+        sensors = list(sensors)
+        check_device_indices({s.config.instance_id: s.metadata() for s in sensors})
         for sensor in sensors:
             instance_id = sensor.config.instance_id
             if instance_id in self._streams:
@@ -163,6 +174,11 @@ class TactileDatasetWriter:
             key = feature_key(instance_id)
             if key not in features:
                 raise SchemaError(f"dataset has no feature {key!r}; create it with tactile_features()")
+            if any(isinstance(c, str) for c in (features[key].get("info") or {}).get("channels") or ()):
+                raise SchemaError(
+                    f"feature {key!r} was recorded under SCHEMA 0.3.x, whose channels carry no unit or "
+                    "source; resuming it needs a new dataset"
+                )
             entry = read_feature_entry(features[key])
             if replace(info, reduction=entry.reduction) != entry:
                 raise SchemaError(f"feature {key!r} does not match the metadata of {sensor!r}")
@@ -394,15 +410,22 @@ class _Stream:
                 self.sensor.drain()
                 self.sensor.read()
         self.sample_every = sample_every
+        transport = self.sensor.transport()
+        info = self.sensor.metadata()
+        uncalibrated = any(c.unit in UNCALIBRATED_UNITS for c in info.channels or ())
         self._fields = {
             "session_id": session_id,
             "clock": {"wall_time": wall_time, "host_clock": host, "episode_origins": []},
             "adapter": {"name": f"taxel.{self.sensor.config.type}", "version": __version__},
-            "calibration": None,
+            "calibration": {"method": "uncalibrated"} if uncalibrated else None,
             "baseline": None if baseline is None else baseline.to_dict(),
             "baseline_stream": {"sample_every": sample_every},
+            "transport": None if transport is None else transport.to_dict(),
             **dict(fields),
         }
+        # The record as it will be written, checked now rather than after the first episode.
+        opening = SessionRecord.from_dict({**self._fields, "episodes": [0, 0], "clock": None})
+        check_session_calibration(info, opening)
 
     def write_meta(self) -> None:
         if self.record is None:

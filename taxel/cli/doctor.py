@@ -30,6 +30,7 @@ from taxel.doctor.loader import DoctorDataset, candidate_keys, resolve_root
 from taxel.doctor.report import REFERENCE_ALL, run_doctor, write_report
 from taxel.schema import (
     CHECK_NAMES,
+    ChannelReport,
     HealthReport,
     InstanceChecks,
     SchemaError,
@@ -178,8 +179,19 @@ _NUMBER = re.compile(r" -?\d+(\.\d+)?(?= below)")
 
 
 def format_report(report: HealthReport) -> str:
-    """The per-instance table: one block per instance, one row per episode, a cell per check."""
+    """The per-instance table: one block per instance, one row per episode, a cell per check.
+
+    A run that read channels declared in the SCHEMA 0.3 form opens with one note saying so.
+    """
     lines: list[str] = []
+    upgraded = [name for name, instance in report.instances.items() if instance.upgraded]
+    if upgraded:
+        verb = "declares" if len(upgraded) == 1 else "declare"
+        lines.append(
+            f"note: {', '.join(upgraded)} {verb} channels in the SCHEMA 0.3 form (names and a units "
+            "block); read as channel objects with source unknown"
+        )
+        lines.append("")
     for name, instance in report.instances.items():
         limits = "" if instance.range is None else f"  range: [{instance.range.min}, {instance.range.max}]"
         rate = "" if instance.declared_rate_hz is None else f"  {instance.declared_rate_hz:g} Hz"
@@ -196,6 +208,8 @@ def format_report(report: HealthReport) -> str:
             if instance.error:
                 notes.append(instance.error)
             lines.append("  " + "; ".join(notes))
+        if instance.channels:
+            lines.append("  channels " + _channels(instance.channels))
         rows = [list(_COLUMNS)]
         skipped: dict[str, dict[str, int]] = {}
         for episode, block in report.episodes.items():
@@ -225,6 +239,32 @@ def format_report(report: HealthReport) -> str:
     return "\n".join(lines)
 
 
+def _channels(channels: Sequence[ChannelReport]) -> str:
+    """Channels grouped by unit and source, in order: ``fz (counts, measured); fx, fy (N, unavailable,
+    not checked)``. A unit or source the run could not read says so."""
+    groups: list[tuple[str | None, str, list[str]]] = []
+    for channel in channels:
+        if groups and groups[-1][:2] == (channel.unit, channel.source):
+            groups[-1][2].append(channel.name)
+        else:
+            groups.append((channel.unit, channel.source, [channel.name]))
+    parts = []
+    for unit, source, names in groups:
+        if source == "unavailable":
+            what = "unavailable, not checked"
+        elif source == "unknown":
+            what = "source unknown"
+        else:
+            what = source
+        parts.append(f"{', '.join(names)} ({unit or 'unit unknown'}, {what})")
+    return "; ".join(parts)
+
+
+def _largest(values: Sequence[float | None]) -> float:
+    """The value of largest magnitude, passing over the ``None`` of channels not checked."""
+    return max((v for v in values if v is not None), key=abs)
+
+
 def _cell(checks: InstanceChecks, check: str, skipped: dict[str, dict[str, int]]) -> str:
     value = getattr(checks, check)
     if isinstance(value, Skipped):
@@ -244,10 +284,10 @@ def _cell(checks: InstanceChecks, check: str, skipped: dict[str, dict[str, int]]
         if value.confidence == "low":
             zero += ", low confidence"
         if isinstance(value.offset, Skipped):
-            change = max(value.level_change, key=abs)
+            change = _largest(value.level_change)
             return f"level change {change:+.3g}{events}{zero}{mark}"
-        offset = max(value.offset, key=abs)
-        pct = "" if value.offset_pct_range is None else f" ({max(value.offset_pct_range):.1%})"
+        offset = _largest(value.offset)
+        pct = "" if value.offset_pct_range is None else f" ({_largest(value.offset_pct_range):.1%})"
         return f"{offset:+.3g}{pct}{events}{zero}{mark}"
     if check == "framerate":
         stalled = f", {value.stalled} stalled" if value.stalled else ""
@@ -264,8 +304,8 @@ def _cell(checks: InstanceChecks, check: str, skipped: dict[str, dict[str, int]]
         )
     if check == "saturation":
         if value.limit == "observed" and value.at_min_pct is not None and value.at_max_pct is not None:
-            return f"min {max(value.at_min_pct):.1%}, max {max(value.at_max_pct):.1%} (observed)"
-        return f"{max(value.saturated_pct):.2%} ({value.limit}){mark}"
+            return f"min {_largest(value.at_min_pct):.1%}, max {_largest(value.at_max_pct):.1%} (observed)"
+        return f"{_largest(value.saturated_pct):.2%} ({value.limit}){mark}"
     if check == "gel":
         if value.kind == "pixels":
             return f"{value.dead_pct:.2%} dead, cluster {value.largest_cluster_px} px{mark}"

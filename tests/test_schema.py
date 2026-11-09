@@ -15,6 +15,7 @@ from taxel.schema import (
     Channel,
     ChannelReport,
     Clock,
+    DeviceGroup,
     DriftReport,
     FrameCounts,
     GelReport,
@@ -424,7 +425,7 @@ class TestLenientUpgrade:
         info, _, _, _ = read_info_lenient(OLD_LEFT_FINGERTIP)
         with pytest.raises(SchemaError, match="source must be one of"):
             TactileInfo.from_dict(info.to_dict())
-        with pytest.raises(SchemaError, match="missing required key 'index'"):
+        with pytest.raises(SchemaError, match="set device.index in the sensor config"):
             TactileInfo.from_dict({**LEFT_FINGERTIP, "device": OLD_LEFT_FINGERTIP["device"]})
 
     def test_units_are_matched_by_quantity_and_never_guessed(self) -> None:
@@ -588,9 +589,22 @@ class TestDeviceAndTransport:
     def test_device_index(self) -> None:
         assert TactileInfo.from_dict(LEFT_FINGERTIP).device.index == 0
         device = LEFT_FINGERTIP["device"]
-        for bad in (-1, None):
-            with pytest.raises(SchemaError, match="device.index must be a non-negative integer"):
-                TactileInfo.from_dict({**LEFT_FINGERTIP, "device": {**device, "index": bad}})
+        with pytest.raises(SchemaError, match="device.index must be a non-negative integer"):
+            TactileInfo.from_dict({**LEFT_FINGERTIP, "device": {**device, "index": -1}})
+        with pytest.raises(SchemaError, match="set device.index in the sensor config"):
+            TactileInfo.from_dict({**LEFT_FINGERTIP, "device": {**device, "index": None}})
+        unset = DeviceGroup("paxini_hub_0", "paxini_hub_0")
+        with pytest.raises(SchemaError, match="set device.index in the sensor config"):
+            unset.require_index()
+        with pytest.raises(SchemaError, match="set device.index in the sensor config"):
+            TactileInfo(
+                "magnetic",
+                200,
+                PALM["session_meta"],
+                layout=Layout.from_dict(PALM["layout"]),
+                channels=[Channel(n, "uT", "measured") for n in ("bx", "by", "bz")],
+                device=unset,
+            )
         for bad in (1.5, True):
             with pytest.raises(SchemaError, match="expected an integer"):
                 TactileInfo.from_dict({**LEFT_FINGERTIP, "device": {**device, "index": bad}})

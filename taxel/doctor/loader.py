@@ -34,6 +34,7 @@ from taxel.dataset.sidecar import (
 )
 from taxel.schema import (
     FEATURE_KEY_PREFIX,
+    ChannelReport,
     InstanceReport,
     Range,
     Reduction,
@@ -227,6 +228,20 @@ class InstanceSource:
         """Channels of an array instance: the last dimension, or 1 for a one-dimensional feature."""
         return self.shape[1] if len(self.shape) == 2 else 1
 
+    @property
+    def available(self) -> NDArray[np.bool_]:
+        """Per channel of an array instance, whether it holds a measurement: ``False`` where ``info``
+        declares the channel ``unavailable``, stored as 0.0. All ``True`` without channel metadata."""
+        channels = self.info.channels if self.info is not None else None
+        if not channels or len(channels) != self.n_channels:
+            return np.ones(self.n_channels, dtype=bool)
+        return np.array([c.source != "unavailable" for c in channels])
+
+    @property
+    def clock_column(self) -> str | None:
+        """The main-table column ``info`` names as the instance's real per-frame clock, if any."""
+        return None if self.info is None else self.info.clock_column
+
     def session_for(self, episode_index: int) -> SessionRecord | None:
         """The session record whose episode range covers ``episode_index``, or ``None``."""
         if self.sessions is None:
@@ -238,6 +253,7 @@ class InstanceSource:
         return None
 
     def report(self) -> InstanceReport:
+        channels = self.info.channels if self.info is not None else None
         return InstanceReport(
             key=self.key,
             family=self.family,
@@ -248,6 +264,10 @@ class InstanceSource:
             unknown_keys=list(self.unknown_keys),
             missing_keys=list(self.missing_keys),
             error=self.error,
+            channels=None
+            if channels is None
+            else [ChannelReport(c.name, c.unit, c.source) for c in channels],
+            upgraded=self.upgraded,
         )
 
 

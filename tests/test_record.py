@@ -144,6 +144,27 @@ class TestRecording:
         sessions = read_session_meta(root, "left_fingertip").sessions
         assert [(s.session_id, s.episodes) for s in sessions] == [("first", (0, 1)), ("second", (2, 2))]
 
+    def test_device_index_comes_from_the_sensor_config(self, tmp_path, capsys) -> None:
+        hub = {"id": "hand", "clock": "hand"}
+        assert main(record_args(tmp_path, tactile_arg(device=hub), "--dataset.num_episodes=1")) == 2
+        assert "set device.index in the sensor config" in capsys.readouterr().err
+        args = record_args(tmp_path, tactile_arg(device={**hub, "index": 3}), "--dataset.num_episodes=1")
+        assert main(args) == 0
+        info = json.loads((tmp_path / "ds" / "meta" / "info.json").read_text())
+        assert info["features"]["observation.tactile.left_fingertip"]["info"]["device"] == {**hub, "index": 3}
+        session = read_session_meta(tmp_path / "ds", "left_fingertip").sessions[0]
+        assert session.transport.to_dict() == {"kind": "other", "rate_hz": 500.0}
+
+    def test_resume_of_a_0_3_dataset_needs_a_new_dataset(self, tmp_path, capsys) -> None:
+        assert main(record_args(tmp_path, "--dataset.num_episodes=1")) == 0
+        path = tmp_path / "ds" / "meta" / "info.json"
+        info = json.loads(path.read_text())
+        block = info["features"]["observation.tactile.left_fingertip"]["info"]
+        block["channels"], block["units"] = [c["name"] for c in block["channels"]], {"force": "N"}
+        path.write_text(json.dumps(info))
+        assert main(record_args(tmp_path, "--resume=true", "--dataset.num_episodes=1")) == 2
+        assert "recorded under SCHEMA 0.3.x" in capsys.readouterr().err
+
     def test_resume_refuses_a_different_setup(self, tmp_path, capsys) -> None:
         assert main(record_args(tmp_path, "--dataset.num_episodes=1")) == 0
         assert main(record_args(tmp_path, "--resume=true", "--dataset.fps=25")) == 2
