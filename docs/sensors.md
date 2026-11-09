@@ -88,7 +88,7 @@ from typing import Any
 
 import numpy as np
 
-from taxel.schema import Axes, Layout, Origin, TactileFamily, TactileInfo, session_meta_path
+from taxel.schema import Axes, Channel, Layout, Origin, TactileFamily, TactileInfo, session_meta_path
 from taxel.sensors import TactileReading, TactileSensor, TactileSensorConfig, host_clock
 
 
@@ -121,8 +121,7 @@ class ExampleSensor(TactileSensor):
             vendor="Example",
             model="EX-1",
             declared_rate_hz=self.config.declared_rate_hz,
-            units={"force": "N"},
-            channels=["fx", "fy", "fz"],
+            channels=[Channel(name, "N", "measured") for name in ("fx", "fy", "fz")],
             layout=Layout(
                 origin=Origin(at="corner", description="taxel 0, nearest the cable"),
                 axes=Axes(x="along a row", y="down a column", z="out of the pad, toward the object"),

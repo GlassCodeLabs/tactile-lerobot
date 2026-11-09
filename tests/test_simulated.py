@@ -56,6 +56,9 @@ class TestRegistryAndShape:
         cfg = config(family="force_torque", n_elements=1, channels=["fx", "fy", "fz", "mx", "my", "mz"])
         with SimulatedTactile(cfg) as sensor:
             assert sensor.read().data.shape == (1, 6)
+        info = SimulatedTactile(cfg).metadata()
+        assert [c.unit for c in info.channels] == ["N"] * 3 + ["N.m"] * 3
+        assert TactileInfo.from_dict(info.to_dict()) == info
         with pytest.raises(SchemaError, match=r"\(1, 6\)"):
             config(family="force_torque")
 
@@ -64,8 +67,9 @@ class TestRegistryAndShape:
         info = SimulatedTactile(cfg).metadata()
         assert TactileInfo.from_dict(info.to_dict()) == info
         assert info.family is TactileFamily.MAGNETIC
-        assert info.units == {"field": "uT"}
-        assert info.channels == ["bx", "by", "bz"]
+        assert [c.to_dict() for c in info.channels] == [
+            {"name": name, "unit": "uT", "source": "measured"} for name in ("bx", "by", "bz")
+        ]
         assert info.layout is not None and len(info.layout.positions_mm) == 5
         assert info.layout.origin.at == "corner" and info.layout.surface == "pad"
         assert info.session_meta == "tactile/left_fingertip/meta.json"

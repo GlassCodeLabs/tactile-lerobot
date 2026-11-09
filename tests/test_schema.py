@@ -12,15 +12,19 @@ from taxel.schema import (
     Baseline,
     BaselineStream,
     Calibration,
+    Channel,
+    ChannelReport,
     Clock,
     DriftReport,
     FrameCounts,
     GelReport,
     HealthReport,
+    Indexing,
     InstanceChecks,
     Layout,
     Origin,
     Range,
+    Region,
     SchemaError,
     SessionMeta,
     SessionRecord,
@@ -29,11 +33,15 @@ from taxel.schema import (
     TactileFamily,
     TactileInfo,
     Thresholds,
+    Transport,
+    check_device_indices,
+    check_session_calibration,
     feature_key,
     health_report_path,
     read_info_lenient,
     read_session_meta_lenient,
     session_meta_path,
+    without_core_keys,
 )
 
 N_TAXELS = 52
@@ -43,14 +51,17 @@ def positions(n: int) -> list[list[float]]:
     return [[1.5 * i, 0.0, 0.0] for i in range(n)]
 
 
-# The three feature entries from SCHEMA.md, "Static metadata", with the "..." rows filled in.
+def channels(unit: str, *names: str, source: str = "measured") -> list[dict]:
+    return [{"name": name, "unit": unit, "source": source} for name in names]
+
+
+# The four feature entries from SCHEMA.md, "Static metadata", with the "..." rows filled in.
 LEFT_FINGERTIP = {
     "family": "taxel_array",
     "vendor": "PaXini",
     "model": "PX-6AX-GEN3 DP-S2015-Elite",
     "declared_rate_hz": 91,
-    "units": {"force": "N"},
-    "channels": ["fx", "fy", "fz"],
+    "channels": channels("N", "fx", "fy", "fz"),
     "layout": {
         "origin": {"at": "corner", "description": "taxel 0, the corner of the array nearest the connector"},
         "axes": {
@@ -64,7 +75,7 @@ LEFT_FINGERTIP = {
     },
     "reduction": {"method": "mean", "window_ms": 33.3},
     "mount": {"body": "so101_follower", "link": "gripper_left_finger", "pose": None},
-    "device": {"id": "paxini_hub_0", "clock": "paxini_hub_0"},
+    "device": {"id": "paxini_hub_0", "clock": "paxini_hub_0", "index": 0},
     "session_meta": "tactile/left_fingertip/meta.json",
 }
 
@@ -90,13 +101,18 @@ RIGHT_FINGERTIP = {
     "session_meta": "tactile/right_fingertip/meta.json",
 }
 
+RIGHT_FINGERTIP_DISPLACEMENT = {
+    "channels": channels("mm", "dx", "dy", "dz", source="derived"),
+    "reduction": {"method": "mean", "window_ms": 33.3},
+    "session_meta": "tactile/right_fingertip/meta.json",
+}
+
 PALM = {
     "family": "magnetic",
     "vendor": "NYU / AnySkin",
     "model": "AnySkin v1",
     "declared_rate_hz": 200,
-    "units": {"field": "uT"},
-    "channels": ["bx", "by", "bz"],
+    "channels": channels("uT", "bx", "by", "bz"),
     "layout": {
         "origin": {"at": "element", "description": "the central magnetometer"},
         "axes": {
@@ -130,6 +146,7 @@ LEFT_FINGERTIP_META = {
             "serial": "PX3-00412",
             "firmware": None,
             "device": {"serial": "PXH-0193", "firmware": "1.4.2"},
+            "transport": {"kind": "usb", "rate_hz": 91},
             "adapter": {"name": "tactile-lerobot.paxini", "version": "0.1.0"},
             "calibration": {
                 "version": "vendor-factory-2026-03",
@@ -152,7 +169,27 @@ LEFT_FINGERTIP_META = {
 }
 
 
+# The field-note fragments from SCHEMA.md, "Static metadata": a converted three-axis force kept as
+# force_torque, and the PaXini GEN3-2 fingertip and palm as two regions.
+CONVERTED_FORCE_CHANNELS = channels("N", "fx", "fy", "fz") + channels(
+    "N.m", "mx", "my", "mz", source="unavailable"
+)
+GEN3_2_INDEXING = {
+    "kind": "regions",
+    "regions": [
+        {
+            "name": "fingertip",
+            "shape": [8, 8],
+            "pitch_mm": [1.75, 1.75],
+            "first_element": 0,
+            "area_mm2": 3.0625,
+        },
+        {"name": "palm", "shape": [16, 12], "pitch_mm": [3.0, 3.0], "first_element": 64, "area_mm2": 9.0},
+    ],
+}
+
 FRAME = {k: PALM["layout"][k] for k in ("origin", "axes", "surface")}
+WRENCH = {**PALM, "family": "force_torque", "channels": channels("N", "fx", "fy", "fz", "mx", "my", "mz")}
 
 
 def json_round_trip(obj: object) -> object:
@@ -177,9 +214,21 @@ class TestInfoRoundTrip:
         assert "positions_mm" not in out["layout"] and "normals" not in out["layout"]
         assert out["device"] is None  # always written
 
-    def test_video_keys_are_ignored_on_read(self) -> None:
-        with_core_keys = {"video.fps": 30, "video.codec": "av1", **RIGHT_FINGERTIP}
-        assert TactileInfo.from_dict(with_core_keys).to_dict() == RIGHT_FINGERTIP
+    def test_lerobot_keys_are_set_aside_on_a_strict_read(self) -> None:
+        """LeRobot 0.6.1 writes has_audio and is_depth_map on every video feature, and audio.* when the
+        file has sound, beside its video.* keys; the strict reader sets all of them aside."""
+        core = {
+            "video.fps": 30,
+            "video.codec": "av1",
+            "has_audio": False,
+            "is_depth_map": False,
+            "audio.codec": "aac",
+            "audio.sample_rate": 48000,
+        }
+        assert TactileInfo.from_dict({**core, **RIGHT_FINGERTIP}).to_dict() == RIGHT_FINGERTIP
+        assert without_core_keys({**core, "family": "visuotactile"}) == {"family": "visuotactile"}
+        with pytest.raises(SchemaError, match=r"unknown keys \['has_video'\]"):
+            TactileInfo.from_dict({**RIGHT_FINGERTIP, "has_video": True})
 
     def test_family_is_an_enum_after_construction(self) -> None:
         info = TactileInfo.from_dict(PALM)
@@ -198,9 +247,7 @@ class TestInfoValidation:
     def test_force_torque_declares_six_channels(self) -> None:
         with pytest.raises(SchemaError, match="six channels"):
             TactileInfo.from_dict({**PALM, "family": "force_torque"})
-        channels = ["fx", "fy", "fz", "mx", "my", "mz"]
-        ok = {**PALM, "family": "force_torque", "channels": channels, "layout": FRAME}
-        assert TactileInfo.from_dict(ok).n_channels == 6
+        assert TactileInfo.from_dict({**WRENCH, "layout": FRAME}).n_channels == 6
 
     def test_visuotactile_needs_no_channels(self) -> None:
         assert TactileInfo.from_dict(RIGHT_FINGERTIP).channels is None
@@ -266,7 +313,9 @@ class TestLayout:
 
     @pytest.mark.parametrize("family", ["taxel_array", "magnetic"])
     def test_positions_required_for_element_arrays(self, family: str) -> None:
-        with pytest.raises(SchemaError, match=f"positions_mm is required for family '{family}'"):
+        with pytest.raises(
+            SchemaError, match=f"positions_mm or layout.indexing is required for family '{family}'"
+        ):
             TactileInfo.from_dict({**PALM, "family": family, "layout": FRAME})
 
     def test_positions_omitted_for_visuotactile(self) -> None:
@@ -275,10 +324,9 @@ class TestLayout:
             TactileInfo.from_dict({**RIGHT_FINGERTIP, "layout": layout})
 
     def test_force_torque_has_at_most_one_position(self) -> None:
-        wrench = {**PALM, "family": "force_torque", "channels": ["fx", "fy", "fz", "mx", "my", "mz"]}
         with pytest.raises(SchemaError, match="one element; layout.positions_mm has 5 rows"):
-            TactileInfo.from_dict(wrench)
-        one = {**wrench, "layout": {**FRAME, "positions_mm": [[0, 0, 0]], "normals": None}}
+            TactileInfo.from_dict(WRENCH)
+        one = {**WRENCH, "layout": {**FRAME, "positions_mm": [[0, 0, 0]], "normals": None}}
         assert TactileInfo.from_dict(one).to_dict()["layout"] == one["layout"]
 
     def test_normals_only_beside_positions(self) -> None:
@@ -290,15 +338,14 @@ class TestLayout:
 
 
 class TestStreams:
-    def test_derived_streams_require_derived_block(self) -> None:
+    def test_every_suffixed_stream_requires_derived_block(self) -> None:
         example = dict(RIGHT_FINGERTIP)
         del example["derived"]
         info = TactileInfo.from_dict(example)
-        info.check_streams(["markers"])
-        with pytest.raises(SchemaError, match="require a 'derived' block"):
-            info.check_streams(["markers", "force"])
-        with pytest.raises(SchemaError, match="require a 'derived' block"):
-            info.check_streams(["displacement"])
+        info.check_streams([])
+        for suffixes in (["markers"], ["markers", "force"], ["displacement"]):
+            with pytest.raises(SchemaError, match="require a 'derived' block"):
+                info.check_streams(suffixes)
 
     def test_derived_block_satisfies_check(self) -> None:
         TactileInfo.from_dict(RIGHT_FINGERTIP).check_streams(["markers", "displacement", "force"])
@@ -312,36 +359,290 @@ class TestStreams:
             TactileInfo.from_dict(RIGHT_FINGERTIP).check_streams(["depth"])
 
     def test_stream_info_round_trips_and_is_strict(self) -> None:
-        session_meta = RIGHT_FINGERTIP["session_meta"]
-        block = {"reduction": {"method": "nearest", "window_ms": 33.3}, "session_meta": session_meta}
+        block = RIGHT_FINGERTIP_DISPLACEMENT
         assert StreamInfo.from_dict(block).to_dict() == block
-        assert StreamInfo.from_dict({"session_meta": "tactile/x/meta.json"}).to_dict() == {
-            "session_meta": "tactile/x/meta.json"
-        }
+        assert list(StreamInfo.from_dict(block).to_dict()) == ["channels", "reduction", "session_meta"]
+        without_reduction = {k: v for k, v in block.items() if k != "reduction"}
+        assert StreamInfo.from_dict(without_reduction).to_dict() == without_reduction
         with pytest.raises(SchemaError, match="unknown keys \\['family'\\]"):
             StreamInfo.from_dict({**block, "family": "visuotactile"})
+        with pytest.raises(SchemaError, match="missing required key 'channels'"):
+            StreamInfo.from_dict({"session_meta": "tactile/x/meta.json"})
         with pytest.raises(SchemaError, match="session_meta"):
-            StreamInfo(session_meta="meta.json")
+            StreamInfo(session_meta="meta.json", channels=[Channel("dx", "mm", "derived")])
+
+    def test_stream_channels_are_derived(self) -> None:
+        measured = {**RIGHT_FINGERTIP_DISPLACEMENT, "channels": channels("mm", "dx", "dy", "dz")}
+        with pytest.raises(SchemaError, match=r"channels \['dx', 'dy', 'dz'\] must be 'derived'"):
+            StreamInfo.from_dict(measured)
+        with pytest.raises(SchemaError, match="declares its channels"):
+            StreamInfo(session_meta="tactile/x/meta.json", channels=[])
 
 
 class TestLenientReader:
     def test_unknown_keys_are_reported_not_raised(self) -> None:
         layout = {**LEFT_FINGERTIP["layout"], "units": "mm"}
         data = {**LEFT_FINGERTIP, "serial": "PX3-00412", "layout": layout}
-        info, unknown = read_info_lenient(data)
+        info, unknown, missing, upgraded = read_info_lenient(data)
         assert info == TactileInfo.from_dict(LEFT_FINGERTIP)
         assert unknown == ["info.serial", "info.layout.units"]
+        assert missing == [] and not upgraded
 
-    def test_video_keys_are_not_unknown(self) -> None:
-        info, unknown = read_info_lenient({**RIGHT_FINGERTIP, "video.fps": 30, "video.codec": "av1"})
+    def test_lerobot_keys_are_not_unknown(self) -> None:
+        core = {"video.fps": 30, "video.codec": "av1", "has_audio": False, "is_depth_map": False}
+        info, unknown, missing, upgraded = read_info_lenient({**RIGHT_FINGERTIP, **core})
         assert info == TactileInfo.from_dict(RIGHT_FINGERTIP)
-        assert unknown == []
+        assert unknown == [] and missing == [] and not upgraded
 
     def test_wrong_types_still_raise(self) -> None:
         with pytest.raises(SchemaError, match="declared_rate_hz: expected a number"):
             read_info_lenient({**LEFT_FINGERTIP, "declared_rate_hz": "91"})
         with pytest.raises(SchemaError, match="missing required key 'session_meta'"):
             read_info_lenient({k: v for k, v in LEFT_FINGERTIP.items() if k != "session_meta"})
+
+
+# LEFT_FINGERTIP as SCHEMA.md 0.3.1 wrote it: channel names, units per quantity, no device.index.
+OLD_LEFT_FINGERTIP = {
+    **{k: v for k, v in LEFT_FINGERTIP.items() if k != "channels"},
+    "units": {"force": "N"},
+    "channels": ["fx", "fy", "fz"],
+    "device": {"id": "paxini_hub_0", "clock": "paxini_hub_0"},
+}
+
+
+class TestLenientUpgrade:
+    def test_a_0_3_1_entry_reads_as_channel_objects_with_source_unknown(self) -> None:
+        info, unknown, missing, upgraded = read_info_lenient(OLD_LEFT_FINGERTIP)
+        assert upgraded and unknown == [] and missing == ["info.device.index"]
+        assert [c.to_dict() for c in info.channels] == channels("N", "fx", "fy", "fz", source="unknown")
+        assert info.device.index is None
+        assert info.layout == TactileInfo.from_dict(LEFT_FINGERTIP).layout
+
+    def test_the_strict_reader_rejects_the_0_3_form_and_the_upgrade(self) -> None:
+        with pytest.raises(SchemaError, match="a list of names is the 0.3 form"):
+            TactileInfo.from_dict(OLD_LEFT_FINGERTIP)
+        info, _, _, _ = read_info_lenient(OLD_LEFT_FINGERTIP)
+        with pytest.raises(SchemaError, match="source must be one of"):
+            TactileInfo.from_dict(info.to_dict())
+        with pytest.raises(SchemaError, match="missing required key 'index'"):
+            TactileInfo.from_dict({**LEFT_FINGERTIP, "device": OLD_LEFT_FINGERTIP["device"]})
+
+    def test_units_are_matched_by_quantity_and_never_guessed(self) -> None:
+        old = {**WRENCH, "layout": FRAME, "units": {"force": "N", "torque": "N.m"}}
+        for names in (["fx", "fy", "fz", "mx", "my", "mz"], ["fx", "fy", "fz", "tx", "ty", "tz"]):
+            info, _, _, upgraded = read_info_lenient({**old, "channels": names})
+            assert upgraded and [c.unit for c in info.channels] == ["N"] * 3 + ["N.m"] * 3
+            assert {c.source for c in info.channels} == {"unknown"}
+        info, _, _, _ = read_info_lenient(
+            {**old, "channels": ["fx", "fy", "fz", "mx", "my", "mz"], "units": {"force": "N", "field": "uT"}}
+        )
+        assert [c.unit for c in info.channels] == ["N"] * 3 + [None] * 3
+        no_block = {k: v for k, v in PALM.items() if k != "channels"} | {"channels": ["bx", "by", "bz"]}
+        info, _, _, upgraded = read_info_lenient(no_block)
+        assert upgraded and [c.unit for c in info.channels] == [None] * 3
+
+    def test_a_units_block_on_an_image_entry_is_reported(self) -> None:
+        info, unknown, _, upgraded = read_info_lenient({**RIGHT_FINGERTIP, "units": {"intensity": "counts"}})
+        assert unknown == ["info.units"] and not upgraded and info.channels is None
+
+
+class TestChannels:
+    def test_channel_validation(self) -> None:
+        for source in ("measured", "derived", "unavailable"):
+            assert Channel("fx", "N", source).source == source
+        assert Channel("p", "kPa", "measured").is_pressure and not Channel("fz", "N", "measured").is_pressure
+        with pytest.raises(SchemaError, match="source must be one of"):
+            Channel("fx", "N", "unknown")
+        with pytest.raises(SchemaError, match="unit must be a non-empty string"):
+            Channel("fx", None, "measured")
+        with pytest.raises(SchemaError, match="channel.name"):
+            Channel("", "N", "measured")
+
+    def test_names_are_unique_and_channels_are_objects(self) -> None:
+        with pytest.raises(SchemaError, match="unique names"):
+            TactileInfo.from_dict({**PALM, "channels": channels("uT", "bx", "bx", "bz")})
+        layout = Layout.from_dict(PALM["layout"])
+        with pytest.raises(SchemaError, match="0.3 form"):
+            TactileInfo("magnetic", 200, PALM["session_meta"], channels=["bx", "by", "bz"], layout=layout)
+
+    def test_a_derived_channel_requires_the_derived_block(self) -> None:
+        estimated = {**WRENCH, "layout": FRAME, "channels": channels("N", "fx", "fy", "fz", source="derived")}
+        estimated["channels"] += channels("N.m", "mx", "my", "mz", source="derived")
+        with pytest.raises(SchemaError, match="requires a 'derived' block"):
+            TactileInfo.from_dict(estimated)
+        named = {**estimated, "derived": {"method": "vendor-estimate", "version": "2.0"}}
+        assert TactileInfo.from_dict(named).to_dict() == named
+
+    def test_converted_force_keeps_six_channels_with_unavailable_moments(self) -> None:
+        info = TactileInfo.from_dict({**WRENCH, "layout": FRAME, "channels": CONVERTED_FORCE_CHANNELS})
+        assert [c.source for c in info.channels] == ["measured"] * 3 + ["unavailable"] * 3
+        assert info.to_dict()["channels"] == CONVERTED_FORCE_CHANNELS
+
+    def test_an_image_has_no_channels_and_only_an_image_is_processed(self) -> None:
+        with pytest.raises(SchemaError, match="image entry has no channels"):
+            TactileInfo.from_dict({**RIGHT_FINGERTIP, "channels": channels("counts", "gray")})
+        processed = {**RIGHT_FINGERTIP, "processed": {"method": "deformation-map", "version": "2.1"}}
+        out = TactileInfo.from_dict(processed).to_dict()
+        assert out == processed and list(out).index("processed") == list(out).index("derived") + 1
+        with pytest.raises(SchemaError, match="processed is defined for visuotactile"):
+            TactileInfo.from_dict({**PALM, "processed": {"method": "x", "version": "1"}})
+        with pytest.raises(SchemaError, match="processed.version"):
+            TactileInfo.from_dict({**RIGHT_FINGERTIP, "processed": {"method": "x", "version": ""}})
+
+
+def pressure_entry(layout: dict) -> dict:
+    """A taxel_array with one channel in kPa, a pressure map, and the frame plus ``layout``."""
+    return {**PALM, "family": "taxel_array", "channels": channels("kPa", "p"), "layout": {**FRAME, **layout}}
+
+
+GRID_64 = [[1.75 * (i % 8), 1.75 * (i // 8), 0.0] for i in range(64)]
+
+
+class TestIndexing:
+    def test_schema_example_round_trips(self) -> None:
+        entry = pressure_entry({"indexing": GEN3_2_INDEXING})
+        info = TactileInfo.from_dict(entry)
+        assert info.to_dict() == entry
+        assert info.layout.n_elements == 256 and info.layout.has_area
+        assert [r.n_elements for r in info.layout.indexing.parts] == [64, 192]
+
+    def test_one_grid(self) -> None:
+        grid = {"kind": "grid", "shape": [8, 8], "pitch_mm": [1.75, 1.75], "area_mm2": 3.0625}
+        info = TactileInfo.from_dict(pressure_entry({"indexing": grid}))
+        assert info.layout.indexing.parts == [Region("grid", [8, 8], [1.75, 1.75], 0, 3.0625)]
+        assert info.layout.to_dict()["indexing"] == grid
+        with pytest.raises(SchemaError, match="a grid has shape and pitch_mm, not regions"):
+            Indexing.from_dict({**grid, "regions": GEN3_2_INDEXING["regions"]})
+        with pytest.raises(SchemaError, match="pitch_mm must be two positive numbers"):
+            Indexing.from_dict({"kind": "grid", "shape": [8, 8], "pitch_mm": [1.75]})
+        with pytest.raises(SchemaError, match="shape must be two positive integers"):
+            Indexing.from_dict({"kind": "grid", "shape": [8, 0], "pitch_mm": [1.0, 1.0]})
+        with pytest.raises(SchemaError, match="indexing.kind"):
+            Indexing.from_dict({"kind": "hexagonal"})
+
+    def test_regions_cover_the_elements_once(self) -> None:
+        tip, palm = GEN3_2_INDEXING["regions"]
+        assert Indexing.from_dict({"kind": "regions", "regions": [palm, tip]}).n_elements == 256
+        with pytest.raises(SchemaError, match="region 'palm' starts at element 65, expected 64"):
+            Indexing.from_dict({"kind": "regions", "regions": [tip, {**palm, "first_element": 65}]})
+        with pytest.raises(SchemaError, match="region 'fingertip' starts at element 1, expected 0"):
+            Indexing.from_dict({"kind": "regions", "regions": [{**tip, "first_element": 1}, palm]})
+        with pytest.raises(SchemaError, match="unique"):
+            Indexing.from_dict({"kind": "regions", "regions": [tip, {**palm, "name": "fingertip"}]})
+        with pytest.raises(SchemaError, match="at least one region"):
+            Indexing.from_dict({"kind": "regions", "regions": []})
+        with pytest.raises(SchemaError, match="each region carries its own"):
+            Indexing.from_dict({**GEN3_2_INDEXING, "shape": [8, 8]})
+
+    def test_a_pressure_channel_needs_element_area(self) -> None:
+        bare = [{k: v for k, v in r.items() if k != "area_mm2"} for r in GEN3_2_INDEXING["regions"]]
+        no_area = {"kind": "regions", "regions": bare}
+        with pytest.raises(SchemaError, match=r"channels \['p'\] are pressures"):
+            TactileInfo.from_dict(pressure_entry({"indexing": no_area}))
+        newtons = {**pressure_entry({"indexing": no_area}), "channels": channels("N", "fz")}
+        assert not TactileInfo.from_dict(newtons).layout.has_area
+        for area in (3.0625, [3.0625] * 64):
+            entry = pressure_entry({"positions_mm": GRID_64, "normals": None, "element_area_mm2": area})
+            assert TactileInfo.from_dict(entry).to_dict() == entry
+        for unit in ("Pa", "kPa", "N/mm2", "N/mm²", "psi"):
+            with pytest.raises(SchemaError, match="are pressures"):
+                TactileInfo.from_dict(
+                    {**pressure_entry({"positions_mm": GRID_64}), "channels": channels(unit, "p")}
+                )
+        with pytest.raises(SchemaError, match="2 values for 64 positions"):
+            TactileInfo.from_dict(pressure_entry({"positions_mm": GRID_64, "element_area_mm2": [1.0, 1.0]}))
+
+    def test_where_indexing_and_area_belong(self) -> None:
+        both = pressure_entry({"positions_mm": positions(256), "normals": None, "indexing": GEN3_2_INDEXING})
+        assert TactileInfo.from_dict(both).to_dict() == both
+        with pytest.raises(SchemaError, match="positions_mm has 255 rows, layout.indexing 256 elements"):
+            TactileInfo.from_dict(
+                pressure_entry({"positions_mm": positions(255), "indexing": GEN3_2_INDEXING})
+            )
+        with pytest.raises(SchemaError, match="element_area_mm2 is for positions_mm alone"):
+            TactileInfo.from_dict(pressure_entry({"indexing": GEN3_2_INDEXING, "element_area_mm2": 3.0}))
+        with pytest.raises(SchemaError, match="element_area_mm2 is given without positions_mm"):
+            Layout.from_dict({**FRAME, "element_area_mm2": 3.0})
+        grid = {"kind": "grid", "shape": [1, 1], "pitch_mm": [1.0, 1.0]}
+        with pytest.raises(SchemaError, match="defined for taxel_array and magnetic"):
+            TactileInfo.from_dict({**WRENCH, "layout": {**FRAME, "indexing": grid}})
+
+
+class TestUncalibratedUnits:
+    def test_counts_and_au_require_an_uncalibrated_session(self) -> None:
+        record = SessionRecord.from_dict(LEFT_FINGERTIP_META["sessions"][0])
+        counts = TactileInfo.from_dict({**PALM, "channels": channels("counts", "bx", "by", "bz")})
+        match = r"channels in \['counts'\] require calibration.method 'uncalibrated', got 'vendor'"
+        with pytest.raises(SchemaError, match=match):
+            check_session_calibration(counts, record)
+        record.calibration = Calibration(method="uncalibrated")
+        check_session_calibration(counts, record)
+        record.calibration = None
+        au = TactileInfo.from_dict({**PALM, "channels": channels("a.u.", "bx", "by", "bz")})
+        with pytest.raises(SchemaError, match=r"\['a.u.'\] require .* got None"):
+            check_session_calibration(au, record)
+        check_session_calibration(TactileInfo.from_dict(PALM), record)  # uT needs no method
+
+
+class TestDeviceAndTransport:
+    def test_device_index(self) -> None:
+        assert TactileInfo.from_dict(LEFT_FINGERTIP).device.index == 0
+        device = LEFT_FINGERTIP["device"]
+        for bad in (-1, None):
+            with pytest.raises(SchemaError, match="device.index must be a non-negative integer"):
+                TactileInfo.from_dict({**LEFT_FINGERTIP, "device": {**device, "index": bad}})
+        for bad in (1.5, True):
+            with pytest.raises(SchemaError, match="expected an integer"):
+                TactileInfo.from_dict({**LEFT_FINGERTIP, "device": {**device, "index": bad}})
+
+    def test_indices_are_unique_on_a_device(self) -> None:
+        left = TactileInfo.from_dict(LEFT_FINGERTIP)
+        right = {**LEFT_FINGERTIP, "session_meta": "tactile/right/meta.json"}
+        with pytest.raises(
+            SchemaError, match="'left' and 'right' share device.index 0 on device 'paxini_hub_0'"
+        ):
+            check_device_indices({"left": left, "right": TactileInfo.from_dict(right)})
+        second = TactileInfo.from_dict({**right, "device": {**LEFT_FINGERTIP["device"], "index": 1}})
+        check_device_indices({"left": left, "right": second, "palm": TactileInfo.from_dict(PALM)})
+
+    def test_transport(self) -> None:
+        assert SessionMeta.from_dict(LEFT_FINGERTIP_META).sessions[0].transport == Transport("usb", 91)
+        assert Transport("ble", None).to_dict() == {"kind": "ble", "rate_hz": None}
+        with pytest.raises(SchemaError, match="transport.kind"):
+            Transport("wifi", 100.0)
+        with pytest.raises(SchemaError, match="transport.rate_hz"):
+            Transport("usb", 0)
+        with pytest.raises(SchemaError, match="missing required key 'rate_hz'"):
+            Transport.from_dict({"kind": "usb"})
+        older = copy.deepcopy(LEFT_FINGERTIP_META)
+        del older["sessions"][0]["transport"]
+        assert SessionMeta.from_dict(older).sessions[0].transport is None  # optional: a 0.3 record reads
+
+
+class TestClockColumn:
+    FEATURES = {
+        "source_timestamp": {"dtype": "float64", "shape": [1]},
+        "t_epoch": {"dtype": "float32", "shape": []},
+        "observation.state": {"dtype": "float32", "shape": [6]},
+    }
+
+    def test_names_a_feature_of_one_number_per_frame(self) -> None:
+        info = TactileInfo.from_dict({**PALM, "clock_column": "source_timestamp"})
+        keys = list(info.to_dict())
+        assert keys.index("clock_column") == keys.index("mount") - 1
+        info.check_clock_column(self.FEATURES)
+        TactileInfo.from_dict({**PALM, "clock_column": "t_epoch"}).check_clock_column(self.FEATURES)
+        TactileInfo.from_dict(PALM).check_clock_column({})  # none declared
+        with pytest.raises(SchemaError, match="'timestamp_ns' is not a feature"):
+            TactileInfo.from_dict({**PALM, "clock_column": "timestamp_ns"}).check_clock_column(self.FEATURES)
+        with pytest.raises(
+            SchemaError, match=r"'observation.state' is float32 \[6\], not one number per frame"
+        ):
+            TactileInfo.from_dict({**PALM, "clock_column": "observation.state"}).check_clock_column(
+                self.FEATURES
+            )
+        with pytest.raises(SchemaError, match="clock_column must be a non-empty string"):
+            TactileInfo.from_dict({**PALM, "clock_column": ""})
 
 
 class TestSessionRoundTrip:
@@ -585,6 +886,8 @@ HEALTH = {
             "sidecar": True,
             "declared_rate_hz": 91,
             "range": None,
+            "channels": channels("N", "fx", "fy", "fz"),
+            "upgraded": False,
             "unknown_keys": [],
             "missing_keys": ["meta.sessions[0].baseline.frame_range"],
             "error": None,
@@ -639,6 +942,7 @@ HEALTH = {
                 },
                 "framerate": {
                     "effective_hz": 89.4,
+                    "configured_hz": 91,
                     "declared_hz": 91,
                     "dropped_pct": 0.018,
                     "max_gap_ms": 31.0,
@@ -713,6 +1017,22 @@ class TestHealthReport:
         assert checks.gel.dead_elements == [] and checks.gel.episodes_checked == 14
         assert checks.drift.frame_range == "not recorded" and checks.drift.rebaselines[0].sample_index == 1200
         assert [f for f in checks.to_dict()] == list(CHECK_NAMES)
+        assert list(report.to_dict()["instances"]["left_fingertip"]) == list(
+            HEALTH["instances"]["left_fingertip"]
+        )
+        assert list(checks.to_dict()["framerate"])[:3] == ["effective_hz", "configured_hz", "declared_hz"]
+
+    def test_an_upgraded_instance_reads_back(self) -> None:
+        data = copy.deepcopy(HEALTH)
+        instance = data["instances"]["left_fingertip"]
+        instance["channels"] = [{"name": "fx", "unit": None, "source": "unknown"}]
+        instance["upgraded"] = True
+        report = HealthReport.from_dict(data)
+        assert report.instances["left_fingertip"].channels == [ChannelReport("fx", None, "unknown")]
+        assert report.to_dict() == data
+        instance["channels"][0]["source"] = "guessed"
+        with pytest.raises(SchemaError, match="source must be one of"):
+            HealthReport.from_dict(data)
 
     def test_skipped_is_told_apart_by_its_key(self) -> None:
         data = copy.deepcopy(HEALTH)
@@ -745,17 +1065,20 @@ class TestHealthReport:
 
     def test_a_report_from_before_the_added_keys_still_reads(self) -> None:
         """The keys added after 0.3.1 (saturation at_min_pct and at_max_pct, the gel block's cross-episode
-        fields, nan_pct, the framerate's stalled and clock, the held block and its threshold,
-        thresholds.cluster_pct) have defaults, so an older health.json still loads."""
+        fields, nan_pct, the framerate's stalled, clock and configured_hz, the held block and its
+        threshold, thresholds.cluster_pct, the instance's channels and upgraded) have defaults, so an
+        older health.json still loads."""
         data = copy.deepcopy(HEALTH)
         data["thresholds"] = {k: v for k, v in data["thresholds"].items() if k not in ("cluster_pct", "held")}
         data["thresholds"]["cluster_px"] = 25
+        del data["instances"]["left_fingertip"]["channels"], data["instances"]["left_fingertip"]["upgraded"]
         block = data["episodes"]["episode_000012"]["left_fingertip"]
         del (
             block["held"],
             block["drift"]["nan_pct"],
             block["framerate"]["stalled"],
             block["framerate"]["clock"],
+            block["framerate"]["configured_hz"],
         )
         block["saturation"] = {
             k: v for k, v in block["saturation"].items() if not k.startswith("at_") and k != "nan_pct"
@@ -779,7 +1102,10 @@ class TestHealthReport:
             checks.drift.nan_pct is None
             and checks.framerate.stalled is None
             and checks.framerate.clock is None
+            and checks.framerate.configured_hz is None
         )
+        instance = report.instances["left_fingertip"]
+        assert instance.channels is None and not instance.upgraded
         out = report.to_dict()["episodes"]["episode_000012"]["left_fingertip"]
         assert "held" not in out and list(out) == list(CHECK_NAMES[:-1])
         assert list(out["saturation"])[:3] == ["saturated_pct", "at_min_pct", "at_max_pct"]

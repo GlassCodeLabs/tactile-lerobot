@@ -19,7 +19,9 @@ at load time rather than silently becoming an ignored field. Decoding goes
 through :class:`_Reader`; :func:`read_info_lenient` and
 :func:`read_session_meta_lenient` use its lenient mode, which reports unknown keys
 and the keys a later schema version added instead of raising, for datasets this
-package did not write or wrote under an earlier version.
+package did not write or wrote under an earlier version. The lenient ``info`` reader
+also reads a 0.3 channel list as channel objects whose ``source`` is ``unknown``,
+a value the strict reader rejects.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from __future__ import annotations
 import re
 import types
 from collections.abc import Iterable, Mapping
+from contextvars import ContextVar
 from dataclasses import MISSING, dataclass, fields, is_dataclass
 from enum import Enum
 from itertools import pairwise
@@ -42,8 +45,13 @@ __all__ = [
     "Baseline",
     "BaselineStream",
     "Block",
+    "CHANNEL_SOURCES",
+    "CORE_INFO_KEYS",
+    "CORE_INFO_PREFIXES",
     "Calibration",
     "CHECK_NAMES",
+    "Channel",
+    "ChannelReport",
     "Clock",
     "CopyCheck",
     "Derived",
@@ -60,6 +68,8 @@ __all__ = [
     "HealthReport",
     "HeldGroup",
     "HeldReport",
+    "INDEXING_KINDS",
+    "Indexing",
     "InstanceChecks",
     "InstanceReport",
     "IntegrityReport",
@@ -68,11 +78,14 @@ __all__ = [
     "Mount",
     "ORIGIN_AT",
     "Origin",
+    "PRESSURE_UNITS",
+    "Processed",
     "REDUCTION_METHODS",
     "Range",
     "RawCheck",
     "RebaselineEvent",
     "Reduction",
+    "Region",
     "STREAM_SUFFIXES",
     "STREAM_WIDTHS",
     "SURFACES",
@@ -85,13 +98,20 @@ __all__ = [
     "Skipped",
     "StreamInfo",
     "TactileFamily",
+    "TRANSPORT_KINDS",
     "TactileInfo",
     "Thresholds",
+    "Transport",
+    "UNCALIBRATED_UNITS",
+    "UNKNOWN_SOURCE",
+    "check_device_indices",
+    "check_session_calibration",
     "feature_key",
     "health_report_path",
     "read_info_lenient",
     "read_session_meta_lenient",
     "session_meta_path",
+    "without_core_keys",
 ]
 
 FEATURE_KEY_PREFIX = "observation.tactile."
@@ -112,6 +132,34 @@ ORIGIN_AT = ("center", "corner", "element", "mount")
 SURFACES = ("gel", "die", "skin", "pad", "vendor")
 """Which surface a layout's frame and positions describe."""
 
+CHANNEL_SOURCES = ("measured", "derived", "unavailable")
+"""What a channel's column is: a value the sensor reported, one computed from another stream, or none."""
+
+UNKNOWN_SOURCE = "unknown"
+"""The ``source`` the lenient reader gives a channel read from 0.3 metadata, which never said; the strict
+reader rejects it."""
+
+UNCALIBRATED_UNITS = ("counts", "a.u.")
+"""Units of a channel that is measured but not calibrated: raw integers from an analog-to-digital converter,
+or a value the vendor scaled. Either requires the session's ``calibration.method`` to be ``uncalibrated``."""
+
+PRESSURE_UNITS = ("Pa", "kPa", "N/mm2", "N/mm²", "psi")
+"""Units that make a channel a pressure, which requires element area in its ``layout``."""
+
+INDEXING_KINDS = ("grid", "regions")
+"""Forms of ``layout.indexing``: one regular grid, or several."""
+
+TRANSPORT_KINDS = ("usb", "ble", "serial", "ethernet", "can", "other")
+"""Links a session record's ``transport.kind`` names."""
+
+CORE_INFO_PREFIXES = ("video.", "audio.")
+"""Prefixes of the keys LeRobot core writes into a video feature's ``info`` itself."""
+
+CORE_INFO_KEYS = frozenset({"has_audio", "is_depth_map"})
+"""The other keys LeRobot core writes into a video feature's ``info``; 0.6.1 writes both on every one."""
+
+_CLOCK_DTYPES = ("float32", "float64", "int32", "int64")
+
 HEALTH_REPORT_PATH = "tactile/health.json"
 """Where ``taxel doctor`` writes its report, relative to the dataset root."""
 
@@ -125,6 +173,11 @@ _WALL_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
 
 class SchemaError(ValueError):
     """Raised when metadata does not satisfy ``SCHEMA.md``."""
+
+
+_LENIENT: ContextVar[bool] = ContextVar("taxel_schema_lenient", default=False)
+"""Set while the lenient reader builds a block, so that validation accepts what only it produces: a
+channel whose ``source`` is ``unknown`` or that has no unit, and a missing ``device.index``."""
 
 
 _T = TypeVar("_T", bound="Block")
@@ -189,6 +242,36 @@ def session_meta_path(instance_id: str) -> str:
 
 
 @dataclass
+class Channel(Block):
+    """One column of an array entry's last dimension: its name, its unit, and what it is.
+
+    ``source`` is one of :data:`CHANNEL_SOURCES`: ``measured``, a value the sensor reported;
+    ``derived``, a value computed from another stream, whose method the instance's ``derived`` block
+    names; or ``unavailable``, a column with no measurement, stored as 0.0, which only converted data
+    that keeps a fixed channel set declares. ``unit`` is a free string, physical where the sensor is
+    calibrated and ``counts`` or ``a.u.`` (:data:`UNCALIBRATED_UNITS`) where it is not. Only the
+    lenient reader, reading 0.3 metadata, gives a channel the ``unknown`` source or no unit.
+    """
+
+    name: str
+    unit: str | None
+    source: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.name, "channel.name")
+        lenient = _LENIENT.get()
+        if self.unit is not None or not lenient:
+            _require_nonempty_str(self.unit, f"channel {self.name!r}: unit")
+        sources = (*CHANNEL_SOURCES, UNKNOWN_SOURCE) if lenient else CHANNEL_SOURCES
+        _require_one_of(self.source, sources, f"channel {self.name!r}: source")
+
+    @property
+    def is_pressure(self) -> bool:
+        """Whether the unit is a pressure (:data:`PRESSURE_UNITS`), which needs element area."""
+        return self.unit in PRESSURE_UNITS
+
+
+@dataclass
 class Origin(Block):
     """Where (0, 0, 0) of the sensor's frame sits on its body.
 
@@ -218,14 +301,104 @@ class Axes(Block):
 
 
 @dataclass
-class Layout(Block):
-    """The sensor's coordinate frame and, for the array families, the position of each element in it.
+class Region(Block):
+    """One regular grid of elements in an instance's flat element order, part of ``layout.indexing``.
 
-    ``origin``, ``axes`` and ``surface`` (one of :data:`SURFACES`) make the frame
-    explicit, so two sensors' positions are comparable. ``positions_mm`` has one
-    ``[x, y, z]`` row per element, in millimetres, and is omitted for an image
-    sensor, whose image is the element arrangement. ``normals`` is ``None`` or one
-    unit vector per position, and is written only beside ``positions_mm``.
+    ``shape`` is ``[rows, cols]`` and ``pitch_mm`` ``[dy, dx]``, the centre-to-centre distance between
+    neighbouring elements down a column and along a row. Elements are row-major: element ``(r, c)`` is
+    element ``first_element + r * cols + c`` of the feature and sits ``c * dx`` along +x and ``r * dy``
+    along +y from the region's first element. ``area_mm2`` is each element's area, required when a
+    channel is a pressure.
+    """
+
+    name: str
+    shape: list[int]
+    pitch_mm: list[float]
+    first_element: int
+    area_mm2: float | None = None
+
+    _omit_when_none: ClassVar[frozenset[str]] = frozenset({"area_mm2"})
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.name, "region.name")
+        _require_grid(self.shape, self.pitch_mm, self.area_mm2, f"region {self.name!r}")
+        first = self.first_element
+        if isinstance(first, bool) or not isinstance(first, int) or first < 0:
+            raise SchemaError(
+                f"region {self.name!r}: first_element must be a non-negative integer, got {first!r}"
+            )
+
+    @property
+    def n_elements(self) -> int:
+        return self.shape[0] * self.shape[1]
+
+
+@dataclass
+class Indexing(Block):
+    """Element geometry for a source that publishes a grid, not each element's position: ``layout.indexing``.
+
+    ``kind`` ``grid`` is one regular grid over every element, with ``shape``, ``pitch_mm`` and an
+    optional ``area_mm2`` as in :class:`Region`; ``regions`` is several :class:`Region` blocks, which
+    cover the instance's elements exactly once. Where one region lies relative to another is not part
+    of it; ``positions_mm`` says that.
+    """
+
+    kind: str
+    shape: list[int] | None = None
+    pitch_mm: list[float] | None = None
+    area_mm2: float | None = None
+    regions: list[Region] | None = None
+
+    _omit_when_none: ClassVar[frozenset[str]] = frozenset({"shape", "pitch_mm", "area_mm2", "regions"})
+
+    def __post_init__(self) -> None:
+        _require_one_of(self.kind, INDEXING_KINDS, "indexing.kind")
+        if self.kind == "grid":
+            if self.regions is not None:
+                raise SchemaError("indexing: a grid has shape and pitch_mm, not regions")
+            _require_grid(self.shape, self.pitch_mm, self.area_mm2, "indexing")
+            return
+        if self.shape is not None or self.pitch_mm is not None or self.area_mm2 is not None:
+            raise SchemaError("indexing: each region carries its own shape, pitch_mm and area_mm2")
+        if not self.regions:
+            raise SchemaError("indexing: kind 'regions' needs at least one region")
+        names = [r.name for r in self.regions]
+        if len(set(names)) != len(names):
+            raise SchemaError(f"indexing: region names must be unique, got {names!r}")
+        expected = 0
+        for region in sorted(self.regions, key=lambda r: r.first_element):
+            if region.first_element != expected:
+                raise SchemaError(
+                    f"indexing: the regions must cover the elements once; region {region.name!r} starts at "
+                    f"element {region.first_element}, expected {expected}"
+                )
+            expected += region.n_elements
+
+    @property
+    def parts(self) -> list[Region]:
+        """The regions, with a grid as one region that starts at element 0."""
+        if self.kind == "grid":
+            assert self.shape is not None and self.pitch_mm is not None
+            return [Region("grid", list(self.shape), list(self.pitch_mm), 0, self.area_mm2)]
+        return list(self.regions or ())
+
+    @property
+    def n_elements(self) -> int:
+        return sum(r.n_elements for r in self.parts)
+
+
+@dataclass
+class Layout(Block):
+    """The sensor's coordinate frame and, for the array families, where its elements are.
+
+    ``origin``, ``axes`` and ``surface`` (one of :data:`SURFACES`) make the frame explicit, so two
+    sensors' positions are comparable. ``positions_mm`` has one ``[x, y, z]`` row per element, in
+    millimetres; it is a point set that assumes no grid, and is omitted for an image sensor, whose
+    image is the element arrangement. ``normals`` is ``None`` or one unit vector per position, and is
+    written only beside ``positions_mm``. ``indexing`` is the fallback for a source that publishes a
+    grid instead of positions. Element area, required for a pressure channel, is ``area_mm2`` in
+    ``indexing``, or ``element_area_mm2`` (one number, or one per element) beside ``positions_mm``
+    alone.
     """
 
     origin: Origin
@@ -233,8 +406,10 @@ class Layout(Block):
     surface: str
     positions_mm: list[list[float]] | None = None
     normals: list[list[float]] | None = None
+    indexing: Indexing | None = None
+    element_area_mm2: float | list[float] | None = None
 
-    _omit_when_none: ClassVar[frozenset[str]] = frozenset({"positions_mm"})
+    _omit_when_none: ClassVar[frozenset[str]] = frozenset({"positions_mm", "indexing", "element_area_mm2"})
 
     def __post_init__(self) -> None:
         if self.surface not in SURFACES:
@@ -249,12 +424,50 @@ class Layout(Block):
                 raise SchemaError(
                     f"layout.normals has {len(self.normals)} rows, positions_mm has {len(self.positions_mm)}"
                 )
+        positions, indexing = self.positions_mm, self.indexing
+        if positions is not None and indexing is not None and len(positions) != indexing.n_elements:
+            raise SchemaError(
+                f"layout.positions_mm has {len(positions)} rows, "
+                f"layout.indexing {indexing.n_elements} elements"
+            )
+        area = self.element_area_mm2
+        if area is not None:
+            if self.indexing is not None:
+                raise SchemaError(
+                    "layout.element_area_mm2 is for positions_mm alone; "
+                    "with indexing, area_mm2 goes on each region"
+                )
+            if self.positions_mm is None:
+                raise SchemaError("layout.element_area_mm2 is given without positions_mm")
+            values = area if isinstance(area, list) else [area]
+            if not values or any(not _is_number(v) or not v > 0 for v in values):
+                raise SchemaError(
+                    f"layout.element_area_mm2 must be positive, one number or one per element, got {area!r}"
+                )
+            if isinstance(area, list) and len(area) != len(self.positions_mm):
+                raise SchemaError(
+                    f"layout.element_area_mm2 has {len(area)} values for {len(self.positions_mm)} positions"
+                )
 
     def to_dict(self) -> dict[str, Any]:
         out = super().to_dict()
         if self.positions_mm is None:
             del out["normals"]
         return out
+
+    @property
+    def n_elements(self) -> int | None:
+        """Elements the layout describes: rows of ``positions_mm``, else elements of ``indexing``."""
+        if self.positions_mm is not None:
+            return len(self.positions_mm)
+        return None if self.indexing is None else self.indexing.n_elements
+
+    @property
+    def has_area(self) -> bool:
+        """Whether every element has an area, as a pressure channel requires."""
+        if self.indexing is not None:
+            return all(r.area_mm2 is not None for r in self.indexing.parts)
+        return self.element_area_mm2 is not None
 
 
 @dataclass
@@ -324,7 +537,8 @@ class Markers(Block):
 
 @dataclass
 class Derived(Block):
-    """The algorithm that produced a ``.displacement`` or ``.force`` stream."""
+    """The algorithm that produced an instance's derived channels: the columns of its suffixed streams,
+    which are all derived, and any channel with ``source`` ``derived``."""
 
     method: str
     version: str
@@ -332,6 +546,20 @@ class Derived(Block):
     def __post_init__(self) -> None:
         _require_nonempty_str(self.method, "derived.method")
         _require_nonempty_str(self.version, "derived.version")
+
+
+@dataclass
+class Processed(Block):
+    """The processing that made a visuotactile image from raw gel frames, such as a difference image or a
+    deformation map. A raw gel image has none, and a check that assumes one, such as dead pixels, does not
+    apply."""
+
+    method: str
+    version: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.method, "processed.method")
+        _require_nonempty_str(self.version, "processed.version")
 
 
 @dataclass
@@ -353,15 +581,24 @@ class Mount(Block):
 class DeviceGroup(Block):
     """The physical connection an instance shares with others, such as a serial hub.
 
-    Instances with the same ``clock`` have directly comparable ``device_ts``.
+    Instances with the same ``clock`` have directly comparable ``device_ts``. ``index`` is the
+    instance's 0-based position on the device, unique among the instances with the same ``id`` and
+    fixed for the dataset's life; a lenient read of 0.3 metadata, which had none, leaves it ``None``.
     """
 
     id: str
     clock: str
+    index: int | None
+
+    _lenient_missing: ClassVar[frozenset[str]] = frozenset({"index"})
 
     def __post_init__(self) -> None:
         _require_slug(self.id, "device.id")
         _require_slug(self.clock, "device.clock")
+        if self.index is None and _LENIENT.get():
+            return
+        if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
+            raise SchemaError(f"device.index must be a non-negative integer, got {self.index!r}")
 
 
 @dataclass
@@ -373,11 +610,15 @@ class TactileInfo(Block):
     sessions goes in :class:`SessionRecord` instead.
 
     ``family``, ``vendor``, ``model``, ``declared_rate_hz``, ``layout``, ``mount``,
-    ``device`` and ``session_meta`` are always written. ``units``, ``channels``,
-    ``range``, ``reduction``, ``markers`` and ``derived`` are written only when set. ``layout``
-    is required for every family; its ``positions_mm`` is required for
-    ``taxel_array`` and ``magnetic``, at most one row for ``force_torque``, and
-    omitted for ``visuotactile``.
+    ``device`` and ``session_meta`` are always written, the other keys only when set.
+    ``channels`` is required for the array families, one :class:`Channel` per column,
+    and absent for ``visuotactile``, whose suffixed streams declare their own. ``layout``
+    is required for every family: ``taxel_array`` and ``magnetic`` need ``positions_mm``
+    or ``indexing`` in it, ``force_torque`` has at most one position, and
+    ``visuotactile`` none. A ``derived`` channel needs the ``derived`` block, a pressure
+    channel needs element area, and ``processed`` is for ``visuotactile`` only.
+    ``clock_column`` names a main-table feature of real per-frame times, checked against
+    the dataset's features by :meth:`check_clock_column`.
     """
 
     family: TactileFamily
@@ -385,32 +626,34 @@ class TactileInfo(Block):
     session_meta: str
     vendor: str | None = None
     model: str | None = None
-    units: dict[str, str] | None = None
-    channels: list[str] | None = None
+    channels: list[Channel] | None = None
     range: Range | None = None
     layout: Layout | None = None
     reduction: Reduction | None = None
     markers: Markers | None = None
     derived: Derived | None = None
+    processed: Processed | None = None
+    clock_column: str | None = None
     mount: Mount | None = None
     device: DeviceGroup | None = None
 
     _label: ClassVar[str] = "info"
     _omit_when_none: ClassVar[frozenset[str]] = frozenset(
-        {"units", "channels", "range", "reduction", "markers", "derived"}
+        {"channels", "range", "reduction", "markers", "derived", "processed", "clock_column"}
     )
     _key_order: ClassVar[tuple[str, ...] | None] = (
         "family",
         "vendor",
         "model",
         "declared_rate_hz",
-        "units",
         "channels",
         "range",
         "layout",
         "reduction",
         "markers",
         "derived",
+        "processed",
+        "clock_column",
         "mount",
         "device",
         "session_meta",
@@ -423,16 +666,22 @@ class TactileInfo(Block):
         if self.family in ARRAY_FAMILIES:
             if not self.channels:
                 raise SchemaError(f"channels is required for family {self.family.value!r}")
-            if any(not isinstance(c, str) or not c for c in self.channels):
-                raise SchemaError("channels must be non-empty strings")
-            if len(set(self.channels)) != len(self.channels):
-                raise SchemaError(f"channels must be unique, got {self.channels!r}")
+            _require_channels(self.channels, "channels")
             if self.family is TactileFamily.FORCE_TORQUE and len(self.channels) != 6:
                 raise SchemaError(f"force_torque declares six channels, got {len(self.channels)}")
-        if self.units is not None and any(
-            not isinstance(k, str) or not isinstance(v, str) for k, v in self.units.items()
-        ):
-            raise SchemaError("units must map quantity names to unit strings")
+        elif self.channels is not None:
+            raise SchemaError(
+                "a visuotactile image entry has no channels; its suffixed streams declare theirs"
+            )
+        if self.processed is not None and self.family is not TactileFamily.VISUOTACTILE:
+            raise SchemaError(f"processed is defined for visuotactile images, not {self.family.value!r}")
+        derived = [c.name for c in self.channels or () if c.source == "derived"]
+        if derived and self.derived is None:
+            raise SchemaError(
+                f"channels {derived} are derived, which requires a 'derived' block naming the method"
+            )
+        if self.clock_column is not None:
+            _require_nonempty_str(self.clock_column, "clock_column")
         if self.range is not None:
             if self.family not in ARRAY_FAMILIES:
                 raise SchemaError(f"range is defined for the array families, not {self.family.value!r}")
@@ -441,14 +690,29 @@ class TactileInfo(Block):
                 raise SchemaError(f"range lists {per_channel} values for {len(self.channels or ())} channels")
         if self.layout is None:
             raise SchemaError("layout is required: origin, axes and surface declare the sensor's frame")
-        positions = self.layout.positions_mm
-        if self.family in (TactileFamily.TAXEL_ARRAY, TactileFamily.MAGNETIC) and positions is None:
-            raise SchemaError(f"layout.positions_mm is required for family {self.family.value!r}")
+        layout = self.layout
+        positions = layout.positions_mm
+        if self.family in (TactileFamily.TAXEL_ARRAY, TactileFamily.MAGNETIC):
+            if positions is None and layout.indexing is None:
+                raise SchemaError(
+                    f"layout.positions_mm or layout.indexing is required for family {self.family.value!r}"
+                )
+        elif layout.indexing is not None or layout.element_area_mm2 is not None:
+            raise SchemaError(
+                f"layout.indexing and element area are defined for taxel_array and magnetic, "
+                f"not {self.family.value!r}"
+            )
         if self.family is TactileFamily.FORCE_TORQUE and positions is not None and len(positions) != 1:
             raise SchemaError(f"force_torque is one element; layout.positions_mm has {len(positions)} rows")
         if self.family is TactileFamily.VISUOTACTILE and positions is not None:
             raise SchemaError(
                 "layout.positions_mm is omitted for visuotactile; the image is the element arrangement"
+            )
+        pressures = [c.name for c in self.channels or () if c.is_pressure]
+        if pressures and not layout.has_area:
+            raise SchemaError(
+                f"channels {pressures} are pressures, which require element area: area_mm2 on each region "
+                "of layout.indexing, or layout.element_area_mm2 beside positions_mm"
             )
 
     @property
@@ -459,8 +723,8 @@ class TactileInfo(Block):
     def check_streams(self, suffixes: Iterable[str]) -> None:
         """Validate the suffixed streams declared beside this instance's key.
 
-        ``.displacement`` and ``.force`` require a ``derived`` block, and any
-        suffixed stream requires the visuotactile family.
+        Any suffixed stream requires the visuotactile family and, since every one is
+        computed from the image, a ``derived`` block naming the method.
         """
         declared = set(suffixes)
         unknown = declared - set(STREAM_SUFFIXES)
@@ -470,13 +734,39 @@ class TactileInfo(Block):
             raise SchemaError(
                 f"suffixed streams are defined for visuotactile instances only, not {self.family.value!r}"
             )
-        if declared & {"displacement", "force"} and self.derived is None:
-            raise SchemaError("'.displacement' and '.force' streams require a 'derived' block")
+        if declared and self.derived is None:
+            raise SchemaError("suffixed streams are derived from the image and require a 'derived' block")
+
+    def check_clock_column(self, features: Mapping[str, Mapping[str, Any]]) -> None:
+        """Check that ``clock_column`` names a feature of the dataset holding one number per frame.
+
+        Raises:
+            SchemaError: If it names no feature in ``features``, or one that is not a single
+                number per frame.
+        """
+        if self.clock_column is None:
+            return
+        entry = features.get(self.clock_column)
+        if entry is None:
+            raise SchemaError(f"clock_column {self.clock_column!r} is not a feature of the dataset")
+        dtype, shape = entry.get("dtype"), list(entry.get("shape") or [])
+        if dtype not in _CLOCK_DTYPES or shape not in ([], [1]):
+            raise SchemaError(
+                f"clock_column {self.clock_column!r} is {dtype} {shape}, not one number per frame"
+            )
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> TactileInfo:
-        """Build from an ``info`` block. Core's own ``video.*`` keys are ignored."""
-        own = {k: v for k, v in data.items() if not k.startswith("video.")}
+        """Build from an ``info`` block, strictly. LeRobot's own keys are set aside (see
+        :func:`without_core_keys`). A 0.3 channel list of names is an error; :func:`read_info_lenient`
+        reads it."""
+        own = without_core_keys(data)
+        channels = own.get("channels")
+        if isinstance(channels, list) and any(isinstance(c, str) for c in channels):
+            raise SchemaError(
+                "info.channels: each channel is an object with name, unit and source since 0.4; "
+                "a list of names is the 0.3 form, which read_info_lenient reads"
+            )
         return super().from_dict(own)
 
 
@@ -484,34 +774,91 @@ class TactileInfo(Block):
 class StreamInfo(Block):
     """The ``info`` block of a suffixed stream key (``.markers``, ``.displacement``, ``.force``).
 
-    A suffixed stream carries only ``reduction``, when its main-table column is a
-    dataset-rate copy of a faster native stream, and ``session_meta``. Everything
-    else about the stream is read from the instance's own entry.
+    A suffixed stream carries its ``channels``, every one ``derived``, since the stream is
+    computed from the image by the method the instance's ``derived`` block names;
+    ``reduction``, when its main-table column is a dataset-rate copy of a faster native
+    stream; and ``session_meta``. Everything else about the stream is read from the
+    instance's own entry.
     """
 
     session_meta: str
+    channels: list[Channel]
     reduction: Reduction | None = None
 
     _label: ClassVar[str] = "info"
     _omit_when_none: ClassVar[frozenset[str]] = frozenset({"reduction"})
-    _key_order: ClassVar[tuple[str, ...] | None] = ("reduction", "session_meta")
+    _key_order: ClassVar[tuple[str, ...] | None] = ("channels", "reduction", "session_meta")
 
     def __post_init__(self) -> None:
         _require_session_meta(self.session_meta)
+        if not self.channels:
+            raise SchemaError("a suffixed stream declares its channels")
+        _require_channels(self.channels, "channels")
+        measured = [c.name for c in self.channels if c.source != "derived"]
+        if measured:
+            raise SchemaError(
+                f"a suffixed stream is derived from the image; channels {measured} must be 'derived'"
+            )
 
 
-def read_info_lenient(data: Mapping[str, Any]) -> tuple[TactileInfo, list[str]]:
-    """Decode an ``info`` block from a dataset this package did not write.
+def without_core_keys(data: Mapping[str, Any]) -> dict[str, Any]:
+    """``data`` without the keys LeRobot core writes into a feature's ``info`` itself.
 
-    Unknown keys are returned as dotted paths (``info.serial``) instead of raising,
-    so a reader can report them. Wrong types and missing required keys still raise
-    :class:`SchemaError`. Core's own ``video.*`` keys are ignored, as in
-    :meth:`TactileInfo.from_dict`.
+    Those are everything under :data:`CORE_INFO_PREFIXES` and the keys in :data:`CORE_INFO_KEYS`;
+    LeRobot 0.6.1 writes ``has_audio`` and ``is_depth_map`` on every video feature.
+    """
+    return {k: v for k, v in data.items() if not k.startswith(CORE_INFO_PREFIXES) and k not in CORE_INFO_KEYS}
+
+
+def read_info_lenient(data: Mapping[str, Any]) -> tuple[TactileInfo, list[str], list[str], bool]:
+    """Decode an ``info`` block from a dataset this package did not write, or wrote under an earlier schema.
+
+    Returns the info, the unknown keys and the tolerated missing keys, both as dotted paths
+    (``info.serial``, ``info.device.index``), and whether a 0.3 channel declaration was
+    upgraded. A 0.3 array entry lists ``channels`` as names with units per quantity in a
+    ``units`` block; each name becomes a :class:`Channel` with ``source`` ``unknown``, never
+    ``measured`` (see :func:`_upgrade_channels`). A missing ``device.index``, added in 0.4, is
+    read as ``None``. LeRobot's own keys are set aside, as in :meth:`TactileInfo.from_dict`.
+    Wrong types and other missing required keys still raise :class:`SchemaError`.
     """
     reader = _Reader(strict=False)
-    own = {k: v for k, v in data.items() if not k.startswith("video.")}
+    own, upgraded = _upgrade_channels(without_core_keys(data))
     info = _from_dict(TactileInfo, own, reader, "info")
-    return info, reader.unknown
+    return info, reader.unknown, reader.missing, upgraded
+
+
+_QUANTITY_PREFIXES = {"force": ("f",), "torque": ("m", "t")}
+"""How a 0.3 ``units`` block that names several quantities is matched to channel names."""
+
+
+def _upgrade_channels(data: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """A 0.3 channel list, names plus a ``units`` block keyed by quantity, as 0.4 channel objects.
+
+    Each channel gets ``source`` ``unknown``. Its unit is the block's when the block names one
+    quantity, the quantity its name starts with when it names several (``f`` for force, ``m`` or
+    ``t`` for torque), and ``None`` without a block or a match. Any other block is returned as is.
+    """
+    channels = data.get("channels")
+    if not isinstance(channels, list) or not channels or not all(isinstance(c, str) for c in channels):
+        return data, False
+    units = data.get("units")
+    upgraded = {k: v for k, v in data.items() if k != "units"}
+    upgraded["channels"] = [
+        {"name": name, "unit": _unit_of(name, units), "source": UNKNOWN_SOURCE} for name in channels
+    ]
+    return upgraded, True
+
+
+def _unit_of(name: str, units: Any) -> str | None:
+    if not isinstance(units, Mapping) or not units:
+        return None
+    if len(units) == 1:
+        matches = list(units.values())
+    else:
+        matches = [
+            u for quantity, u in units.items() if name.startswith(_QUANTITY_PREFIXES.get(quantity, ()))
+        ]
+    return matches[0] if len(matches) == 1 and isinstance(matches[0], str) and matches[0] else None
 
 
 # --- Per-session metadata: ``tactile/<instance_id>/meta.json`` ---------------------------------
@@ -679,6 +1026,24 @@ class Skin(Block):
 
 
 @dataclass
+class Transport(Block):
+    """The link an instance was read over in one session, and the rate the sensor was configured to on it.
+
+    ``kind`` is one of :data:`TRANSPORT_KINDS`. ``rate_hz`` is the configured rate, not a measured one,
+    or ``None`` when unknown; a sensor's rate can depend on its link. ``info.declared_rate_hz`` stays
+    the instance's nominal native rate, the same in every session.
+    """
+
+    kind: str
+    rate_hz: float | None
+
+    def __post_init__(self) -> None:
+        _require_one_of(self.kind, TRANSPORT_KINDS, "transport.kind")
+        if self.rate_hz is not None:
+            _require_positive(self.rate_hz, "transport.rate_hz")
+
+
+@dataclass
 class SessionRecord(Block):
     """One recording session of one instance.
 
@@ -686,7 +1051,8 @@ class SessionRecord(Block):
     always written, as ``null`` when unknown, so their absence is a visible fact.
     ``episodes`` is the inclusive range of episode indices the session covers.
     ``clock``, ``frames`` and ``baseline_stream`` are written by the recorder; a
-    ``clock`` must carry one episode origin per episode in the range.
+    ``clock`` must carry one episode origin per episode in the range. ``transport`` is
+    the link the session read the sensor over, ``None`` when unknown.
     """
 
     session_id: str
@@ -700,6 +1066,7 @@ class SessionRecord(Block):
     serial: str | None = None
     firmware: str | None = None
     device: DeviceSession | None = None
+    transport: Transport | None = None
     gel: Gel | None = None
     skin: Skin | None = None
 
@@ -712,6 +1079,7 @@ class SessionRecord(Block):
         "serial",
         "firmware",
         "device",
+        "transport",
         "adapter",
         "calibration",
         "baseline",
@@ -765,6 +1133,41 @@ def read_session_meta_lenient(data: Mapping[str, Any]) -> tuple[SessionMeta, lis
     reader = _Reader(strict=False)
     meta = _from_dict(SessionMeta, data, reader, "meta")
     return meta, reader.unknown, reader.missing
+
+
+def check_session_calibration(info: TactileInfo, record: SessionRecord) -> None:
+    """Check a session record against its instance's channels: a channel in ``counts`` or ``a.u.``
+    (:data:`UNCALIBRATED_UNITS`) requires ``calibration.method`` ``uncalibrated``.
+
+    Raises:
+        SchemaError: If an uncalibrated unit meets another calibration method, or none.
+    """
+    units = sorted({c.unit for c in info.channels or () if c.unit in UNCALIBRATED_UNITS})
+    method = None if record.calibration is None else record.calibration.method
+    if units and method != "uncalibrated":
+        raise SchemaError(
+            f"session {record.session_id!r}: channels in {units} require calibration.method "
+            f"'uncalibrated', got {method!r}"
+        )
+
+
+def check_device_indices(infos: Mapping[str, TactileInfo]) -> None:
+    """Check that the instances on each device, keyed here by instance id, have distinct ``device.index``.
+
+    Raises:
+        SchemaError: If two instances with the same ``device.id`` share an index.
+    """
+    seen: dict[tuple[str, int | None], str] = {}
+    for instance_id, info in infos.items():
+        if info.device is None:
+            continue
+        slot = (info.device.id, info.device.index)
+        if slot in seen:
+            raise SchemaError(
+                f"{seen[slot]!r} and {instance_id!r} share device.index {info.device.index} "
+                f"on device {info.device.id!r}"
+            )
+        seen[slot] = instance_id
 
 
 # --- Health annotations: ``tactile/health.json`` --------------------------------------------------
@@ -924,7 +1327,8 @@ class FramerateReport(Block):
     ``frame_index / fps`` (``nominal``), which says nothing about the sensor. ``clock`` names the
     main-table column the times were read from when it is not ``timestamp``. ``stalled`` counts
     the steps of zero length, a clock that did not advance, apart from the drops. ``frames`` is
-    the session's counters when known."""
+    the session's counters when known. ``configured_hz`` is the rate the session's ``transport``
+    says the sensor was set to, reported beside ``effective_hz`` and never flagged."""
 
     effective_hz: float
     declared_hz: float | None
@@ -938,6 +1342,23 @@ class FramerateReport(Block):
     flag: bool
     stalled: int | None = None
     clock: str | None = None
+    configured_hz: float | None = None
+
+    _key_order: ClassVar[tuple[str, ...] | None] = (
+        "effective_hz",
+        "configured_hz",
+        "declared_hz",
+        "dropped_pct",
+        "max_gap_ms",
+        "max_gap_threshold_ms",
+        "gap_histogram",
+        "frames",
+        "source",
+        "timestamps",
+        "stalled",
+        "clock",
+        "flag",
+    )
 
     def __post_init__(self) -> None:
         _require_one_of(self.source, ("sidecar", "main_table"), "framerate.source")
@@ -1100,13 +1521,30 @@ class InstanceChecks(Block):
 
 
 @dataclass
+class ChannelReport(Block):
+    """A channel as a run read it, in an :class:`InstanceReport`: its name, unit and source. Unlike
+    :class:`Channel` it also holds what a lenient read of 0.3 metadata gives, ``source`` ``unknown``
+    and no unit, so a report on such a dataset reads back."""
+
+    name: str
+    unit: str | None
+    source: str
+
+    def __post_init__(self) -> None:
+        _require_nonempty_str(self.name, "channel.name")
+        _require_one_of(self.source, (*CHANNEL_SOURCES, UNKNOWN_SOURCE), f"channel {self.name!r}: source")
+
+
+@dataclass
 class InstanceReport(Block):
     """What the run found out about an instance before checking any episode.
 
     ``metadata`` is ``info`` when the feature entry carried a readable ``info`` block,
     ``none`` when it had none (a plain LeRobot dataset), ``invalid`` when it failed even the
-    lenient read, with the reason in ``error``. ``unknown_keys`` and ``missing_keys`` are
-    the lenient readers' findings for the ``info`` block and the session record.
+    lenient read, with the reason in ``error``. ``channels`` are the instance's channels as
+    read, ``None`` without an ``info`` block or for an image, and ``upgraded`` says the
+    lenient reader turned a 0.3 channel list into them. ``unknown_keys`` and ``missing_keys``
+    are the lenient readers' findings for the ``info`` block and the session record.
     """
 
     key: str
@@ -1118,6 +1556,22 @@ class InstanceReport(Block):
     unknown_keys: list[str]
     missing_keys: list[str]
     error: str | None = None
+    channels: list[ChannelReport] | None = None
+    upgraded: bool = False
+
+    _key_order: ClassVar[tuple[str, ...] | None] = (
+        "key",
+        "family",
+        "metadata",
+        "sidecar",
+        "declared_rate_hz",
+        "range",
+        "channels",
+        "upgraded",
+        "unknown_keys",
+        "missing_keys",
+        "error",
+    )
 
     def __post_init__(self) -> None:
         _require_nonempty_str(self.key, "instance.key")
@@ -1240,10 +1694,13 @@ def _from_dict(cls: type, data: Any, reader: _Reader, path: str) -> Any:
                 raise SchemaError(f"{path}: missing required key {field.name!r}")
             continue
         kwargs[field.name] = _decode(hints[field.name], data[field.name], reader, f"{path}.{field.name}")
+    token = _LENIENT.set(not reader.strict)
     try:
         return cls(**kwargs)
     except SchemaError as e:
         raise SchemaError(f"{path}: {e}") from None
+    finally:
+        _LENIENT.reset(token)
 
 
 def _decode(hint: Any, value: Any, reader: _Reader, path: str) -> Any:
@@ -1350,6 +1807,35 @@ def _require_one_of(value: Any, allowed: tuple[str, ...], path: str) -> None:
 def _require_slug(value: Any, path: str) -> None:
     if not isinstance(value, str) or not _SLUG.match(value):
         raise SchemaError(f"{path} must match [A-Za-z0-9_-]+, got {value!r}")
+
+
+def _require_channels(channels: Any, path: str) -> None:
+    """Require a list of :class:`Channel` objects with unique names."""
+    if not isinstance(channels, list) or any(not isinstance(c, Channel) for c in channels):
+        raise SchemaError(
+            f"{path} must be Channel objects (name, unit, source); a list of names is the 0.3 form"
+        )
+    names = [c.name for c in channels]
+    if len(set(names)) != len(names):
+        raise SchemaError(f"{path} must have unique names, got {names!r}")
+
+
+def _require_grid(shape: Any, pitch_mm: Any, area_mm2: Any, path: str) -> None:
+    """Require a grid's ``[rows, cols]``, its ``[dy, dx]`` pitch in mm and an optional positive area."""
+    if (
+        not isinstance(shape, (list, tuple))
+        or len(shape) != 2
+        or any(isinstance(n, bool) or not isinstance(n, int) or n <= 0 for n in shape)
+    ):
+        raise SchemaError(f"{path}: shape must be two positive integers [rows, cols], got {shape!r}")
+    if (
+        not isinstance(pitch_mm, (list, tuple))
+        or len(pitch_mm) != 2
+        or any(not _is_number(p) or not p > 0 for p in pitch_mm)
+    ):
+        raise SchemaError(f"{path}: pitch_mm must be two positive numbers [dy, dx], got {pitch_mm!r}")
+    if area_mm2 is not None:
+        _require_positive(area_mm2, f"{path}: area_mm2")
 
 
 def _require_session_meta(value: Any) -> None:

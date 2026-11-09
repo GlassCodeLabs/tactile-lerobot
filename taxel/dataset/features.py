@@ -10,7 +10,7 @@ streams against the instance, and reads entries back. It needs numpy only.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 from taxel.schema import (
@@ -18,6 +18,7 @@ from taxel.schema import (
     FEATURE_KEY_PREFIX,
     STREAM_SUFFIXES,
     STREAM_WIDTHS,
+    Channel,
     Reduction,
     SchemaError,
     StreamInfo,
@@ -52,20 +53,29 @@ def feature_entry(info: TactileInfo, shape: tuple[int, ...], *, use_videos: bool
 
     Raises:
         SchemaError: If ``shape`` disagrees with ``info`` (wrong rank, width not equal
-            to the channel count, element count not equal to the number of
-            ``layout.positions_mm`` rows, or not three image channels).
+            to the channel count, element count not equal to the rows of
+            ``layout.positions_mm`` or the elements of ``layout.indexing``, or not
+            three image channels).
     """
     shape = _require_shape(shape, "shape")
     if info.family in ARRAY_FAMILIES:
         assert info.channels is not None  # guaranteed by TactileInfo validation
         if len(shape) != 2 or shape[1] != len(info.channels):
+            names = [c.name for c in info.channels]
             raise SchemaError(
                 f"{info.family.value} frames are (n_elements, {len(info.channels)}) for channels "
-                f"{info.channels}, got shape {shape}"
+                f"{names}, got shape {shape}"
             )
-        positions = info.layout.positions_mm if info.layout is not None else None
-        if positions is not None and len(positions) != shape[0]:
-            raise SchemaError(f"layout.positions_mm has {len(positions)} rows for {shape[0]} elements")
+        layout = info.layout
+        assert layout is not None  # guaranteed by TactileInfo validation
+        if layout.positions_mm is not None and len(layout.positions_mm) != shape[0]:
+            raise SchemaError(
+                f"layout.positions_mm has {len(layout.positions_mm)} rows for {shape[0]} elements"
+            )
+        if layout.indexing is not None and layout.indexing.n_elements != shape[0]:
+            raise SchemaError(
+                f"layout.indexing covers {layout.indexing.n_elements} elements, the feature {shape[0]}"
+            )
         return {"dtype": ARRAY_DTYPE, "shape": shape, "names": None, "info": info.to_dict()}
     if len(shape) != 3 or shape[2] != 3:
         raise SchemaError(f"visuotactile frames are (height, width, 3), got shape {shape}")
@@ -78,18 +88,24 @@ def feature_entry(info: TactileInfo, shape: tuple[int, ...], *, use_videos: bool
 
 
 def stream_entry(
-    info: TactileInfo, suffix: str, shape: tuple[int, ...], reduction: Reduction | None = None
+    info: TactileInfo,
+    suffix: str,
+    shape: tuple[int, ...],
+    channels: Sequence[Channel],
+    reduction: Reduction | None = None,
 ) -> dict[str, Any]:
     """Return the entry of a suffixed stream, ``observation.tactile.<instance_id>.<suffix>``.
 
     The stream is validated against the instance through
-    :meth:`TactileInfo.check_streams` (visuotactile family, ``derived`` block for
-    ``.displacement`` and ``.force``). Its per-frame array is float32 ``(N, 2)``
-    for ``.markers`` and ``(N, 3)`` for the other two; when the instance declares
-    ``markers``, the ``.markers`` stream must have ``markers.count`` rows.
+    :meth:`TactileInfo.check_streams` (visuotactile family and a ``derived`` block,
+    since every suffixed stream is computed from the image). Its per-frame array is
+    float32 ``(N, 2)`` for ``.markers`` and ``(N, 3)`` for the other two, with one
+    ``derived`` channel per column; when the instance declares ``markers``, the
+    ``.markers`` stream must have ``markers.count`` rows.
 
     Raises:
-        SchemaError: If the stream is not allowed beside this instance or ``shape`` is wrong.
+        SchemaError: If the stream is not allowed beside this instance, or ``shape`` or
+            ``channels`` is wrong.
     """
     info.check_streams([suffix])
     shape = _require_shape(shape, f".{suffix} shape")
@@ -98,7 +114,9 @@ def stream_entry(
         raise SchemaError(f".{suffix} frames are (N, {width}), got shape {shape}")
     if suffix == "markers" and info.markers is not None and shape[0] != info.markers.count:
         raise SchemaError(f".markers has {shape[0]} rows but info.markers.count is {info.markers.count}")
-    stream = StreamInfo(session_meta=info.session_meta, reduction=reduction)
+    if len(channels) != width:
+        raise SchemaError(f".{suffix} declares {len(channels)} channels for {width} columns")
+    stream = StreamInfo(session_meta=info.session_meta, channels=list(channels), reduction=reduction)
     return {"dtype": ARRAY_DTYPE, "shape": shape, "names": None, "info": stream.to_dict()}
 
 
@@ -106,31 +124,37 @@ def feature_entries(
     instance_id: str,
     info: TactileInfo,
     shape: tuple[int, ...],
-    streams: Mapping[str, tuple[tuple[int, ...], Reduction | None]] | None = None,
+    streams: Mapping[str, tuple[tuple[int, ...], Sequence[Channel], Reduction | None]] | None = None,
     *,
     use_videos: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Return every entry of one instance keyed by feature key: the main key, then its streams.
 
-    ``streams`` maps a suffix to the stream's per-frame shape and its reduction (``None``
-    when its native rate equals the dataset fps). All suffixes are checked together
+    ``streams`` maps a suffix to the stream's per-frame shape, its channels and its reduction
+    (``None`` when its native rate equals the dataset fps). All suffixes are checked together
     against the instance before any entry is built.
     """
     streams = dict(streams or {})
     info.check_streams(streams)
     entries = {feature_key(instance_id): feature_entry(info, shape, use_videos=use_videos)}
-    for suffix, (stream_shape, reduction) in streams.items():
-        entries[feature_key(instance_id, suffix)] = stream_entry(info, suffix, stream_shape, reduction)
+    for suffix, (stream_shape, channels, reduction) in streams.items():
+        entries[feature_key(instance_id, suffix)] = stream_entry(
+            info, suffix, stream_shape, channels, reduction
+        )
     return entries
 
 
-def read_feature_entry(entry: Mapping[str, Any]) -> TactileInfo:
+def read_feature_entry(entry: Mapping[str, Any], features: Mapping[str, Any] | None = None) -> TactileInfo:
     """Read an instance's static metadata back from its feature entry, strictly.
+
+    With ``features``, the dataset's whole features dict, ``info.clock_column`` is checked
+    to name a feature of one number per frame.
 
     Raises:
         SchemaError: If the entry has no ``info`` block, ``info`` is not a valid
             ``SCHEMA.md`` block (an unknown key such as a serial number is an error),
-            or ``dtype`` and ``shape`` disagree with it.
+            ``dtype`` and ``shape`` disagree with it, or ``clock_column`` names no
+            clock in ``features``.
     """
     info = TactileInfo.from_dict(_info_block(entry))
     dtype, shape = entry.get("dtype"), tuple(entry.get("shape") or ())
@@ -140,6 +164,8 @@ def read_feature_entry(entry: Mapping[str, Any]) -> TactileInfo:
         feature_entry(info, shape)  # validates the shape against the channels
     elif dtype not in ("video", "image"):
         raise SchemaError(f"visuotactile features are video or image, got dtype {dtype!r}")
+    if features is not None:
+        info.check_clock_column(features)
     return info
 
 

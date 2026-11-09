@@ -43,6 +43,7 @@ from taxel.schema import (
     TactileInfo,
     read_info_lenient,
     read_session_meta_lenient,
+    without_core_keys,
 )
 
 __all__ = [
@@ -71,11 +72,6 @@ _REQUIRED_INFO_KEYS = frozenset(
     f.name for f in fields(TactileInfo) if f.default is MISSING and f.default_factory is MISSING
 )
 """The keys a tactile ``info`` block cannot lack; a block with none of them is not an instance's."""
-
-_CORE_INFO_PREFIXES = ("video.", "audio.")
-_CORE_INFO_KEYS = frozenset({"has_audio", "is_depth_map"})
-"""What LeRobot 0.6.1 writes into a video feature's ``info`` itself: the probed ``video.*`` and
-``audio.*`` values, ``has_audio`` and ``is_depth_map``. None of it belongs to the tactile block."""
 
 
 # --- Discovery -----------------------------------------------------------------------------------
@@ -190,9 +186,9 @@ class InstanceSource:
     """One tactile instance of the dataset: its feature, its metadata and its sidecar, if any.
 
     ``kind`` is ``array`` for a float feature of one or two dimensions, ``image`` for a
-    video or image feature. ``metadata``, ``error``, ``unknown_keys`` and ``missing_keys``
-    are what the lenient readers found; see :class:`~taxel.schema.InstanceReport`. ``names``
-    are the feature's own element names, when it gives one per element.
+    video or image feature. ``metadata``, ``error``, ``unknown_keys``, ``missing_keys`` and
+    ``upgraded`` are what the lenient readers found; see :class:`~taxel.schema.InstanceReport`.
+    ``names`` are the feature's own element names, when it gives one per element.
     """
 
     instance_id: str
@@ -208,6 +204,7 @@ class InstanceSource:
     unknown_keys: list[str] = field(default_factory=list)
     missing_keys: list[str] = field(default_factory=list)
     names: list[str] | None = None
+    upgraded: bool = False
 
     @property
     def family(self) -> str:
@@ -352,7 +349,7 @@ class DoctorDataset:
             kind = "array"
         else:
             raise SchemaError(f"{key}: a tactile instance is a float array or an image, not {dtype} {shape}")
-        info, metadata, error, unknown = self._read_info(key, entry)
+        info, metadata, error, unknown, info_missing, upgraded = self._read_info(key, entry)
         sessions, sidecar, missing, session_error = self._read_sessions(instance_id, info)
         if session_error is not None:
             error = session_error if error is None else f"{error}; {session_error}"
@@ -375,27 +372,23 @@ class DoctorDataset:
             sessions,
             sidecar,
             unknown,
-            missing,
+            [*info_missing, *missing],
             names=list(names) if per_element else None,
+            upgraded=upgraded,
         )
 
     @staticmethod
     def _read_info(
         key: str, entry: Mapping[str, Any]
-    ) -> tuple[TactileInfo | None, str, str | None, list[str]]:
-        block = entry.get("info")
-        own = {
-            k: v
-            for k, v in (block or {}).items()
-            if not k.startswith(_CORE_INFO_PREFIXES) and k not in _CORE_INFO_KEYS
-        }
+    ) -> tuple[TactileInfo | None, str, str | None, list[str], list[str], bool]:
+        own = without_core_keys(entry.get("info") or {})
         if not own.keys() & _REQUIRED_INFO_KEYS:
-            return None, "none", None, []  # LeRobot's own keys alone, or nothing: no tactile block
+            return None, "none", None, [], [], False  # LeRobot's own keys alone, or nothing: no tactile block
         try:
-            info, unknown = read_info_lenient(own)
+            info, unknown, missing, upgraded = read_info_lenient(own)
         except SchemaError as e:
-            return None, "invalid", f"{key}: info block: {e}", []
-        return info, "info", None, unknown
+            return None, "invalid", f"{key}: info block: {e}", [], [], False
+        return info, "info", None, unknown, missing, upgraded
 
     def _read_sessions(
         self, instance_id: str, info: TactileInfo | None

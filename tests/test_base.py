@@ -12,6 +12,7 @@ import pytest
 from taxel.schema import (
     Axes,
     Baseline,
+    Channel,
     Layout,
     Origin,
     SchemaError,
@@ -74,7 +75,7 @@ class FakeSensor(TactileSensor):
             family=self.config.family,
             declared_rate_hz=self.config.declared_rate_hz,
             session_meta=session_meta_path(self.config.instance_id),
-            channels=["fx", "fy", "fz"],
+            channels=[Channel(name, "N", "measured") for name in ("fx", "fy", "fz")],
             layout=Layout(
                 origin=Origin("corner", "element 0"),
                 axes=Axes("along a row", "down a column", "out of the surface"),

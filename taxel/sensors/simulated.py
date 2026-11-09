@@ -22,6 +22,7 @@ from numpy.typing import ArrayLike, NDArray
 from taxel.schema import (
     ARRAY_FAMILIES,
     Axes,
+    Channel,
     Layout,
     Markers,
     Origin,
@@ -50,11 +51,14 @@ __all__ = [
 Press = tuple[float, float, float]
 """A press: ``(start_s, duration_s, amplitude)``, start and duration in sensor time from ``connect()``."""
 
-_UNITS = {
-    TactileFamily.TAXEL_ARRAY: {"force": "N"},
-    TactileFamily.FORCE_TORQUE: {"force": "N", "torque": "N.m"},
-    TactileFamily.MAGNETIC: {"field": "uT"},
-}
+
+def _unit(family: TactileFamily, channel: str) -> str:
+    """The unit the simulated sensor reports a channel in: a field in uT, a moment in N.m, a force in N."""
+    if family is TactileFamily.MAGNETIC:
+        return "uT"
+    if family is TactileFamily.FORCE_TORQUE and channel.startswith(("m", "t")):
+        return "N.m"
+    return "N"
 
 
 def _check_presses(schedule: Sequence[Sequence[float]] | None) -> list[Press] | None:
@@ -300,8 +304,7 @@ class SimulatedTactile(TactileSensor):
             vendor="taxel",
             model="simulated",
             declared_rate_hz=cfg.declared_rate_hz,
-            units=dict(_UNITS[cfg.family]),
-            channels=list(cfg.channels),
+            channels=[Channel(name, _unit(cfg.family, name), "measured") for name in cfg.channels],
             range=(
                 Range(min=-cfg.saturation_max, max=cfg.saturation_max)
                 if cfg.saturation_max is not None and cfg.declare_range
