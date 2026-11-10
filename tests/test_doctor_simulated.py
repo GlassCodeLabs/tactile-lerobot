@@ -3,6 +3,7 @@ and check what it finds; then the same on a clean recording, a tampered copy, an
 
 import json
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +47,7 @@ from taxel.sensors import (  # noqa: E402
     SimulatedVisuotactile,
     SimulatedVisuotactileConfig,
     TactileReading,
+    host_clock,
 )
 
 INSTANCE = "left_fingertip"
@@ -118,6 +120,29 @@ def checks(root: Path, **kwargs):
     return report, [report.episodes[f"episode_{e:06d}"][INSTANCE] for e in (0, 1)]
 
 
+def steady(root: Path, dest: Path) -> Path:
+    """A copy of a recording whose native timestamps are on the ideal grid: each frame ``seq - seq_0``
+    periods after the episode's first, the device clock keeping its offset.
+
+    A live recording's gaps include every stall of the host running the test, and ten periods at
+    500 Hz is 20 ms; on the grid a gap is a drop and nothing else, so the framerate check reads the
+    same on every run. Integrity reduces the stored stream by these timestamps and no longer
+    reproduces the main table from them, so it is left out of what is asserted on the copy.
+    """
+    shutil.copytree(root, dest)
+    for e in (0, 1):
+        path = episode_path(dest, INSTANCE, e)
+        stream = read_episode(path)
+        host = stream.host_ts[0] + (stream.seq - stream.seq[0]) / BASE["declared_rate_hz"]
+        device = host + (stream.device_ts[0] - stream.host_ts[0])
+        readings = [
+            TactileReading(stream.data[i], float(host[i]), float(device[i]), int(stream.seq[i]))
+            for i in range(len(stream))
+        ]
+        write_episode(path, e, readings, stream.shape)
+    return dest
+
+
 class TestFaultyRecording:
     def test_report_round_trips_and_is_written(self, faulty) -> None:
         report, _ = checks(faulty)
@@ -142,14 +167,19 @@ class TestFaultyRecording:
                 files.native and files.baseline and files.capture_at_zero and files.origins and files.counters
             )
 
-    def test_framerate_flags_the_source_drops(self, faulty) -> None:
+    def test_framerate_flags_the_source_drops(self, faulty, tmp_path) -> None:
         _, episodes = checks(faulty)
         for ep in episodes:
             fr = ep.framerate
             assert fr.source == "sidecar" and fr.timestamps == "measured" and fr.declared_hz == 500.0
-            assert 0.02 < fr.dropped_pct < 0.1 and fr.flag
+            assert 0.02 < fr.dropped_pct < 0.1 and fr.flag  # drops come from seq, whatever the host clock did
             assert fr.frames is not None and fr.frames.dropped > 0 and fr.max_gap_threshold_ms == 20.0
-            assert 400 < fr.effective_hz < 500
+        # On fixed timestamps the drops alone raise the flag, and the rate is what they leave of 500 Hz.
+        _, episodes = checks(steady(faulty, tmp_path / "steady"), checks=["framerate"])
+        for ep in episodes:
+            fr = ep.framerate
+            assert fr.flag and 0.02 < fr.dropped_pct < 0.1 and fr.max_gap_ms < fr.max_gap_threshold_ms
+            assert fr.effective_hz == pytest.approx(500 * (1 - fr.dropped_pct), abs=0.1)
 
     def test_saturation_flags_the_clamped_press(self, faulty) -> None:
         _, (first, second) = checks(faulty)
@@ -184,10 +214,10 @@ class TestFaultyRecording:
 
 
 class TestCleanRecording:
-    def test_nothing_is_flagged(self, clean) -> None:
+    def test_nothing_is_flagged(self, clean, tmp_path) -> None:
         _, episodes = checks(clean)
         for ep in episodes:
-            assert not ep.integrity.flag and not ep.framerate.flag and not ep.saturation.flag
+            assert not ep.integrity.flag and not ep.saturation.flag
             assert ep.framerate.dropped_pct == 0.0
             assert ep.saturation.limit == "observed" and ep.saturation.confidence == "low"
             assert isinstance(ep.drift, DriftReport) and not ep.drift.flag
@@ -196,6 +226,10 @@ class TestCleanRecording:
             assert ep.gel.kind == "elements" and isinstance(ep.skew, Skipped)
         first = episodes[0].drift
         assert first.no_contact_windows < first.windows  # the press is there, and is not drift
+        # The gaps on fixed timestamps: on the live clock a stall of the host is a gap over 20 ms.
+        _, episodes = checks(steady(clean, tmp_path / "steady"), checks=["framerate"])
+        for ep in episodes:
+            assert not ep.framerate.flag and ep.framerate.max_gap_ms == pytest.approx(2.0)
 
 
 class TestLapses:
@@ -452,17 +486,31 @@ class TestPlainDataset:
 
 GEL_KEY = feature_key("gel")
 ARRAY_KEY = feature_key(INSTANCE)
-PRESSES = [(0.6, 0.4), (1.4, 0.4), (2.7, 0.4), (3.5, 0.4)]
-"""Two presses in each 2 s episode (the first runs from about 0.2 s, the second from about 2.3 s of sensor
-time). One press is an onset and a release quantized to two video-frame phases, and the skew
-confidence of a clean pair then sits near the floor on an unlucky recording; two give four events."""
+EPISODE_STARTS_S = (1.0, 3.5)
+"""Sensor time of each episode's first frame, from the array's ``connect()``. The fixture waits for
+it, so an episode holds the same images on every run; the first start leaves the setup and the
+baseline capture time to finish, the second half a second to save the first episode."""
+PRESSES = [(1.4, 0.4), (2.2, 0.4), (3.9, 0.4), (4.7, 0.4)]
+"""Two presses in each 2 s episode, 0.4 s and 1.2 s after its start. One press is an onset and a
+release quantized to two video-frame phases, and the skew confidence of a clean pair then sits near
+the floor on an unlucky recording; two give four events."""
 IMAGE_RATE = 60.0
 DELAY_FRAMES = 2  # the image sensor shows the press two of its frames late: 33 ms at 60 Hz
 DEAD_BLOCK = (10, 20, 6, 6)  # 36 pixels, 1.2% of the 48x64 image, over the 0.5% cluster default
 
 
 def two_sensor_dataset(root: Path, *, faults: bool) -> Path:
-    """An array sensor through the writer and an image sensor fed to ``add_frame`` by hand, two episodes."""
+    """An array sensor through the writer and an image sensor fed to ``add_frame`` by hand, two episodes.
+
+    The image of frame ``k`` is the image sensor's frame at the frame's sensor time, taken by its
+    ``seq``. A live read returns whichever frame comes next, so the frames written, and their noise,
+    would change with the host's timing from run to run; the noise is what sets the variance of the
+    pixels at the dead block's edge after encoding, and with it the cluster the gel check finds. The
+    encoder mixes the live neighbours' noise into the block, and on about half of the frame sets with
+    these presses it lifts one to four of its pixels over the dead-pixel floor; the image seed is one
+    whose frames leave the whole block under it in both episodes on arm64 and on x86_64, whose builds
+    of the encoder encode the same frames differently.
+    """
     array = SimulatedTactile(
         SimulatedTactileConfig(
             instance_id=INSTANCE,
@@ -477,15 +525,15 @@ def two_sensor_dataset(root: Path, *, faults: bool) -> Path:
         SimulatedVisuotactileConfig(
             instance_id="gel",
             declared_rate_hz=IMAGE_RATE,
-            seed=2,
+            seed=20,
             noise_std=6.0,  # camera noise well above the codec's flicker, as on a real gel image
             contact_schedule=[(s, d, 80.0) for s, d in PRESSES],
             dead_pixels=DEAD_BLOCK if faults else None,
             transport_delay_s=DELAY_FRAMES / IMAGE_RATE if faults else 0.0,
         )
     )
+    zero = host_clock()  # sensor time 0 of both: the image runs the press schedule from here too
     array.connect()
-    image.connect()
     features = {
         **tactile_features([array], fps=30),
         GEL_KEY: feature_entry(image.metadata(), image.config.shape, use_videos=True),
@@ -497,17 +545,18 @@ def two_sensor_dataset(root: Path, *, faults: bool) -> Path:
         dataset, [array], baseline_s=0.2, apply_baseline=True, baseline_sample_every=50
     )
     writer.start_session("two")
-    for _ in range(2):
+    for start_s in EPISODE_STARTS_S:
+        while (left := zero + start_s - host_clock()) > 0:
+            writer.idle()
+            time.sleep(min(left, 0.01))
         writer.start_episode()
-        for _ in range(60):
+        for k in range(60):
             values = writer.frame()  # at the frame's nominal time
-            frame = image.read()  # the next image after it: fresh to within one image period
-            dataset.add_frame({**values, GEL_KEY: frame.data, "task": "press"})
+            frame = image._frame(round((start_s + k / 30) * IMAGE_RATE))
+            dataset.add_frame({**values, GEL_KEY: frame, "task": "press"})
         writer.end_episode()
         dataset.save_episode()
-        writer.idle()
     array.disconnect()
-    image.disconnect()
     writer.finalize()
     dataset.finalize()
     return root
@@ -544,7 +593,7 @@ class TestTwoSensors:
             block = report.episodes[f"episode_{e:06d}"]
             pixels = block["gel"].gel
             assert pixels.kind == "pixels" and pixels.frames_used == 60 and pixels.episodes_checked == 2
-            # Encoder output differs between machines: a pixel or two of the block's edge crosses the floor.
+            # Another machine's encoder build can lift a pixel or two of the block's edge over the floor.
             assert abs(pixels.largest_cluster_px - 36) <= 2 and pixels.flag
             assert pixels.largest_cluster_pct == pytest.approx(36 / (48 * 64), abs=2 / (48 * 64))
             assert pixels.dead_pct == pytest.approx(36 / (48 * 64), abs=0.002)

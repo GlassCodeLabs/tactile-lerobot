@@ -158,6 +158,14 @@ def faulty(tmp_path_factory) -> Path:
     return record(tmp_path_factory.mktemp("cli"), FAULTS)
 
 
+@pytest.fixture(scope="module")
+def steady_faulty(faulty, tmp_path_factory) -> Path:
+    """The recording with its native timestamps on the ideal grid, for what the framerate check flags."""
+    from test_doctor_simulated import steady
+
+    return steady(faulty, tmp_path_factory.mktemp("steady") / "ds")
+
+
 @needs_lerobot
 class TestRun:
     def test_writes_the_report_and_prints_the_table(self, faulty, capsys) -> None:
@@ -186,13 +194,14 @@ class TestRun:
         assert list(report.episodes) == ["episode_000001"]
         assert "written" in capsys.readouterr().out
 
-    def test_fail_on_sets_the_exit_code(self, faulty, capsys) -> None:
-        assert main([str(faulty), "--no-write", "--fail-on", "dropped"]) == 1
+    def test_fail_on_sets_the_exit_code(self, faulty, steady_faulty, capsys) -> None:
+        # Framerate on fixed timestamps: on the live clock a stall of the host is a gap over the 20 ms
+        # limit, which flags framerate whatever the drop threshold.
+        framerate = [str(steady_faulty), "--no-write", "--checks", "framerate", "--fail-on"]
+        assert main([*framerate, "dropped"]) == 1
         out = capsys.readouterr().out
         assert "fail: episode_000000 left_fingertip framerate" in out
-        assert (
-            main([str(faulty), "--no-write", "--fail-on", "dropped=0.5"]) == 0
-        )  # threshold raised above the drops
+        assert main([*framerate, "dropped=0.5"]) == 0  # threshold raised above the drops
         assert main([str(faulty), "--no-write", "--fail-on", "drift,saturated,integrity"]) == 1
         assert "fail: episode_000000 left_fingertip saturation" in capsys.readouterr().out
         assert main([str(faulty), "--no-write", "--fail-on", "integrity"]) == 0
@@ -200,11 +209,12 @@ class TestRun:
             main([str(faulty), "--no-write", "--fail-on", "gel,skew"]) == 0
         )  # skipped and clean checks never fail
 
-    def test_thresholds_file_is_recorded(self, faulty, tmp_path) -> None:
+    def test_thresholds_file_is_recorded(self, steady_faulty, tmp_path) -> None:
         path = tmp_path / "t.json"
         path.write_text('{"saturated": 0.5, "dropped": 0.5}')
         out_path = tmp_path / "report.json"
-        assert main([str(faulty), "--no-write", "--thresholds", str(path), "--json", str(out_path)]) == 0
+        args = [str(steady_faulty), "--no-write", "--thresholds", str(path), "--json", str(out_path)]
+        assert main(args) == 0
         report = HealthReport.from_dict(json.loads(out_path.read_text()))
         assert report.thresholds.saturated == 0.5 and report.thresholds.dropped == 0.5
         first = report.episodes["episode_000000"]["left_fingertip"]
